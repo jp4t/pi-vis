@@ -32,6 +32,7 @@ import {
   type SessionQueryEnvelope,
   SessionQueryEnvelopeSchema,
   type SessionQueryResult,
+  type SessionRuntimeResumeState,
   type SessionSubmission,
   SessionSubmissionSchema,
   type SubmissionResult,
@@ -41,9 +42,13 @@ import {
 } from "@shared/pi-protocol/runtime-state.js";
 import lockfile from "proper-lockfile";
 import { resolveHostExecPath } from "../pi/locate-node.js";
-import { HostRequestUnavailableError, SessionHost } from "../pi/session-host.js";
+import {
+  HostRequestUnavailableError,
+  SessionHost,
+  confinedSessionRuntimeStrategyForPlatform,
+} from "../pi/session-host.js";
 import { type AuthorityPublication, RendererPublicationRouter } from "./renderer-publication.js";
-import { reconcileRestoration } from "./restoration-reconciler.js";
+import { type RestorationDisposition, reconcileRestoration } from "./restoration-reconciler.js";
 import {
   assertConfinedRegularFileDescriptor,
   createPinnedSessionHardLink,
@@ -59,6 +64,7 @@ interface RetainedIntent {
   result?: SubmissionResult | undefined;
   /** Byte boundary captured immediately before sending to the retained host. */
   sessionFileOffsetAtDispatch?: number | undefined;
+  restorationResolution?: Promise<RestorationDisposition> | undefined;
 }
 
 /** Preserve a child-requested queue label for ambiguity review; this never
@@ -86,6 +92,7 @@ interface RetainedDispatchIntent {
   recoveryPublished?: boolean | undefined;
   /** Byte boundary captured immediately before sending to the retained host. */
   sessionFileOffsetAtDispatch?: number | undefined;
+  restorationResolution?: Promise<RestorationDisposition> | undefined;
 }
 
 interface PendingUnifiedSubmit {
@@ -114,7 +121,7 @@ export interface SessionRecord {
   /** Search-open file identity pinned across the cold activation IPC gap. */
   _confinedSessionDescriptor?: number | undefined;
   _confinedSessionRoot?: string | undefined;
-  /** Windows-only hard link that names the descriptor-pinned runtime inode. */
+  /** Stable hard-link path that names the descriptor-pinned runtime inode. */
   _confinedSessionAlias?: string | undefined;
   status: SessionStatus;
   error?: string | undefined;
@@ -123,7 +130,19 @@ export interface SessionRecord {
   availability: RuntimeStateUpdate["availability"];
   snapshot?: AgentSessionSnapshot | undefined;
   _snapshotMutationFingerprint?: string | undefined;
+  /** Child-authored, owner-local continuation token for same-record host replacement. */
+  _runtimeResumeCheckpoint?:
+    | {
+        owner: RuntimeIdentity;
+        state: SessionRuntimeResumeState;
+      }
+    | undefined;
   _editorRecovery?: AgentSessionSnapshot["editor"] | undefined;
+  /**
+   * A same-revision submit from the failed owner must finish persistence
+   * reconciliation before its captured editor can be restored.
+   */
+  _editorRecoveryReconciliation?: Promise<RestorationDisposition> | undefined;
   _deferredInitialBatch?: TransitionBatch | undefined;
   snapshotReceivedAt?: number | undefined;
   leaseExpiresAt?: number | undefined;
@@ -340,7 +359,18 @@ export class SessionRegistry {
     if (!record.sessionFile) return undefined;
     try {
       return statSync(record.sessionFile).size;
-    } catch {
+    } catch (error) {
+      // Pi deliberately defers materializing a brand-new session JSONL until
+      // its first assistant entry. While this registry holds the exact primary
+      // path lock, absence at dispatch is a trustworthy byte boundary: every
+      // byte that can later appear in that reserved file is post-dispatch.
+      if (
+        (error as NodeJS.ErrnoException).code === "ENOENT" &&
+        record._hasLock === true &&
+        record._lockPath === path.resolve(record.sessionFile)
+      ) {
+        return 0;
+      }
       return undefined;
     }
   }
@@ -351,7 +381,10 @@ export class SessionRegistry {
   }
 
   /** Main is the sole authority deciding whether custody returns to a draft. */
-  private async resolveRestoration(record: SessionRecord, payload: unknown): Promise<void> {
+  private async resolveRestoration(
+    record: SessionRecord,
+    payload: unknown,
+  ): Promise<RestorationDisposition | undefined> {
     // Legacy host records are wrapped in a transport envelope while semantic
     // frames and attach baselines carry the record directly. Retain only the
     // record fields before strict protocol validation in both cases.
@@ -369,7 +402,7 @@ export class SessionRegistry {
         : {}),
       certainty: value.certainty,
     });
-    if (!parsed.success) return;
+    if (!parsed.success) return undefined;
     const restoration: QueueRestorationRecord = parsed.data;
     if (record._resolvedRestorationInstructions.has(restoration.restorationId)) {
       this.emitResolvedRestoration(record, restoration.restorationId);
@@ -381,6 +414,12 @@ export class SessionRegistry {
       text.trim(),
     );
     const attachments = restoration.originalAttachments.flatMap((item) => item.images);
+    const intentIds = [
+      ...new Set([
+        ...(restoration.clearedIntentIds ?? []),
+        ...restoration.originalAttachments.map((item) => item.intentId),
+      ]),
+    ];
     let disposition: "restore" | "dropped";
     if (
       restoration.commandDescription?.trim() &&
@@ -414,18 +453,47 @@ export class SessionRegistry {
     }
     // An acknowledgement can win while async reconciliation is in flight.
     // Do not resurrect custody after that acknowledgement.
-    if (!record._restorations.has(restoration.restorationId)) return;
+    if (!record._restorations.has(restoration.restorationId)) return disposition;
     record._resolvedRestorationInstructions.set(restoration.restorationId, {
       restorationId: restoration.restorationId,
+      ...(intentIds.length > 0 ? { intentIds } : {}),
       text: textParts.join("\n\n"),
       attachments: structuredClone(attachments),
       disposition,
     });
     this.emitResolvedRestoration(record, restoration.restorationId);
+    return disposition;
+  }
+
+  private restorationResolution(
+    record: SessionRecord,
+    payload: unknown,
+  ): Promise<RestorationDisposition> {
+    return this.resolveRestoration(record, payload).then(
+      (disposition) => (disposition === "dropped" ? "dropped" : "restore"),
+      () => "restore",
+    );
   }
 
   private queueRestoration(record: SessionRecord, payload: unknown): void {
-    void this.resolveRestoration(record, payload);
+    // All ordinary callers are notification-only. Resolve failures
+    // conservatively so a callback exception cannot become an unhandled
+    // rejection or suppress recoverable custody.
+    void this.restorationResolution(record, payload);
+  }
+
+  private fenceEditorRecoveryOnRestoration(
+    record: SessionRecord,
+    editorRevision: number,
+    resolution: Promise<RestorationDisposition>,
+  ): void {
+    if (record._editorRecovery?.revision !== editorRevision) return;
+    const prior = record._editorRecoveryReconciliation;
+    record._editorRecoveryReconciliation = prior
+      ? Promise.all([prior, resolution]).then((dispositions) =>
+          dispositions.every((disposition) => disposition === "dropped") ? "dropped" : "restore",
+        )
+      : resolution;
   }
 
   openSession(
@@ -556,10 +624,11 @@ export class SessionRegistry {
           record._confinedSessionRoot,
           record._confinedSessionDescriptor,
         );
-        if (process.platform === "win32") {
-          // Windows has no descriptor filesystem. A verified hard link gives
-          // SessionManager a stable path to the pinned inode while preserving
-          // normal append behavior on the original file.
+        if (confinedSessionRuntimeStrategyForPlatform(process.platform) === "hard-link-alias") {
+          // Windows has no descriptor filesystem, while Darwin `/dev/fd`
+          // reopens share one file offset and cannot survive Pi's two-pass
+          // SessionManager.open(). A verified hard link gives both platforms
+          // a stable path while preserving appends to the original inode.
           record._confinedSessionAlias = createPinnedSessionHardLink(
             record.sessionFile,
             record._confinedSessionDescriptor,
@@ -567,9 +636,10 @@ export class SessionRegistry {
           closeSync(record._confinedSessionDescriptor);
           record._confinedSessionDescriptor = undefined;
         } else {
-          // Use a fresh offset-zero O_APPEND file description for every spawn.
-          // Retaining a prior description would share its EOF read offset
-          // across reactivation, while read-only would reject appends.
+          // Linux `/proc/self/fd` gives each Pi open an independent read
+          // position. Use a fresh offset-zero O_APPEND file description for
+          // every spawn; retaining a prior description would keep its EOF
+          // offset across reactivation, while read-only would reject appends.
           const hostDescriptor = openConfinedRegularFileForHost(
             record.sessionFile,
             record._confinedSessionRoot,
@@ -584,6 +654,9 @@ export class SessionRegistry {
           record._confinedSessionDescriptor = hostDescriptor;
         }
       }
+      const runtimeResumeState = record._runtimeResumeCheckpoint
+        ? structuredClone(record._runtimeResumeCheckpoint.state)
+        : undefined;
       const proc = new SessionHost(
         piPath,
         record.worktreePath ?? record.workspacePath,
@@ -592,6 +665,7 @@ export class SessionRegistry {
         execPath,
         record._confinedSessionDescriptor,
         record._confinedSessionAlias,
+        runtimeResumeState,
       );
       record.proc = proc;
       this.attachHost(record, proc);
@@ -757,7 +831,7 @@ export class SessionRegistry {
       record._panelCheckpoints.clear();
       this.onPanelEvent(record.sessionId, { type: "panel_clear_all" });
     });
-    proc.on("unifiedSubmitRequest", (id, text, editorRevision) => {
+    proc.on("unifiedSubmitRequest", (id, text, editorRevision, childSubmissionIntentId) => {
       if (!current() || !proc.hostInstanceId) return;
       record._mutationSequence++;
       const retiredKey = `${proc.hostInstanceId}\0${proc.sessionEpoch}\0${id}`;
@@ -785,7 +859,10 @@ export class SessionRegistry {
         id,
         text,
         editorRevision,
-        submissionIntentId: crypto.randomUUID(),
+        submissionIntentId:
+          typeof childSubmissionIntentId === "string" && childSubmissionIntentId.length > 0
+            ? childSubmissionIntentId
+            : crypto.randomUUID(),
         hostInstanceId: proc.hostInstanceId,
         sessionEpoch: proc.sessionEpoch,
       };
@@ -845,6 +922,18 @@ export class SessionRegistry {
     });
     proc.on("authorityFrame", (frame) => {
       if (!current()) return;
+      if (frame.runtimeResumeState) {
+        record._runtimeResumeCheckpoint = {
+          owner: structuredClone(frame.owner),
+          state: structuredClone(frame.runtimeResumeState),
+        };
+      } else if (
+        record._runtimeResumeCheckpoint &&
+        (record._runtimeResumeCheckpoint.owner.hostInstanceId !== frame.owner.hostInstanceId ||
+          record._runtimeResumeCheckpoint.owner.sessionEpoch !== frame.owner.sessionEpoch)
+      ) {
+        record._runtimeResumeCheckpoint = undefined;
+      }
       this.routeAuthorityPublication(record.sessionId, {
         plane: "semantic",
         owner: frame.owner,
@@ -957,9 +1046,19 @@ export class SessionRegistry {
       this.publishUnavailable(record, `Invalid runtime snapshot: ${parsed.error.message}`);
       return;
     }
+    const reportedSessionFile = parsed.data.sessionFile;
+    const reportsConfinedTransport =
+      reportedSessionFile !== undefined &&
+      ((record._confinedSessionAlias !== undefined &&
+        path.resolve(reportedSessionFile) === path.resolve(record._confinedSessionAlias)) ||
+        (record._confinedSessionDescriptor !== undefined &&
+          ["/proc/self/fd/4", "/dev/fd/4"].includes(reportedSessionFile)));
+    // Current children project the canonical validated source themselves.
+    // Retain this narrow compatibility fence for an older/confused child, but
+    // never mask a genuine /new, fork, or switch successor merely because the
+    // initial runtime pin has not yet been released.
     const snapshot =
-      (record._confinedSessionDescriptor !== undefined || record._confinedSessionAlias) &&
-      record.sessionFile
+      reportsConfinedTransport && record.sessionFile
         ? { ...parsed.data, sessionFile: record.sessionFile }
         : parsed.data;
     const prior = record.snapshot;
@@ -1133,17 +1232,26 @@ export class SessionRegistry {
     // commit completes. Defer file adoption to `commitTransitionLock` rather
     // than asking the generic snapshot path to move a held primary lock.
     this.installSnapshot(record, terminal, false, options.expectedTransition === undefined);
+    if (
+      record._runtimeResumeCheckpoint &&
+      (record._runtimeResumeCheckpoint.owner.hostInstanceId !== terminal.hostInstanceId ||
+        record._runtimeResumeCheckpoint.owner.sessionEpoch !== terminal.sessionEpoch)
+    ) {
+      record._runtimeResumeCheckpoint = undefined;
+    }
     const state = this.publishRuntime(record, "available", undefined, false);
     // Routing is now committed and the successor lock is still held. Only at
     // this point may the predecessor advisory lock be released.
     if (options.expectedTransition !== undefined) {
+      // Reload retains the same internal transport pin. Every other committed
+      // replacement owns its genuine successor path and must stop carrying the
+      // initial confined descriptor/alias into later snapshots.
+      const semanticReplacement = options.expectedTransition.kind !== "reload";
       this.commitTransitionLock(record, batch.transitionId);
-      // Reload is the only host transition that intentionally preserves the
-      // current conversation. Every other successor represents a semantic
-      // session replacement and must reseed renderer transcript ownership,
+      if (semanticReplacement) this.releaseConfinedSource(record);
+      // Every semantic successor must reseed renderer transcript ownership,
       // even when Pi temporarily reuses the same file path or the prepare
       // record did not expose a more specific replacement kind.
-      const semanticReplacement = options.expectedTransition.kind !== "reload";
       if (semanticReplacement || terminal.sessionFile !== prior?.sessionFile) {
         this.onSessionFileChanged(
           record.sessionId,
@@ -1230,6 +1338,7 @@ export class SessionRegistry {
   }
 
   private captureEditorRecovery(record: SessionRecord): void {
+    record._editorRecoveryReconciliation = undefined;
     const editor = record.snapshot?.editor;
     if (
       editor &&
@@ -1239,179 +1348,259 @@ export class SessionRegistry {
     }
   }
 
+  private editorRecoveryWithoutDeliveredPrimary(
+    editor: AgentSessionSnapshot["editor"],
+  ): AgentSessionSnapshot["editor"] | undefined {
+    type EditorCandidate = {
+      text: string;
+      attachments: AgentSessionSnapshot["editor"]["attachments"];
+    };
+    const delivered = { text: editor.text, attachments: editor.attachments };
+    const candidates: EditorCandidate[] = [
+      ...(editor.conflictText !== undefined
+        ? [
+            {
+              text: editor.conflictText,
+              attachments: editor.conflictAttachments ?? [],
+            },
+          ]
+        : []),
+      ...(editor.alternateConflictText !== undefined
+        ? [
+            {
+              text: editor.alternateConflictText,
+              attachments: editor.alternateConflictAttachments ?? [],
+            },
+          ]
+        : []),
+      ...(editor.additionalConflictCandidates ?? []),
+    ];
+    const distinct: EditorCandidate[] = [];
+    for (const candidate of candidates) {
+      if (candidate.text === "" && candidate.attachments.length === 0) continue;
+      if (
+        [delivered, ...distinct].some(
+          (existing) =>
+            existing.text === candidate.text &&
+            isDeepStrictEqual(existing.attachments, candidate.attachments),
+        )
+      )
+        continue;
+      distinct.push(candidate);
+    }
+    const [primary, conflict, alternate, ...additional] = distinct;
+    if (!primary) return undefined;
+    return {
+      revision: editor.revision,
+      text: primary.text,
+      attachments: structuredClone(primary.attachments),
+      ...(conflict
+        ? {
+            conflictText: conflict.text,
+            conflictAttachments: structuredClone(conflict.attachments),
+          }
+        : {}),
+      ...(alternate
+        ? {
+            alternateConflictText: alternate.text,
+            alternateConflictAttachments: structuredClone(alternate.attachments),
+          }
+        : {}),
+      ...(additional.length > 0
+        ? { additionalConflictCandidates: structuredClone(additional) }
+        : {}),
+    };
+  }
+
   private async recoverEditorAfterRestart(record: SessionRecord, proc: SessionHost): Promise<void> {
+    const reconciliation = record._editorRecoveryReconciliation;
+    if (reconciliation) {
+      const disposition = await reconciliation;
+      if (
+        record._dead ||
+        record.proc !== proc ||
+        record._editorRecoveryReconciliation !== reconciliation
+      )
+        return;
+      if (disposition === "dropped" && record._editorRecovery) {
+        record._editorRecovery = this.editorRecoveryWithoutDeliveredPrimary(record._editorRecovery);
+      }
+    }
     const recovery = record._editorRecovery;
     const initialBatch = record._deferredInitialBatch;
-    if (!recovery || !initialBatch) return;
-    const initial = initialBatch.terminalSnapshot.editor;
-    const equal = JSON.stringify(initial) === JSON.stringify(recovery);
-    if (!equal) {
-      type EditorCandidate = { text: string; attachments: unknown[] };
-      const storedCandidates = (editor: typeof recovery): EditorCandidate[] => [
-        ...(editor.conflictText !== undefined
-          ? [
-              {
-                text: editor.conflictText,
-                attachments: editor.conflictAttachments ?? [],
-              },
-            ]
-          : []),
-        ...(editor.alternateConflictText !== undefined
-          ? [
-              {
-                text: editor.alternateConflictText,
-                attachments: editor.alternateConflictAttachments ?? [],
-              },
-            ]
-          : []),
-        ...(editor.additionalConflictCandidates ?? []),
-      ];
-      const deduplicateCandidates = (
-        represented: EditorCandidate[],
-        candidates: EditorCandidate[],
-      ): EditorCandidate[] => {
-        const seen = [...represented];
-        const unique: EditorCandidate[] = [];
-        for (const candidate of candidates) {
-          if (
-            seen.some(
-              (existing) =>
-                existing.text === candidate.text &&
-                JSON.stringify(existing.attachments) === JSON.stringify(candidate.attachments),
+    if (!initialBatch) return;
+    if (recovery) {
+      const initial = initialBatch.terminalSnapshot.editor;
+      const equal = JSON.stringify(initial) === JSON.stringify(recovery);
+      if (!equal) {
+        type EditorCandidate = { text: string; attachments: unknown[] };
+        const storedCandidates = (editor: typeof recovery): EditorCandidate[] => [
+          ...(editor.conflictText !== undefined
+            ? [
+                {
+                  text: editor.conflictText,
+                  attachments: editor.conflictAttachments ?? [],
+                },
+              ]
+            : []),
+          ...(editor.alternateConflictText !== undefined
+            ? [
+                {
+                  text: editor.alternateConflictText,
+                  attachments: editor.alternateConflictAttachments ?? [],
+                },
+              ]
+            : []),
+          ...(editor.additionalConflictCandidates ?? []),
+        ];
+        const deduplicateCandidates = (
+          represented: EditorCandidate[],
+          candidates: EditorCandidate[],
+        ): EditorCandidate[] => {
+          const seen = [...represented];
+          const unique: EditorCandidate[] = [];
+          for (const candidate of candidates) {
+            if (
+              seen.some(
+                (existing) =>
+                  existing.text === candidate.text &&
+                  JSON.stringify(existing.attachments) === JSON.stringify(candidate.attachments),
+              )
             )
-          )
-            continue;
-          seen.push(candidate);
-          unique.push(candidate);
-        }
-        return unique;
-      };
-      let replacementState = initial;
-      let restoredRevision: number | undefined;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const carriedCandidates = deduplicateCandidates(
-          [
-            { text: recovery.text, attachments: recovery.attachments },
-            {
-              text: replacementState.text,
-              attachments: replacementState.attachments,
-            },
-          ],
-          [...storedCandidates(recovery), ...storedCandidates(replacementState)],
-        );
-        const [carriedAlternate, ...carriedAdditional] = carriedCandidates;
-        const restored = await proc.sendEditorPatch({
-          baseRevision: replacementState.revision,
-          revision: replacementState.revision + 1,
-          text: recovery.text,
-          attachments: recovery.attachments,
-          ...(carriedAlternate
-            ? {
-                alternateConflictText: carriedAlternate.text,
-                alternateConflictAttachments: carriedAlternate.attachments,
-              }
-            : {}),
-          ...(carriedAdditional.length > 0
-            ? { additionalConflictCandidates: carriedAdditional }
-            : {}),
-        });
-        if (!restored.success) throw new Error(restored.error ?? "Editor recovery failed");
-        const result = restored.data as
-          | {
-              accepted?: boolean;
-              revision?: number;
-              text?: string;
-              attachments?: unknown[];
-              conflictText?: string;
-              conflictAttachments?: unknown[];
-              alternateConflictText?: string;
-              alternateConflictAttachments?: unknown[];
-              additionalConflictCandidates?: Array<{
-                text: string;
-                attachments: unknown[];
-              }>;
-            }
-          | undefined;
-        if (result?.accepted === true && typeof result.revision === "number") {
-          restoredRevision = result.revision;
-          break;
-        }
-        if (
-          typeof result?.revision !== "number" ||
-          typeof result.text !== "string" ||
-          !Array.isArray(result.attachments)
-        ) {
-          throw new Error("Invalid editor recovery response");
-        }
-        replacementState = {
-          revision: result.revision,
-          text: result.text,
-          attachments: result.attachments,
-          ...(result.conflictText !== undefined
-            ? {
-                conflictText: result.conflictText,
-                conflictAttachments: result.conflictAttachments ?? [],
-                ...(result.alternateConflictText !== undefined
-                  ? {
-                      alternateConflictText: result.alternateConflictText,
-                      alternateConflictAttachments: result.alternateConflictAttachments ?? [],
-                    }
-                  : {}),
-                ...(result.additionalConflictCandidates?.length
-                  ? {
-                      additionalConflictCandidates: result.additionalConflictCandidates,
-                    }
-                  : {}),
-              }
-            : {}),
+              continue;
+            seen.push(candidate);
+            unique.push(candidate);
+          }
+          return unique;
         };
-      }
-      // If all retries conflict, the last rejected patch has already preserved
-      // the recovery text/attachments in host conflict state. Keep that live
-      // replacement instead of killing it and losing its canonical draft.
-      if (restoredRevision !== undefined) {
-        const candidates = deduplicateCandidates(
-          [{ text: recovery.text, attachments: recovery.attachments }],
-          [
-            ...storedCandidates(recovery),
-            ...(replacementState.text !== "" || replacementState.attachments.length > 0
-              ? [
-                  {
-                    text: replacementState.text,
-                    attachments: replacementState.attachments,
-                  },
-                ]
-              : []),
-            ...storedCandidates(replacementState),
-          ],
-        );
-        const [primaryConflict, alternateConflict, ...additionalConflicts] = candidates;
-        if (primaryConflict) {
-          const review = await proc.sendEditorPatch({
-            baseRevision: restoredRevision - 1,
-            revision: restoredRevision + 1,
-            text: primaryConflict.text,
-            attachments: primaryConflict.attachments,
-            ...(alternateConflict
+        let replacementState = initial;
+        let restoredRevision: number | undefined;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const carriedCandidates = deduplicateCandidates(
+            [
+              { text: recovery.text, attachments: recovery.attachments },
+              {
+                text: replacementState.text,
+                attachments: replacementState.attachments,
+              },
+            ],
+            [...storedCandidates(recovery), ...storedCandidates(replacementState)],
+          );
+          const [carriedAlternate, ...carriedAdditional] = carriedCandidates;
+          const restored = await proc.sendEditorPatch({
+            baseRevision: replacementState.revision,
+            revision: replacementState.revision + 1,
+            text: recovery.text,
+            attachments: recovery.attachments,
+            ...(carriedAlternate
               ? {
-                  alternateConflictText: alternateConflict.text,
-                  alternateConflictAttachments: alternateConflict.attachments,
+                  alternateConflictText: carriedAlternate.text,
+                  alternateConflictAttachments: carriedAlternate.attachments,
                 }
               : {}),
-            ...(additionalConflicts.length > 0
-              ? { additionalConflictCandidates: additionalConflicts }
+            ...(carriedAdditional.length > 0
+              ? { additionalConflictCandidates: carriedAdditional }
               : {}),
           });
+          if (!restored.success) throw new Error(restored.error ?? "Editor recovery failed");
+          const result = restored.data as
+            | {
+                accepted?: boolean;
+                revision?: number;
+                text?: string;
+                attachments?: unknown[];
+                conflictText?: string;
+                conflictAttachments?: unknown[];
+                alternateConflictText?: string;
+                alternateConflictAttachments?: unknown[];
+                additionalConflictCandidates?: Array<{
+                  text: string;
+                  attachments: unknown[];
+                }>;
+              }
+            | undefined;
+          if (result?.accepted === true && typeof result.revision === "number") {
+            restoredRevision = result.revision;
+            break;
+          }
           if (
-            !review.success ||
-            (review.data as { accepted?: boolean } | undefined)?.accepted !== false
-          )
-            throw new Error(review.error ?? "Editor conflict recovery failed");
+            typeof result?.revision !== "number" ||
+            typeof result.text !== "string" ||
+            !Array.isArray(result.attachments)
+          ) {
+            throw new Error("Invalid editor recovery response");
+          }
+          replacementState = {
+            revision: result.revision,
+            text: result.text,
+            attachments: result.attachments,
+            ...(result.conflictText !== undefined
+              ? {
+                  conflictText: result.conflictText,
+                  conflictAttachments: result.conflictAttachments ?? [],
+                  ...(result.alternateConflictText !== undefined
+                    ? {
+                        alternateConflictText: result.alternateConflictText,
+                        alternateConflictAttachments: result.alternateConflictAttachments ?? [],
+                      }
+                    : {}),
+                  ...(result.additionalConflictCandidates?.length
+                    ? {
+                        additionalConflictCandidates: result.additionalConflictCandidates,
+                      }
+                    : {}),
+                }
+              : {}),
+          };
+        }
+        // If all retries conflict, the last rejected patch has already preserved
+        // the recovery text/attachments in host conflict state. Keep that live
+        // replacement instead of killing it and losing its canonical draft.
+        if (restoredRevision !== undefined) {
+          const candidates = deduplicateCandidates(
+            [{ text: recovery.text, attachments: recovery.attachments }],
+            [
+              ...storedCandidates(recovery),
+              ...(replacementState.text !== "" || replacementState.attachments.length > 0
+                ? [
+                    {
+                      text: replacementState.text,
+                      attachments: replacementState.attachments,
+                    },
+                  ]
+                : []),
+              ...storedCandidates(replacementState),
+            ],
+          );
+          const [primaryConflict, alternateConflict, ...additionalConflicts] = candidates;
+          if (primaryConflict) {
+            const review = await proc.sendEditorPatch({
+              baseRevision: restoredRevision - 1,
+              revision: restoredRevision + 1,
+              text: primaryConflict.text,
+              attachments: primaryConflict.attachments,
+              ...(alternateConflict
+                ? {
+                    alternateConflictText: alternateConflict.text,
+                    alternateConflictAttachments: alternateConflict.attachments,
+                  }
+                : {}),
+              ...(additionalConflicts.length > 0
+                ? { additionalConflictCandidates: additionalConflicts }
+                : {}),
+            });
+            if (
+              !review.success ||
+              (review.data as { accepted?: boolean } | undefined)?.accepted !== false
+            )
+              throw new Error(review.error ?? "Editor conflict recovery failed");
+          }
         }
       }
     }
     const snapshot = await proc.requestSnapshot();
     record._editorRecovery = undefined;
+    record._editorRecoveryReconciliation = undefined;
     record._deferredInitialBatch = undefined;
     this.installTransitionBatch(
       record,
@@ -1481,6 +1670,7 @@ export class SessionRegistry {
                 expectedEpoch: owner.sessionEpoch,
                 editorRevision: intent.editorRevision,
                 text: intent.text,
+                inputKind: intent.inputKind,
                 images: structuredClone(intent.images),
                 requestedMode: intent.requestedMode,
                 surface: intent.surface,
@@ -1503,7 +1693,10 @@ export class SessionRegistry {
               certainty: "unknown",
             };
       record._restorations.set(restorationId, structuredClone(restoration));
-      this.queueRestoration(record, restoration);
+      const resolution = this.restorationResolution(record, restoration);
+      retained.restorationResolution = resolution;
+      if (intent.kind === "submit")
+        this.fenceEditorRecoveryOnRestoration(record, intent.editorRevision, resolution);
       // Keep the entry as a tombstone. A successor is never allowed to replay
       // it and an old delayed frame cannot clear a new owner's escrow.
       record._retainedDispatchIntents.set(escrowKey, retained);
@@ -1529,9 +1722,19 @@ export class SessionRegistry {
       if (!recoverable) continue;
       retained.disposition = "outcome_unknown";
       retained.updatedAt = Date.now();
+      const payload = retained.payload;
+      const ownedByFailedProc =
+        payload.expectedHostId === proc.hostInstanceId &&
+        payload.expectedEpoch === proc.sessionEpoch;
+      if (ownedByFailedProc && retained.restorationResolution) {
+        this.fenceEditorRecoveryOnRestoration(
+          record,
+          payload.editorRevision,
+          retained.restorationResolution,
+        );
+      }
       if (retained.recoveryPublished) continue;
       retained.recoveryPublished = true;
-      const payload = retained.payload;
       const restoration: RuntimeRecord & { type: "queue_restoration" } = {
         type: "queue_restoration",
         restorationId: `ambiguous-submission:${payload.intentId}`,
@@ -1541,7 +1744,11 @@ export class SessionRegistry {
       };
       if (!record._restorations.has(restoration.restorationId)) {
         record._restorations.set(restoration.restorationId, structuredClone(restoration));
-        this.queueRestoration(record, restoration);
+        const resolution = this.restorationResolution(record, restoration);
+        retained.restorationResolution = resolution;
+        if (ownedByFailedProc) {
+          this.fenceEditorRecoveryOnRestoration(record, payload.editorRevision, resolution);
+        }
       }
       this.onSubmission(record.sessionId, {
         intentId: payload.intentId,
@@ -1933,7 +2140,7 @@ export class SessionRegistry {
           certainty: "unknown",
         };
         record._restorations.set(restorationId, structuredClone(restoration));
-        this.queueRestoration(record, restoration);
+        retained.restorationResolution = this.restorationResolution(record, restoration);
       }
       if (publishDisposition) this.onSubmission(sessionId, result);
       return result;

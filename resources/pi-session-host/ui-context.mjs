@@ -24,6 +24,17 @@ import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { createKeyboardProtocolNegotiator, createKittyGlobalGate } from "./keyboard-protocol.mjs";
 
+function isSlashSubmission(request) {
+  if (request?.inputKind === "slash_command") return true;
+  if (request?.inputKind === "ordinary") return false;
+  // Compatibility for submissions created before inputKind was added.
+  return typeof request?.text === "string" && request.text.startsWith("/");
+}
+
+function inputKindForEditorText(text) {
+  return typeof text === "string" && text.startsWith("/") ? "slash_command" : "ordinary";
+}
+
 // ─── Dialog resolver (promise-based, one-at-a-time) ───────────────────────────
 
 export function createDialogResolver(sendToMain, onAcknowledged = () => {}) {
@@ -460,11 +471,37 @@ export function createUIContext({
 
   function acceptEditorSubmission(request) {
     if (request.editorRevision !== editorRevision) return false;
+    const pendingAtRevision = [...pendingSubmits.values()].filter(
+      (item) => item.accepted !== true && item.revision === request.editorRevision,
+    );
+    let pending;
+    if (typeof request.intentId === "string") {
+      pending = pendingAtRevision.find((item) => item.submissionIntentId === request.intentId);
+      // A pending unified editor submission owns this revision. Never let an
+      // unrelated intent acknowledge whichever pending item happened to be
+      // inserted first.
+      if (pendingAtRevision.length > 0 && pending === undefined) return false;
+    } else if (pendingAtRevision.length > 0) {
+      const exactTextMatches = pendingAtRevision.filter((item) => item.text === request.text);
+      if (exactTextMatches.length === 1) pending = exactTextMatches[0];
+      else if (pendingAtRevision.length === 1) pending = pendingAtRevision[0];
+      else return false;
+    }
+    const authoritativeEditorText = pending?.text ?? editorText;
+    // Current authority requests carry the classification derived from the
+    // revision-matched raw editor text. Missing inputKind keeps the direct
+    // legacy helper behavior for one-version compatibility.
+    if (
+      request.inputKind !== undefined &&
+      request.inputKind !== inputKindForEditorText(authoritativeEditorText)
+    ) {
+      return false;
+    }
     editorRevision++;
     editorText = "";
     // Slash commands consume only their command text. Attachments are staged
     // prompt context and remain authoritative for the next ordinary prompt.
-    if (!request.text.startsWith("/")) editorAttachments = [];
+    if (!isSlashSubmission(request)) editorAttachments = [];
     editorConflictText = undefined;
     editorConflictAttachments = [];
     editorAlternateConflictText = undefined;
@@ -475,11 +512,7 @@ export function createUIContext({
       unifiedTuiState.tui.requestRender();
       maybeDisposeUnifiedTui();
     }
-    for (const pending of pendingSubmits.values()) {
-      if (pending.revision === request.editorRevision && pending.text === request.text) {
-        pending.accepted = true;
-      }
-    }
+    if (pending) pending.accepted = true;
     return true;
   }
 
@@ -727,8 +760,15 @@ export function createUIContext({
       editorText = "";
       editorConflictText = undefined;
       const id = crypto.randomUUID();
-      pendingSubmits.set(id, { text, revision, accepted: false });
-      sendToMain({ type: "unified_submit_request", id, text, editorRevision: revision });
+      const submissionIntentId = crypto.randomUUID();
+      pendingSubmits.set(id, { text, revision, submissionIntentId, accepted: false });
+      sendToMain({
+        type: "unified_submit_request",
+        id,
+        text,
+        editorRevision: revision,
+        submissionIntentId,
+      });
     };
 
     // Clipboard image paste (Ctrl+V / Alt+V). pi wires this on its PRIVATE
@@ -1759,6 +1799,7 @@ export function createUIContext({
           id,
           text: value.text,
           revision: value.revision,
+          submissionIntentId: value.submissionIntentId,
         })),
     },
     unified: {

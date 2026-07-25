@@ -86,6 +86,78 @@ export async function importPiTui(piPath) {
   return import(pathToFileURL(tuiEntry).href);
 }
 
+// ─── Session runtime options ─────────────────────────────────────────────────
+
+/**
+ * Resolve per-session runtime overrides from the active session-file branch.
+ *
+ * Pi 0.80.10 restores model/thinking changes only when the active context has
+ * at least one message. An existing session whose branch contains only
+ * model/thinking metadata would therefore inherit whichever global defaults a
+ * different session most recently wrote. Resolve those explicit branch values
+ * through Pi's public SessionManager and ModelRuntime surfaces before runtime
+ * construction. Main may also supply the last authoritative selection from
+ * this same session record when replacing its host. That owner-local state is
+ * only a fallback for branch settings that are not persisted; explicit branch
+ * metadata always wins. Returning no override preserves Pi's normal settings
+ * fallback for brand-new sessions and unavailable/unauthenticated models.
+ */
+export function resolveSessionRuntimeOverrides(sessionManager, modelRuntime, runtimeResumeState) {
+  const context = sessionManager.buildSessionContext();
+  const branch = sessionManager.getBranch();
+  const overrides = {};
+  const resumedModel =
+    runtimeResumeState &&
+    Object.hasOwn(runtimeResumeState, "model") &&
+    runtimeResumeState.model === null
+      ? null
+      : runtimeResumeState?.model &&
+          typeof runtimeResumeState.model.provider === "string" &&
+          runtimeResumeState.model.provider.length > 0 &&
+          typeof runtimeResumeState.model.modelId === "string" &&
+          runtimeResumeState.model.modelId.length > 0
+        ? runtimeResumeState.model
+        : undefined;
+  // A persisted model (including one derived from an assistant message) owns
+  // this branch even when it is currently unavailable. Do not substitute a
+  // resume hint for explicit persisted identity.
+  const modelReference = context.model ?? resumedModel;
+
+  if (modelReference) {
+    const model = modelRuntime.getModel(modelReference.provider, modelReference.modelId);
+    if (model && modelRuntime.hasConfiguredAuth(model.provider)) {
+      overrides.model = model;
+    }
+  }
+
+  if (branch.some((entry) => entry.type === "thinking_level_change")) {
+    overrides.thinkingLevel = context.thinkingLevel;
+  } else if (
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(
+      runtimeResumeState?.thinkingLevel,
+    )
+  ) {
+    overrides.thinkingLevel = runtimeResumeState.thinkingLevel;
+  }
+
+  return overrides;
+}
+
+/**
+ * Bind a same-session continuation checkpoint to the first runtime factory
+ * invocation only. Pi retains and reuses the factory for /new, /resume, /fork,
+ * and import, so closing over the checkpoint directly would leak the
+ * predecessor session's model/thinking selection into a later session.
+ */
+export function createSessionRuntimeOverrideResolver(runtimeResumeState) {
+  let initial = true;
+  return (sessionManager, modelRuntime) => {
+    const resumeState = initial ? runtimeResumeState : undefined;
+    initial = false;
+    return resolveSessionRuntimeOverrides(sessionManager, modelRuntime, resumeState);
+  };
+}
+
 // ─── HTTP Dispatcher ──────────────────────────────────────────────────────────
 
 let _dispatcherConfigured = false;

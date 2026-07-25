@@ -278,6 +278,8 @@ async function executePrompt(
 ): Promise<IntentCompletion> {
   const observation = deps.getIntentObservation?.(sessionId);
   const deliveryMode = action.deliveryMode ?? "steer";
+  const inputKind =
+    action.inputKind ?? (action.text.startsWith("/") ? "slash_command" : "ordinary");
   if (!observation)
     return dispatchAndAwait(
       sessionId,
@@ -285,6 +287,7 @@ async function executePrompt(
         kind: "submit",
         editorRevision: 0,
         text: action.text,
+        inputKind,
         images: [],
         requestedMode: deliveryMode,
         surface: deps.uiSurface ?? "composer",
@@ -297,6 +300,7 @@ async function executePrompt(
         kind: "submit",
         editorRevision: observation.editorRevision,
         text: action.text,
+        inputKind,
         images: (action.images ?? []).map(({ data, mimeType }) => ({
           type: "image" as const,
           data,

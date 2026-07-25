@@ -1,5 +1,16 @@
 import * as crypto from "node:crypto";
 
+function isSlashSubmission(request) {
+  if (request?.inputKind === "slash_command") return true;
+  if (request?.inputKind === "ordinary") return false;
+  // Compatibility for submissions created before inputKind was added.
+  return typeof request?.text === "string" && request.text.startsWith("/");
+}
+
+function inputKindForEditorText(text) {
+  return typeof text === "string" && text.startsWith("/") ? "slash_command" : "ordinary";
+}
+
 /**
  * Host-side authority for direct public AgentSession snapshots and GUI ingress.
  * It deliberately owns only host facts (admission, barriers, custody); Pi getter
@@ -8,6 +19,7 @@ import * as crypto from "node:crypto";
 export function createStateAuthority({
   hostInstanceId,
   initialSession,
+  initialPresentedSessionFile,
   sendControl = () => {},
   sendRecord = () => {},
   // New consumers can receive one indivisible semantic frame. The legacy
@@ -31,6 +43,15 @@ export function createStateAuthority({
   runWithSurface = (_surface, operation) => operation(),
 }) {
   let session = initialSession;
+  // A confined search open may give Pi an inode-stable transport path
+  // (`/proc/self/fd/4` or a runtime-pin hard link). That path is internal to
+  // the host: snapshots and presentation identify the canonical validated
+  // source until Pi genuinely replaces the AgentSession.
+  let presentedSessionFileOverride =
+    typeof initialPresentedSessionFile === "string" && initialPresentedSessionFile.length > 0
+      ? initialPresentedSessionFile
+      : undefined;
+  const presentedSessionFile = () => presentedSessionFileOverride ?? session.sessionFile;
   let sessionEpoch = 0;
   let snapshotSequence = 0;
   // Semantic frames have their own contiguous source cursor. Host IPC carries
@@ -42,10 +63,13 @@ export function createStateAuthority({
     extensionUi: 1,
     panel: 1,
   };
+  const initialTranscriptSessionFile = presentedSessionFile();
   const transcriptPresentation = {
-    persistedHistoryCursor: initialSession.sessionFile ?? null,
+    persistedHistoryCursor: initialTranscriptSessionFile ?? null,
     liveTailCursor: null,
-    overlapBoundary: initialSession.sessionFile ? `persisted:${initialSession.sessionFile}` : null,
+    overlapBoundary: initialTranscriptSessionFile
+      ? `persisted:${initialTranscriptSessionFile}`
+      : null,
     currentStreamingMessage: undefined,
   };
   let stopped = false;
@@ -94,6 +118,16 @@ export function createStateAuthority({
   const custody = [];
   const activeIntents = new Map();
   const restorations = new Map();
+  // Pi's public prompt preflight can await extension input while an existing
+  // turn is streaming. Bare Escape advances this generation synchronously;
+  // any prompt that has not reached its successful preflight callback is
+  // fenced before Pi can reinterpret it as a new idle turn.
+  let escapeGeneration = 0;
+  // If the public late-queue cleanup itself fails, the child can no longer
+  // prove that a cancelled prompt is absent from Pi's private delivery queue.
+  // Keep a permanent local fence until main retires this authority.
+  let fatalAdmissionFence = false;
+  const pendingAdmissions = new Map();
   const attachmentLedger = new Map();
   // Original GUI payloads retained only while their public queue slot remains
   // attributable. Pi exposes transformed text but no stable queue-item IDs;
@@ -101,9 +135,9 @@ export function createStateAuthority({
   // rebuild atomically for user-requested remove/edit/reorder operations.
   const queuedPayloads = new Map();
   let queueMutationActive = false;
-  // Positional identities parallel Pi's public transformed-text queues. Text is
-  // presentation only: GUI ownership survives extension rewrites by following
-  // FIFO queue slots and decorating the corresponding delivery event.
+  // Positional identities parallel Pi's public text queues. GUI ownership is
+  // assigned only at an attributable admission boundary, then follows that
+  // FIFO slot so delivery can carry the stable intent without text matching.
   let queueIdentity = { steer: [], followUp: [] };
   let queueLengths = { steer: 0, followUp: 0 };
   let queueValues = { steer: [], followUp: [] };
@@ -181,7 +215,7 @@ export function createStateAuthority({
       // Queued slash commands may be expanded or extension-dispatched by Pi.
       // Replaying one through the public SDK would not preserve its original
       // semantics, so only ordinary prompts are eligible for queue mutation.
-      replayable: typeof request.text === "string" && !request.text.startsWith("/"),
+      replayable: typeof request.text === "string" && !isSlashSubmission(request),
     });
   }
 
@@ -250,6 +284,7 @@ export function createStateAuthority({
       if (
         queue.length === claim.priorLength + 1 &&
         baselineUnchanged &&
+        queue[claim.priorLength] === claim.text &&
         identities[claim.priorLength] === null
       ) {
         identities[claim.priorLength] = intentId;
@@ -270,7 +305,7 @@ export function createStateAuthority({
     return { steering, followUp, deliveredQueueIntentIds };
   }
 
-  function registerQueuedIntent(request, priorLength, priorValues) {
+  function registerQueuedIntent(request, priorLength, priorValues, admission) {
     const { steering, followUp } = readQueues();
     const mode = request.requestedMode === "steer" ? "steer" : "followUp";
     const queue = mode === "steer" ? steering : followUp;
@@ -280,7 +315,7 @@ export function createStateAuthority({
     // never replayable by the queue manager, so it must not retain a deferred
     // positional claim that could later steal a normal prompt's queue slot.
     // A resulting public slot remains intentionally unowned/uneditable.
-    if (request.text.startsWith("/")) {
+    if (isSlashSubmission(request)) {
       pendingQueueClaims.delete(request.intentId);
       queuedPayloads.delete(request.intentId);
       return;
@@ -290,11 +325,25 @@ export function createStateAuthority({
       pendingQueueClaims.delete(request.intentId);
       return;
     }
+    // Once an input handler participates, a sole queue append may belong to
+    // handled/extension work rather than this GUI prompt. Only an identity
+    // assigned from the exact ALS-correlated raw Pi queue_update above can own
+    // that slot; callback-time +1 inference is unsafe.
+    if (admission && !admission.rawQueueAttributionEligible) {
+      pendingQueueClaims.delete(request.intentId);
+      queuedPayloads.delete(request.intentId);
+      return;
+    }
     const baselineUnchanged = priorValues.every((value, index) => value === queue[index]);
     // Successful admission may claim only the single slot appended relative
     // to its pre-prompt baseline. Extra/replaced slots are extension-owned or
     // ambiguous and must never inherit this GUI intent.
-    if (queue.length === priorLength + 1 && baselineUnchanged && identities[priorLength] === null) {
+    if (
+      queue.length === priorLength + 1 &&
+      baselineUnchanged &&
+      queue[priorLength] === request.text &&
+      identities[priorLength] === null
+    ) {
       identities[priorLength] = request.intentId;
       retainQueuedPayload(request);
       pendingQueueClaims.delete(request.intentId);
@@ -306,20 +355,65 @@ export function createStateAuthority({
         mode,
         priorLength,
         priorValues: [...priorValues],
+        text: request.text,
       });
       return;
     }
     pendingQueueClaims.delete(request.intentId);
   }
 
-  function finalizeQueuedIntentClaim(request, priorLength, priorValues) {
+  function finalizeQueuedIntentClaim(request, priorLength, priorValues, admission) {
     // Pi may expose the accepted queue slot only as prompt() settles. Take one
     // final direct getter sample, then retire an unresolved claim permanently:
     // extension commands can report successful preflight without queueing, and
     // must never steal a later ordinary prompt's slot.
-    registerQueuedIntent(request, priorLength, priorValues);
+    registerQueuedIntent(request, priorLength, priorValues, admission);
     pendingQueueClaims.delete(request.intentId);
     if (!ownsQueuedIntent(request.intentId)) queuedPayloads.delete(request.intentId);
+  }
+
+  function observeAttributableAdmissionQueueAppend(initiatingIntentId) {
+    if (typeof initiatingIntentId !== "string") return;
+    const admission = pendingAdmissions.get(initiatingIntentId);
+    if (!admission || admission.crossedAcceptance) return;
+    const mode = admission.request.requestedMode === "steer" ? "steer" : "followUp";
+    const priorObservedValues = [...queueValues[mode]];
+    const priorObservedLength = priorObservedValues.length;
+    const { steering, followUp } = readQueues();
+    const queue = mode === "steer" ? steering : followUp;
+    const identities = queueIdentity[mode];
+    const priorObservationUnchanged = priorObservedValues.every(
+      (value, index) => value === queue[index],
+    );
+    const observedOneSlotGrowth =
+      queue.length === priorObservedLength + 1 &&
+      priorObservationUnchanged &&
+      identities[priorObservedLength] === null;
+    if (observedOneSlotGrowth) {
+      // This exact growth is still deliberately non-owning. A handler or
+      // transform can produce the slot, but successful preflight may use it
+      // to preserve queue/attachment custody if callback-time isStreaming has
+      // already fallen back to false. Positional ownership remains subject to
+      // the stricter raw-text/no-handler checks below.
+      admission.queueActivityObserved = true;
+    }
+    if (admission.queueAppendAttributed || !admission.rawQueueAttributionEligible) return;
+    // The context proves this queue_update ran under the owning prompt. With
+    // no input handler and ordinary/raw transport, Pi's own append is the first
+    // exact one-slot growth observed in that context. Other admissions may
+    // have appended since this prompt's baseline, so compare with the prior
+    // public projection rather than assuming the original baseline is current.
+    // Once tagged,
+    // the positional identity survives a later unrelated append in the await
+    // inside _queueSteer/_queueFollowUp.
+    if (
+      observedOneSlotGrowth &&
+      queue[priorObservedLength] === admission.request.text &&
+      identities[priorObservedLength] === null
+    ) {
+      identities[priorObservedLength] = initiatingIntentId;
+      admission.queueAppendAttributed = true;
+    }
   }
 
   function resetQueueIdentity() {
@@ -396,16 +490,24 @@ export function createStateAuthority({
         );
       case "submit":
         return (
-          isStrictObject(intent, [
-            "kind",
-            "editorRevision",
-            "text",
-            "images",
-            "requestedMode",
-            "surface",
-          ]) &&
+          Object.keys(intent).every((key) =>
+            [
+              "kind",
+              "editorRevision",
+              "text",
+              "inputKind",
+              "images",
+              "requestedMode",
+              "surface",
+            ].includes(key),
+          ) &&
+          ["kind", "editorRevision", "text", "images", "requestedMode", "surface"].every(
+            (key) => key in intent,
+          ) &&
           nonNegativeInteger(intent.editorRevision) &&
           typeof intent.text === "string" &&
+          (intent.inputKind === undefined ||
+            ["ordinary", "slash_command"].includes(intent.inputKind)) &&
           Array.isArray(intent.images) &&
           intent.images.every(image) &&
           ["steer", "followUp"].includes(intent.requestedMode) &&
@@ -515,6 +617,7 @@ export function createStateAuthority({
       sessionEpoch: request.expectedEpoch,
       editorRevision: request.editorRevision,
       text: request.text,
+      inputKind: request.inputKind,
       images: request.images ?? [],
       requestedMode: request.requestedMode,
       surface: request.surface,
@@ -815,7 +918,7 @@ export function createStateAuthority({
       model: s.model ?? null,
       thinkingLevel: s.thinkingLevel,
       sessionId: s.sessionId,
-      sessionFile: s.sessionFile,
+      sessionFile: presentedSessionFile(),
       sessionName: s.sessionName,
       pendingMessageCount: s.pendingMessageCount,
       steering,
@@ -823,7 +926,7 @@ export function createStateAuthority({
       steeringIntentIds: [...queueIdentity.steer],
       followUpIntentIds: [...queueIdentity.followUp],
       hostFacts: {
-        submitting: submitting > 0 || unresolvedAdmissions > 0,
+        submitting: submitting > 0 || unresolvedAdmissions > 0 || fatalAdmissionFence,
         actualCompaction,
         navigation: navigationDepth > 0,
         pendingDialogs: Number(getCatalog()?.pendingDialogs ?? 0),
@@ -1106,12 +1209,26 @@ export function createStateAuthority({
     const terminalSnapshot = semanticSnapshot(directSnapshot);
     observeSnapshotMutation(terminalSnapshot);
     const transportSequence = ++semanticTransportSequence;
+    const runtimeResumeState = {
+      model:
+        typeof terminalSnapshot.model?.provider === "string" &&
+        terminalSnapshot.model.provider.length > 0 &&
+        typeof terminalSnapshot.model.id === "string" &&
+        terminalSnapshot.model.id.length > 0
+          ? {
+              provider: terminalSnapshot.model.provider,
+              modelId: terminalSnapshot.model.id,
+            }
+          : null,
+      thinkingLevel: terminalSnapshot.thinkingLevel,
+    };
     return {
       owner: semanticOwner(),
       transportSequence,
       frameId: `${hostInstanceId}:${sessionEpoch}:${transportSequence}`,
       records: authorityRecords(records),
       terminalSnapshot,
+      runtimeResumeState,
     };
   }
 
@@ -1545,7 +1662,252 @@ export function createStateAuthority({
     });
   }
 
-  async function admit(request, fromCustody = false) {
+  function rememberAdmissionAttachments(admission) {
+    if (admission.attachmentsRemembered) return;
+    admission.attachmentsRemembered = true;
+    rememberAttachments(admission.request);
+  }
+
+  function trackUnresolvedAdmission(admission) {
+    if (admission.unresolvedTracked) return;
+    admission.unresolvedTracked = true;
+    unresolvedAdmissions++;
+    admission.stuckTimer = setTimeout(() => {
+      if (
+        !admission.fatalSignalled &&
+        pendingAdmissions.get(admission.request.intentId) === admission
+      ) {
+        admission.fatalSignalled = true;
+        onAdmissionStuck({
+          intentId: admission.request.intentId,
+          sessionEpoch: admission.sessionEpoch,
+        });
+      }
+    }, admissionStuckMs);
+    admission.stuckTimer.unref?.();
+  }
+
+  function releasePendingAdmission(admission) {
+    if (pendingAdmissions.get(admission.request.intentId) !== admission) return;
+    pendingAdmissions.delete(admission.request.intentId);
+    if (admission.stuckTimer) clearTimeout(admission.stuckTimer);
+    if (admission.unresolvedTracked) {
+      admission.unresolvedTracked = false;
+      unresolvedAdmissions--;
+    }
+    if (admission.cancelled && activeIntents.get(admission.request.intentId) === "unknown") {
+      activeIntents.delete(admission.request.intentId);
+    }
+    if (admission.cancelled) {
+      scheduleCustodyDrain();
+      publishSnapshot();
+    }
+  }
+
+  function hasCancelledAdmissionFence() {
+    return (
+      fatalAdmissionFence ||
+      [...pendingAdmissions.values()].some((admission) => admission.cancelled)
+    );
+  }
+
+  function cancelUnacceptedAdmissions() {
+    const generation = ++escapeGeneration;
+    const cancelled = [];
+    for (const admission of pendingAdmissions.values()) {
+      if (
+        admission.escapeGeneration >= generation ||
+        admission.crossedAcceptance ||
+        admission.cancelled
+      ) {
+        continue;
+      }
+      admission.cancelled = true;
+      activeIntents.set(admission.request.intentId, "unknown");
+      trackUnresolvedAdmission(admission);
+      admission.resolveCancellation();
+      cancelled.push(admission);
+    }
+    return cancelled;
+  }
+
+  function publishCancelledAdmissionRestoration(admissions) {
+    const unpublished = admissions.filter((admission) => !admission.restorationPublished);
+    if (unpublished.length === 0) return undefined;
+    let firstRestorationId;
+    for (const admission of unpublished) {
+      const restorationId = crypto.randomUUID();
+      firstRestorationId ??= restorationId;
+      const steer = admission.request.requestedMode === "steer";
+      const restoration = {
+        type: "queue_restoration",
+        restorationId,
+        steering: steer ? [admission.request.text] : [],
+        followUp: steer ? [] : [admission.request.text],
+        originalAttachments: [
+          {
+            intentId: admission.request.intentId,
+            images: structuredClone(admission.request.images ?? []),
+          },
+        ],
+        clearedIntentIds: [admission.request.intentId],
+        // An extension input/command hook may have performed an effect before
+        // Pi invokes preflightResult. The prompt delivery is fenced, but only
+        // main's persisted-history reconciliation can classify the whole hook.
+        certainty: "unknown",
+      };
+      restorations.set(restorationId, restoration);
+      record(restoration);
+      admission.restorationPublished = true;
+      admission.restorationId = restorationId;
+      reportSubmission(
+        resultFor(admission.request, "outcome_unknown", {
+          message:
+            "Escape fenced prompt admission before delivery; review this submission before retrying",
+        }),
+      );
+    }
+    return firstRestorationId;
+  }
+
+  function restorationLaneAfterAttributedCancellation(
+    messages,
+    identities,
+    attributedCancelledIntentIds,
+    allCancelledIntentIds = attributedCancelledIntentIds,
+  ) {
+    const aligned = messages.length === identities.length;
+    const retainedMessages = [];
+    const retainedIntentIds = [];
+    for (const [index, message] of messages.entries()) {
+      const intentId = aligned ? identities[index] : undefined;
+      if (typeof intentId === "string" && attributedCancelledIntentIds.has(intentId)) continue;
+      retainedMessages.push(message);
+      if (typeof intentId === "string" && !allCancelledIntentIds.has(intentId)) {
+        retainedIntentIds.push(intentId);
+      }
+    }
+    // If Pi's returned clear payload cannot be aligned with the immediately
+    // preceding public projection, preserve every text and retain only
+    // non-cancelled correlation IDs as non-positional cleared custody.
+    if (!aligned) {
+      retainedIntentIds.push(
+        ...identities.filter(
+          (intentId) => typeof intentId === "string" && !allCancelledIntentIds.has(intentId),
+        ),
+      );
+    }
+    return { messages: retainedMessages, intentIds: retainedIntentIds };
+  }
+
+  function clearLateQueueForCancelledAdmission(admission) {
+    if (admission.lateQueueCleanupAttempted) return;
+    admission.lateQueueCleanupAttempted = true;
+    let queuesBefore;
+    let identitiesBefore;
+    let attachmentSnapshot;
+    try {
+      queuesBefore = readQueues();
+      const mode = admission.request.requestedMode === "steer" ? "steer" : "followUp";
+      const lateLane = mode === "steer" ? queuesBefore.steering : queuesBefore.followUp;
+      if (lateLane.length === 0) return;
+      identitiesBefore = {
+        steer: [...queueIdentity.steer],
+        followUp: [...queueIdentity.followUp],
+      };
+      const cancelledAdmissions = [...pendingAdmissions.values()].filter(
+        (candidate) => candidate.cancelled,
+      );
+      const allCancelledIntentIds = new Set(
+        cancelledAdmissions.map((candidate) => candidate.request.intentId),
+      );
+      attachmentSnapshot = snapshotAttachmentsForClearedQueue(allCancelledIntentIds);
+
+      // clearQueue() is the only public removal API. Exclude only exact slots
+      // attributed by queue_update to cancelled admissions; a handled input
+      // may append nothing, and unrelated work may append after Pi's slot
+      // while _queueSteer/_queueFollowUp is still awaiting.
+      const queued = session.clearQueue() ?? {};
+      const clearedSteering = Array.isArray(queued.steering)
+        ? [...queued.steering]
+        : [...queuesBefore.steering];
+      const clearedFollowUp = Array.isArray(queued.followUp)
+        ? [...queued.followUp]
+        : [...queuesBefore.followUp];
+      const attributableCancelledIds = new Set(
+        cancelledAdmissions
+          .filter((candidate) => candidate.queueAppendAttributed)
+          .map((candidate) => candidate.request.intentId),
+      );
+      const steeringRestoration = restorationLaneAfterAttributedCancellation(
+        clearedSteering,
+        identitiesBefore.steer,
+        attributableCancelledIds,
+        allCancelledIntentIds,
+      );
+      const followUpRestoration = restorationLaneAfterAttributedCancellation(
+        clearedFollowUp,
+        identitiesBefore.followUp,
+        attributableCancelledIds,
+        allCancelledIntentIds,
+      );
+      const steering = steeringRestoration.messages;
+      const followUp = followUpRestoration.messages;
+      const clearedIntentIds = [...steeringRestoration.intentIds, ...followUpRestoration.intentIds];
+
+      resetQueueIdentity();
+      attachmentLedger.clear();
+      if (
+        session.getSteeringMessages().length !== 0 ||
+        session.getFollowUpMessages().length !== 0
+      ) {
+        throw new Error("The SDK retained a late queue entry after cancellation");
+      }
+
+      const otherAttachments = attachmentSnapshot.originals;
+      if (
+        steering.length > 0 ||
+        followUp.length > 0 ||
+        otherAttachments.length > 0 ||
+        clearedIntentIds.length > 0
+      ) {
+        const restorationId = crypto.randomUUID();
+        const restoration = {
+          type: "queue_restoration",
+          restorationId,
+          steering,
+          followUp,
+          originalAttachments: otherAttachments,
+          clearedIntentIds,
+          certainty: "not_processed",
+        };
+        restorations.set(restorationId, restoration);
+        record(restoration);
+      }
+    } catch (error) {
+      resetQueueIdentity();
+      if (attachmentSnapshot) restoreAttachmentEntries(attachmentSnapshot.entries);
+      appendAnomaly(
+        "escape_cancelled_admission_queue_cleanup_failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      // A remaining agent-queue entry can execute despite the callback throw.
+      // Retire this authority through the existing admission watchdog path
+      // rather than claiming the cancellation succeeded. The permanent fence
+      // prevents a finally-handler from draining later custody first.
+      fatalAdmissionFence = true;
+      if (!admission.fatalSignalled) {
+        admission.fatalSignalled = true;
+        onAdmissionStuck({
+          intentId: admission.request.intentId,
+          sessionEpoch: admission.sessionEpoch,
+        });
+      }
+    }
+  }
+
+  async function admit(requestInput, fromCustody = false) {
+    let request = requestInput;
     if (
       request.expectedHostId !== hostInstanceId ||
       request.expectedEpoch !== sessionEpoch ||
@@ -1564,10 +1926,32 @@ export function createStateAuthority({
     // Custody owns an already admitted GUI intent. Its editor revision may
     // legitimately advance while a compaction/navigation barrier runs; checking
     // it again here would strand that FIFO prefix forever.
-    if (!fromCustody && request.editorRevision !== getEditor().revision) {
-      return resultFor(request, "not_submitted", {
-        message: "Editor revision changed before submission was accepted",
-      });
+    if (!fromCustody) {
+      const editor = getEditor();
+      if (request.editorRevision !== editor.revision) {
+        return resultFor(request, "not_submitted", {
+          message: "Editor revision changed before submission was accepted",
+        });
+      }
+      const authoritativeInputKind = inputKindForEditorText(editor.text);
+      if (request.inputKind !== undefined && request.inputKind !== authoritativeInputKind) {
+        return resultFor(request, "rejected", {
+          message: "Submission input classification does not match the authoritative editor",
+        });
+      }
+      // Older renderers did not send inputKind. Derive it only from the exact
+      // revision-matched raw editor text, then retain it on the internal
+      // request so delayed custody never reclassifies transformed transport
+      // text after the editor has been cleared.
+      if (request.inputKind === undefined) {
+        request = { ...request, inputKind: authoritativeInputKind };
+      }
+      // Defense in depth: only a validated slash classification may suppress
+      // attachments. Renderer-transformed ordinary text can legitimately
+      // begin with an absolute path.
+      if (isSlashSubmission(request) && request.images?.length) {
+        request = { ...request, images: [] };
+      }
     }
 
     if ((compactionBarrierOpen() || navigationDepth > 0) && !fromCustody) {
@@ -1578,6 +1962,23 @@ export function createStateAuthority({
         ingressSequence: ++ingressSequence,
         barrierId: `barrier-${barrierSequence}`,
         phase: compactionBarrierOpen() ? "compaction" : "navigation",
+      });
+      activeIntents.set(request.intentId, "custody");
+      acknowledgeEditorCustody(request);
+      const value = resultFor(request, "in_custody", { custodyId });
+      reportSubmission(value);
+      publishSnapshot();
+      return value;
+    }
+
+    if (!fromCustody && hasCancelledAdmissionFence()) {
+      const custodyId = crypto.randomUUID();
+      custody.push({
+        request: structuredClone(request),
+        custodyId,
+        ingressSequence: ++ingressSequence,
+        barrierId: `escape-generation-${escapeGeneration}`,
+        phase: "admission_fence",
       });
       activeIntents.set(request.intentId, "custody");
       acknowledgeEditorCustody(request);
@@ -1621,9 +2022,18 @@ export function createStateAuthority({
     }
     const wasStreaming = session.isStreaming;
     const queueMode = request.requestedMode === "steer" ? "steer" : "followUp";
-    const isSlashCommand = request.text.startsWith("/");
+    const isSlashCommand = isSlashSubmission(request);
     const commandName = isSlashCommand ? request.text.slice(1).split(/\s/, 1)[0] : "";
     const isExtension = !!commandName && !!session.extensionRunner.getCommand(commandName);
+    let rawQueueAttributionEligible = false;
+    if (!isSlashCommand && typeof session.extensionRunner?.hasHandlers === "function") {
+      try {
+        rawQueueAttributionEligible = session.extensionRunner.hasHandlers("input") === false;
+      } catch {
+        // A non-conforming extension runner cannot establish exact raw-text
+        // attribution. Queue cleanup will preserve every cleared slot.
+      }
+    }
     submitting++;
     activeIntents.set(request.intentId, "admitting");
     publishSnapshot();
@@ -1631,6 +2041,35 @@ export function createStateAuthority({
     // attributable admission baseline must come from that fresh observation.
     const queueLengthBeforePrompt = queueLengths[queueMode];
     const queueValuesBeforePrompt = [...queueValues[queueMode]];
+
+    let resolveCancellation;
+    const cancellation = new Promise((resolve) => {
+      resolveCancellation = resolve;
+    });
+    const admission = {
+      request: structuredClone(request),
+      sessionEpoch,
+      escapeGeneration,
+      // Pi rechecks isStreaming after awaited input hooks. An admission that
+      // started idle can therefore enter Pi's queued branch before preflight.
+      // Capture the actual acceptance-time classification in the callback
+      // instead of treating this initial observation as immutable.
+      queuedAtAcceptance: undefined,
+      crossedAcceptance: false,
+      cancelled: false,
+      restorationPublished: false,
+      unresolvedTracked: false,
+      stuckTimer: undefined,
+      lateQueueCleanupAttempted: false,
+      fatalSignalled: false,
+      rawQueueAttributionEligible,
+      queueAppendAttributed: false,
+      queueActivityObserved: false,
+      attachmentsRemembered: false,
+      resolveCancellation,
+      cancellationError: new Error("Prompt admission was cancelled by Escape"),
+    };
+    pendingAdmissions.set(request.intentId, admission);
 
     let preflightResolve;
     let crossedPreflight = false;
@@ -1644,16 +2083,49 @@ export function createStateAuthority({
         () =>
           session.prompt(request.text, {
             ...(!isSlashCommand && request.images?.length ? { images: request.images } : {}),
+            expandPromptTemplates: isSlashCommand,
             source: "interactive",
             streamingBehavior: request.requestedMode,
             preflightResult: (success) => {
               if (success) {
+                // For an initially idle admission, an input hook can start a
+                // turn before Pi resumes prompt() and takes its queue branch.
+                // Pi invokes this callback after that append. Preserve the
+                // conservative initial-streaming classification too: the
+                // active turn can settle between Pi's append and this callback.
+                admission.queuedAtAcceptance =
+                  wasStreaming ||
+                  session.isStreaming ||
+                  admission.queueAppendAttributed ||
+                  admission.queueActivityObserved;
+                if (admission.cancelled || admission.escapeGeneration !== escapeGeneration) {
+                  // The requested lane check inside this helper is the public
+                  // proof that there is anything to clear. Do not gate cleanup
+                  // on the stale admission-start streaming observation.
+                  clearLateQueueForCancelledAdmission(admission);
+                  // Pinned Pi invokes this public callback immediately before
+                  // idle _runAgentPrompt(), but after its streaming queue append.
+                  // The late-queue cleanup above uses only public queue APIs.
+                  // Pi then catches this throw, reports false, and rethrows.
+                  throw admission.cancellationError;
+                }
+                admission.crossedAcceptance = true;
                 crossedPreflight = true;
                 // Correlate synchronously at Pi's acceptance boundary. Waiting
                 // for the submit continuation leaves a re-entrant delivery
                 // window where message_start has no queue intent.
-                if (wasStreaming) {
-                  registerQueuedIntent(request, queueLengthBeforePrompt, queueValuesBeforePrompt);
+                if (admission.queuedAtAcceptance) {
+                  registerQueuedIntent(
+                    request,
+                    queueLengthBeforePrompt,
+                    queueValuesBeforePrompt,
+                    admission,
+                  );
+                  // Input-handler participation can make the exact text slot
+                  // unprovable even though callback-time streaming proves the
+                  // prompt used Pi's queue path. Retain its original images as
+                  // unpaired review custody for a later destructive clear.
+                  rememberAdmissionAttachments(admission);
                 } else {
                   directDeliveryIntentId = request.intentId;
                 }
@@ -1664,6 +2136,7 @@ export function createStateAuthority({
         request.intentId,
       ),
     );
+    void promptPromise.finally(() => releasePendingAdmission(admission)).catch(() => {});
     if (!wasStreaming) promptFence = promptPromise;
     if (!wasStreaming) {
       void promptPromise
@@ -1672,19 +2145,33 @@ export function createStateAuthority({
         })
         .catch(() => {});
     }
-    if (wasStreaming) {
-      // Register this before any admission continuation so all prompt() exit
-      // paths (handled extension, rejection, throw, or normal queueing) take a
-      // final queue observation and cannot leave a stale positional claim.
-      void promptPromise
-        .then(
-          () =>
-            finalizeQueuedIntentClaim(request, queueLengthBeforePrompt, queueValuesBeforePrompt),
-          () =>
-            finalizeQueuedIntentClaim(request, queueLengthBeforePrompt, queueValuesBeforePrompt),
-        )
-        .catch(() => pendingQueueClaims.delete(request.intentId));
-    }
+    // Register this before any admission continuation so every prompt() exit
+    // path that was actually queued (including idle→streaming inside an input
+    // hook) takes a final observation and cannot leave a stale claim.
+    void promptPromise
+      .then(
+        () => {
+          if (admission.queuedAtAcceptance ?? wasStreaming) {
+            finalizeQueuedIntentClaim(
+              request,
+              queueLengthBeforePrompt,
+              queueValuesBeforePrompt,
+              admission,
+            );
+          }
+        },
+        () => {
+          if (admission.queuedAtAcceptance ?? wasStreaming) {
+            finalizeQueuedIntentClaim(
+              request,
+              queueLengthBeforePrompt,
+              queueValuesBeforePrompt,
+              admission,
+            );
+          }
+        },
+      )
+      .catch(() => pendingQueueClaims.delete(request.intentId));
 
     const admissionDeadline = new Promise((resolve) => {
       setTimeout(() => resolve("deadline"), 2_000).unref?.();
@@ -1694,6 +2181,7 @@ export function createStateAuthority({
       () => "settled",
       () => "failed",
     );
+    const cancellationOutcome = cancellation.then(() => "escape_cancelled");
 
     try {
       // Streaming observation alone is never a consumption signal: on an
@@ -1701,8 +2189,19 @@ export function createStateAuthority({
       // turn it can become visible before an extension preflight later rejects.
       // Idle admission requires successful preflight plus the public streaming
       // boundary, unless the prompt promise itself settles first.
-      let winner = await Promise.race([preflightOutcome, promptOutcome, admissionDeadline]);
-      if (winner === "preflight" && !wasStreaming) {
+      let winner = await Promise.race([
+        preflightOutcome,
+        promptOutcome,
+        admissionDeadline,
+        cancellationOutcome,
+      ]);
+      if (winner === "escape_cancelled") {
+        return resultFor(request, "outcome_unknown", {
+          message:
+            "Escape fenced prompt admission before delivery; review this submission before retrying",
+        });
+      }
+      if (winner === "preflight" && !(admission.queuedAtAcceptance ?? wasStreaming)) {
         let streamingPoll;
         const stateObserved = new Promise((resolve) => {
           const check = () => {
@@ -1713,10 +2212,21 @@ export function createStateAuthority({
           check();
         });
         try {
-          winner = await Promise.race([stateObserved, promptOutcome, admissionDeadline]);
+          winner = await Promise.race([
+            stateObserved,
+            promptOutcome,
+            admissionDeadline,
+            cancellationOutcome,
+          ]);
         } finally {
           if (streamingPoll) clearTimeout(streamingPoll);
         }
+      }
+      if (winner === "escape_cancelled" || admission.cancelled) {
+        return resultFor(request, "outcome_unknown", {
+          message:
+            "Escape fenced prompt admission before delivery; review this submission before retrying",
+        });
       }
       if (winner === "rejected") {
         activeIntents.delete(request.intentId);
@@ -1742,50 +2252,46 @@ export function createStateAuthority({
         // promise. Returning outcome_unknown here made a live admission look
         // terminal and then emitted a second completion later.
         activeIntents.set(request.intentId, "admitting");
-        if (wasStreaming) rememberAttachments(request);
-        unresolvedAdmissions++;
-        const stuckTimer = setTimeout(() => {
-          if (activeIntents.get(request.intentId) === "admitting") {
-            onAdmissionStuck({ intentId: request.intentId, sessionEpoch });
-          }
-        }, admissionStuckMs);
-        stuckTimer.unref?.();
-        void promptPromise
-          .then(
-            () => {
-              if (wasStreaming) {
-                finalizeQueuedIntentClaim(
-                  request,
-                  queueLengthBeforePrompt,
-                  queueValuesBeforePrompt,
-                );
-              }
-              acknowledgeEditorCustody(request);
-              activeIntents.delete(request.intentId);
-              reportSubmission(resultFor(request, "completed", { queued: wasStreaming }));
-              publishSnapshot();
-            },
-            (err) => {
-              activeIntents.delete(request.intentId);
-              if (isExtension) acknowledgeEditorCustody(request);
-              reportSubmission(
-                resultFor(
-                  request,
-                  isExtension
-                    ? "extension_error"
-                    : crossedPreflight
-                      ? "outcome_unknown"
-                      : "rejected",
-                  { message: err instanceof Error ? err.message : String(err) },
-                ),
+        // Current streaming alone is not queue evidence for an initially idle
+        // admission: its input hook may have started unrelated work and still
+        // reject this prompt. A successful callback will retain images when Pi
+        // actually accepts the dynamic queue path.
+        if (admission.queuedAtAcceptance ?? wasStreaming) {
+          rememberAdmissionAttachments(admission);
+        }
+        trackUnresolvedAdmission(admission);
+        void promptPromise.then(
+          () => {
+            if (admission.cancelled) return;
+            const queued = admission.queuedAtAcceptance ?? wasStreaming;
+            if (queued) {
+              finalizeQueuedIntentClaim(
+                request,
+                queueLengthBeforePrompt,
+                queueValuesBeforePrompt,
+                admission,
               );
-              publishSnapshot();
-            },
-          )
-          .finally(() => {
-            clearTimeout(stuckTimer);
-            unresolvedAdmissions--;
-          });
+              rememberAdmissionAttachments(admission);
+            }
+            acknowledgeEditorCustody(request);
+            activeIntents.delete(request.intentId);
+            reportSubmission(resultFor(request, "completed", { queued }));
+            publishSnapshot();
+          },
+          (err) => {
+            if (admission.cancelled) return;
+            activeIntents.delete(request.intentId);
+            if (isExtension) acknowledgeEditorCustody(request);
+            reportSubmission(
+              resultFor(
+                request,
+                isExtension ? "extension_error" : crossedPreflight ? "outcome_unknown" : "rejected",
+                { message: err instanceof Error ? err.message : String(err) },
+              ),
+            );
+            publishSnapshot();
+          },
+        );
         return resultFor(request, "admitting", {
           message: "Prompt admission is still pending in this authority",
         });
@@ -1793,15 +2299,16 @@ export function createStateAuthority({
 
       activeIntents.set(request.intentId, "consumed");
       acknowledgeEditorCustody(request);
-      if (wasStreaming) {
-        registerQueuedIntent(request, queueLengthBeforePrompt, queueValuesBeforePrompt);
-        rememberAttachments(request);
+      const queued = admission.queuedAtAcceptance ?? wasStreaming;
+      if (queued) {
+        registerQueuedIntent(request, queueLengthBeforePrompt, queueValuesBeforePrompt, admission);
+        rememberAdmissionAttachments(admission);
       }
-      const consumed = resultFor(request, "consumed", { queued: wasStreaming });
+      const consumed = resultFor(request, "consumed", { queued });
       void promptPromise.then(
         () => {
           activeIntents.delete(request.intentId);
-          reportSubmission(resultFor(request, "completed", { queued: wasStreaming }));
+          reportSubmission(resultFor(request, "completed", { queued }));
           publishSnapshot();
         },
         (err) => {
@@ -1861,6 +2368,9 @@ export function createStateAuthority({
       return Promise.resolve({ status: "not_admitted", intentId, reason: "stale_owner" });
     }
     if (stopped || closePreparation?.confirmed) {
+      return Promise.resolve({ status: "not_admitted", intentId, reason: "closing" });
+    }
+    if (fatalAdmissionFence) {
       return Promise.resolve({ status: "not_admitted", intentId, reason: "closing" });
     }
     if (transition) {
@@ -1985,12 +2495,15 @@ export function createStateAuthority({
         // Transitions never inherit queued ingress. Do not run a delayed
         // predecessor intent against a successor session.
         if (
+          fatalAdmissionFence ||
           transition ||
           owner.hostInstanceId !== hostInstanceId ||
           owner.sessionEpoch !== sessionEpoch
         ) {
           settleDispatchedIntent(intentId, owner, intent.kind, "outcome_unknown", {
-            message: "Intent execution lost its owning authority",
+            message: fatalAdmissionFence
+              ? "Intent execution was fenced after prompt cancellation became unsafe"
+              : "Intent execution lost its owning authority",
           });
           return;
         }
@@ -2024,16 +2537,12 @@ export function createStateAuthority({
   }
 
   function submit(request, alreadySerialized = false) {
-    // Defense in depth: renderer classification already omits images for slash
-    // commands, but the host must never forward an attachment payload if a
-    // stale or malformed caller supplies one.
-    const normalized = request.text.startsWith("/") ? { ...request, images: [] } : request;
-    const fingerprint = intentFingerprint(normalized);
-    const prior = intentLedger.get(normalized.intentId);
+    const fingerprint = intentFingerprint(request);
+    const prior = intentLedger.get(request.intentId);
     if (prior) {
       if (prior.fingerprint !== fingerprint) {
         return Promise.resolve(
-          resultFor(normalized, "rejected", {
+          resultFor(request, "rejected", {
             message: "Intent ID was reused with a different payload",
           }),
         );
@@ -2044,10 +2553,10 @@ export function createStateAuthority({
       return prior.promise;
     }
     const ledger = { fingerprint, settled: false, initial: null, terminal: null, promise: null };
-    intentLedger.set(normalized.intentId, ledger);
+    intentLedger.set(request.intentId, ledger);
     const admission = alreadySerialized
-      ? Promise.resolve().then(() => admit(normalized))
-      : schedule("ingress", () => admit(normalized));
+      ? Promise.resolve().then(() => admit(request))
+      : schedule("ingress", () => admit(request));
     ledger.promise = admission.then(
       (result) => {
         ledger.initial = structuredClone(result);
@@ -2057,7 +2566,7 @@ export function createStateAuthority({
       (error) => {
         // An adapter exception did not produce an authoritative disposition;
         // allow the caller to observe it but never leave a phantom dedupe key.
-        intentLedger.delete(normalized.intentId);
+        intentLedger.delete(request.intentId);
         throw error;
       },
     );
@@ -2065,9 +2574,21 @@ export function createStateAuthority({
   }
 
   async function drainCustody() {
-    if (compactionBarrierOpen() || navigationDepth > 0 || custody.length === 0) return;
+    if (
+      compactionBarrierOpen() ||
+      navigationDepth > 0 ||
+      hasCancelledAdmissionFence() ||
+      custody.length === 0
+    ) {
+      return;
+    }
     custody.sort((a, b) => a.ingressSequence - b.ingressSequence);
-    while (custody.length > 0 && !compactionBarrierOpen() && navigationDepth === 0) {
+    while (
+      custody.length > 0 &&
+      !compactionBarrierOpen() &&
+      navigationDepth === 0 &&
+      !hasCancelledAdmissionFence()
+    ) {
       if (!session.isStreaming && promptFence) {
         // A prior drained prompt crossed admission but has not settled. Never
         // block the single scheduler (and every later IPC) behind that fence;
@@ -2106,7 +2627,14 @@ export function createStateAuthority({
   }
 
   function scheduleCustodyDrain() {
-    if (compactionBarrierOpen() || navigationDepth > 0 || custody.length === 0) return;
+    if (
+      compactionBarrierOpen() ||
+      navigationDepth > 0 ||
+      hasCancelledAdmissionFence() ||
+      custody.length === 0
+    ) {
+      return;
+    }
     void schedule("custody", drainCustody);
   }
 
@@ -2162,12 +2690,15 @@ export function createStateAuthority({
     sendPresentation({ plane: "panel", owner, payload: resolved });
   }
 
-  function observeEvent(event) {
+  function observeEvent(event, initiatingIntentId) {
     // clearQueue() and the public requeue methods synchronously emit one
     // queue_update each. A management transaction rebuilds the complete queue
     // in the same JS turn, so publishing those transient empty/partial states
     // would make a single atomic user operation visibly flicker.
     if (queueMutationActive && event?.type === "queue_update") return undefined;
+    if (event?.type === "queue_update") {
+      observeAttributableAdmissionQueueAppend(initiatingIntentId);
+    }
     let publishedEvent = event;
     if (event?.type === "message_start" && event.message?.role === "user") {
       const { deliveredQueueIntentIds } = readQueues(true);
@@ -2600,20 +3131,36 @@ export function createStateAuthority({
     });
   }
 
-  function attachmentsForClearedQueue() {
+  function snapshotAttachmentsForClearedQueue(excludedIntentIds = new Set()) {
     // Pi exposes transformed queue text but not transformed images. Preserve
     // every original queued attachment separately and require user review;
     // never guess which transformed text entry it belongs to.
-    const originals = [...attachmentLedger.values()]
+    const entries = [...attachmentLedger.values()]
+      .filter((entry) => !excludedIntentIds.has(entry.intentId))
       .sort((a, b) => a.ingressSequence - b.ingressSequence)
-      .filter((entry) => entry.images.length > 0)
-      .map((entry) => ({ intentId: entry.intentId, images: structuredClone(entry.images) }));
-    attachmentLedger.clear();
-    return originals;
+      .map((entry) => structuredClone(entry));
+    return {
+      entries,
+      originals: entries
+        .filter((entry) => entry.images.length > 0)
+        .map((entry) => ({ intentId: entry.intentId, images: structuredClone(entry.images) })),
+    };
+  }
+
+  function restoreAttachmentEntries(entries) {
+    for (const entry of entries) {
+      if (!attachmentLedger.has(entry.intentId)) {
+        attachmentLedger.set(entry.intentId, structuredClone(entry));
+      }
+    }
   }
 
   async function requestEscape(requestId) {
     const base = { requestId, hostInstanceId, sessionEpoch };
+    // This local fence is installed before selecting/aborting the active
+    // operation. It schedules no continuation until this synchronous Escape
+    // stack returns, so AgentSession.abort() below remains the first Pi call.
+    const cancelledAdmissions = cancelUnacceptedAdmissions();
     let value;
     try {
       if (navigationDepth > 0) {
@@ -2633,50 +3180,176 @@ export function createStateAuthority({
         session.abortRetry();
         value = { ...base, disposition: "abort_requested", target: "retry" };
       } else if (session.isStreaming) {
-        // Give a preflight-accepted delayed getter one final direct observation
-        // before destructive clearQueue custody is recorded.
-        readQueues();
-        // Capture ownership before clearQueue(): real Pi can synchronously emit
-        // queue_update while clearing, and that direct empty-queue observation
-        // correctly retires positional identities for future delivery but must
-        // not erase the restoration record's just-cleared GUI intents.
-        const clearedIntentIds = [...queueIdentity.steer, ...queueIdentity.followUp].filter(
-          (intentId) => typeof intentId === "string",
-        );
-        const queued = session.clearQueue() ?? {};
-        // Destructive removal is not delivery. Retire positional identities
-        // before the next snapshot observes the empty queues, otherwise those
-        // intents could decorate an unrelated future user event.
-        resetQueueIdentity();
-        const steering = Array.isArray(queued.steering) ? queued.steering : [];
-        const followUp = Array.isArray(queued.followUp) ? queued.followUp : [];
-        const originalAttachments = attachmentsForClearedQueue();
-        const hasRestoration =
-          steering.length > 0 ||
-          followUp.length > 0 ||
-          originalAttachments.length > 0 ||
-          clearedIntentIds.length > 0;
-        const restorationId = hasRestoration ? crypto.randomUUID() : undefined;
-        if (restorationId) {
-          const restoration = {
-            type: "queue_restoration",
-            restorationId,
-            steering,
-            followUp,
-            originalAttachments,
-            clearedIntentIds,
-            certainty: "not_processed",
+        // AgentSession.abort() signals its controller synchronously, then its
+        // promise waits for idle. Signal first so queue observation/cleanup can
+        // never delay or suppress the active-turn interrupt.
+        void Promise.resolve(session.abort()).catch(() => {});
+        let attachmentSnapshot;
+        let queuesBeforeClear;
+        let clearedIntentIdsByMode;
+        try {
+          // Give a preflight-accepted delayed getter one final direct
+          // observation before destructive clearQueue custody is recorded.
+          queuesBeforeClear = readQueues();
+          // Capture ownership before clearQueue(): real Pi can synchronously
+          // emit queue_update while clearing, and that direct empty-queue
+          // observation correctly retires positional identities for future
+          // delivery but must not erase the restoration record's just-cleared
+          // GUI intents or attachment bytes.
+          clearedIntentIdsByMode = {
+            steer: [...queueIdentity.steer],
+            followUp: [...queueIdentity.followUp],
           };
-          restorations.set(restorationId, restoration);
-          record(restoration);
+          const allCancelledIntentIds = new Set(
+            cancelledAdmissions.map((admission) => admission.request.intentId),
+          );
+          attachmentSnapshot = snapshotAttachmentsForClearedQueue(allCancelledIntentIds);
+          const queued = session.clearQueue() ?? {};
+          // Destructive removal is not delivery. Retire positional identities
+          // before the next snapshot observes the empty queues, otherwise those
+          // intents could decorate an unrelated future user event.
+          resetQueueIdentity();
+          attachmentLedger.clear();
+          const attributableCancelledIds = new Set(
+            cancelledAdmissions
+              .filter((admission) => admission.queueAppendAttributed)
+              .map((admission) => admission.request.intentId),
+          );
+          const steeringRestoration = restorationLaneAfterAttributedCancellation(
+            Array.isArray(queued.steering) ? [...queued.steering] : [],
+            clearedIntentIdsByMode.steer,
+            attributableCancelledIds,
+            allCancelledIntentIds,
+          );
+          const followUpRestoration = restorationLaneAfterAttributedCancellation(
+            Array.isArray(queued.followUp) ? [...queued.followUp] : [],
+            clearedIntentIdsByMode.followUp,
+            attributableCancelledIds,
+            allCancelledIntentIds,
+          );
+          const steering = steeringRestoration.messages;
+          const followUp = followUpRestoration.messages;
+          const originalAttachments = attachmentSnapshot.originals;
+          const clearedIntentIds = [
+            ...steeringRestoration.intentIds,
+            ...followUpRestoration.intentIds,
+          ];
+          const hasRestoration =
+            steering.length > 0 ||
+            followUp.length > 0 ||
+            originalAttachments.length > 0 ||
+            clearedIntentIds.length > 0;
+          const restorationId = hasRestoration ? crypto.randomUUID() : undefined;
+          if (restorationId) {
+            const restoration = {
+              type: "queue_restoration",
+              restorationId,
+              steering,
+              followUp,
+              originalAttachments,
+              clearedIntentIds,
+              certainty: "not_processed",
+            };
+            restorations.set(restorationId, restoration);
+            record(restoration);
+          }
+          value = {
+            ...base,
+            disposition: "abort_requested",
+            target: "streaming",
+            ...(restorationId ? { restorationId } : {}),
+          };
+        } catch (err) {
+          // A synchronous Pi clearQueue() first empties both queues and then
+          // emits queue_update. If that callback throws, the clear happened
+          // even though no return payload reached us. Restore still-queued
+          // attachment custody to the ledger, and publish explicit unknown
+          // custody only for a mode that is now empty.
+          let restorationId;
+          if (attachmentSnapshot && queuesBeforeClear && clearedIntentIdsByMode) {
+            let steeringAfter;
+            let followUpAfter;
+            try {
+              steeringAfter = [...session.getSteeringMessages()];
+              followUpAfter = [...session.getFollowUpMessages()];
+            } catch {
+              // If the public getters also fail, retaining the local snapshot
+              // is safer than inventing a destructive-clear result.
+            }
+            if (steeringAfter && followUpAfter) {
+              const lostSteering =
+                queuesBeforeClear.steering.length > 0 && steeringAfter.length === 0;
+              const lostFollowUp =
+                queuesBeforeClear.followUp.length > 0 && followUpAfter.length === 0;
+              const attributableCancelledIds = new Set(
+                cancelledAdmissions
+                  .filter((admission) => admission.queueAppendAttributed)
+                  .map((admission) => admission.request.intentId),
+              );
+              const allCancelledIntentIds = new Set(
+                cancelledAdmissions.map((admission) => admission.request.intentId),
+              );
+              const lostSteeringRestoration = restorationLaneAfterAttributedCancellation(
+                lostSteering ? queuesBeforeClear.steering : [],
+                lostSteering ? clearedIntentIdsByMode.steer : [],
+                attributableCancelledIds,
+                allCancelledIntentIds,
+              );
+              const lostFollowUpRestoration = restorationLaneAfterAttributedCancellation(
+                lostFollowUp ? queuesBeforeClear.followUp : [],
+                lostFollowUp ? clearedIntentIdsByMode.followUp : [],
+                attributableCancelledIds,
+                allCancelledIntentIds,
+              );
+              const lostIntentIds = [
+                ...lostSteeringRestoration.intentIds,
+                ...lostFollowUpRestoration.intentIds,
+              ];
+              const attachmentModeWasLost = (entry) =>
+                entry.requestedMode === "steer" ? lostSteering : lostFollowUp;
+              const lostAttachmentEntries =
+                attachmentSnapshot.entries.filter(attachmentModeWasLost);
+              restoreAttachmentEntries(
+                attachmentSnapshot.entries.filter((entry) => !attachmentModeWasLost(entry)),
+              );
+              readQueues();
+              if (
+                lostSteeringRestoration.messages.length > 0 ||
+                lostFollowUpRestoration.messages.length > 0 ||
+                lostAttachmentEntries.some((entry) => entry.images.length > 0)
+              ) {
+                restorationId = crypto.randomUUID();
+                const restoration = {
+                  type: "queue_restoration",
+                  restorationId,
+                  steering: lostSteeringRestoration.messages,
+                  followUp: lostFollowUpRestoration.messages,
+                  originalAttachments: lostAttachmentEntries
+                    .filter((entry) => entry.images.length > 0)
+                    .map((entry) => ({
+                      intentId: entry.intentId,
+                      images: structuredClone(entry.images),
+                    })),
+                  clearedIntentIds: lostIntentIds,
+                  certainty: "unknown",
+                };
+                restorations.set(restorationId, restoration);
+                record(restoration);
+              }
+            } else {
+              restoreAttachmentEntries(attachmentSnapshot.entries);
+            }
+          }
+          value = {
+            ...base,
+            disposition: "failed",
+            target: "streaming",
+            message: `Abort was requested, but queued prompt cleanup/restoration failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+            ...(restorationId ? { restorationId } : {}),
+          };
         }
-        void session.abort().catch(() => {});
-        value = {
-          ...base,
-          disposition: "abort_requested",
-          target: "streaming",
-          ...(restorationId ? { restorationId } : {}),
-        };
       } else if (session.isBashRunning) {
         session.abortBash();
         value = { ...base, disposition: "abort_requested", target: "bash" };
@@ -2701,6 +3374,10 @@ export function createStateAuthority({
         message: err instanceof Error ? err.message : String(err),
       };
     } finally {
+      const admissionRestorationId = publishCancelledAdmissionRestoration(cancelledAdmissions);
+      if (value && admissionRestorationId && !value.restorationId) {
+        value = { ...value, restorationId: admissionRestorationId };
+      }
       if (value) record({ type: "escape", result: value });
       publishSnapshot();
     }
@@ -2858,8 +3535,21 @@ export function createStateAuthority({
     nextSession,
     provisionalEpoch = transition?.provisionalEpoch ?? sessionEpoch + 1,
   ) {
+    const replacingSession = nextSession !== session;
     session = nextSession;
     sessionEpoch = provisionalEpoch;
+    if (replacingSession) {
+      // `/new`, fork, and switch own their real successor path. Stop masking
+      // it with the initial confined transport's canonical source and reset
+      // transcript ownership to that successor. Reload retains the same
+      // AgentSession object and therefore keeps the initial override.
+      presentedSessionFileOverride = undefined;
+      const successorFile = presentedSessionFile();
+      transcriptPresentation.persistedHistoryCursor = successorFile ?? null;
+      transcriptPresentation.liveTailCursor = null;
+      transcriptPresentation.overlapBoundary = successorFile ? `persisted:${successorFile}` : null;
+      transcriptPresentation.currentStreamingMessage = undefined;
+    }
     // Operation-journal coverage is owner-scoped. A successor baseline must
     // never advertise retained predecessor entries or predecessor watermarks.
     operationJournal.length = 0;
@@ -2961,6 +3651,7 @@ export function createStateAuthority({
     const childWork =
       submitting > 0 ||
       unresolvedAdmissions > 0 ||
+      fatalAdmissionFence ||
       activeIntents.size > 0 ||
       custody.length > 0 ||
       promptFence !== null ||
@@ -3191,6 +3882,9 @@ export function createStateAuthority({
     get currentSession() {
       return session;
     },
+    get presentedSessionFile() {
+      return presentedSessionFile();
+    },
     get isTransitioning() {
       return transition !== null;
     },
@@ -3201,12 +3895,14 @@ export function createStateAuthority({
       return (
         submitting > 0 ||
         unresolvedAdmissions > 0 ||
+        fatalAdmissionFence ||
         activeIntents.size > 0 ||
         custody.length > 0 ||
         promptFence !== null
       );
     },
     canReplaceFromIntent(intentId) {
+      if (fatalAdmissionFence) return false;
       if (!activeIntents.has(intentId)) return false;
       const hasOtherIntent = [...activeIntents.keys()].some((activeId) => activeId !== intentId);
       return (

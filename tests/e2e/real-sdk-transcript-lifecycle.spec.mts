@@ -22,6 +22,7 @@ const LIFECYCLE_EXTENSION = join(
   here,
   "../fixtures/real-host-lifecycle-extension/lifecycle-e2e.ts",
 );
+const SMOKE_EXTENSION = join(here, "../fixtures/real-host-smoke-extension/smoke-e2e.ts");
 
 async function closeFixture(
   launch: RealSdkLaunch | undefined,
@@ -337,6 +338,7 @@ test.describe("Pinned real Pi transcript lifecycle", () => {
           timeout: 60_000,
         });
         await expectIdle(window);
+        await expect(window.locator(".composer__attachment-item--file")).toHaveCount(0);
         await expect(
           window
             .locator(".transcript-block--user")
@@ -468,7 +470,12 @@ test.describe("Pinned real Pi transcript lifecycle", () => {
     );
     const fixture = createRealSdkFixture({
       providerBaseUrl: provider.baseUrl,
-      extensionFiles: [LIFECYCLE_EXTENSION],
+      // Exact queue ownership is intentionally unavailable when an input
+      // handler participates because Pi exposes no transformed-item identity.
+      // Use the command-only fixture here so this journey tests the safe exact
+      // ownership/remove/restore path; handler ambiguity is covered directly
+      // by state-authority fault injection.
+      extensionFiles: [SMOKE_EXTENSION],
     });
     let launch: RealSdkLaunch | undefined;
     try {
@@ -492,8 +499,10 @@ test.describe("Pinned real Pi transcript lifecycle", () => {
       // A handled extension command reports successful prompt preflight but
       // creates no Pi queue slot. Its temporary claim must retire before the
       // following ordinary prompt becomes visible in the queue getter.
-      await submitSlash(textarea, "/e2e-notify");
-      await expect(window.getByText("e2e lifecycle notification", { exact: true })).toBeVisible();
+      await submitSlash(textarea, "/smoke-e2e");
+      await expect(
+        window.getByText("Real SDK host command completed", { exact: true }),
+      ).toBeVisible();
       expect(provider.requests).toHaveLength(1);
 
       const staleQueuedText = "remove this queued steering before delivery";

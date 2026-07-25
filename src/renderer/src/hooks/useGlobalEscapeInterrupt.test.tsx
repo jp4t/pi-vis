@@ -121,9 +121,11 @@ describe("useGlobalEscapeInterrupt", () => {
       return { sessions, activeSessionId: SESSION_A };
     });
     invokeSpy = vi.fn().mockResolvedValue({
-      status: "admitted",
-      intentId: "interrupt",
-      owner: { hostInstanceId: "host-escape", sessionEpoch: 4 },
+      requestId: "escape",
+      hostInstanceId: "host-escape",
+      sessionEpoch: 4,
+      disposition: "already_inactive",
+      target: "editor",
     });
     // @ts-expect-error test bridge
     window.pivis = { invoke: invokeSpy };
@@ -139,15 +141,50 @@ describe("useGlobalEscapeInterrupt", () => {
     const { defaultPrevented, secondListenerCalled } = dispatchKey();
     expect(defaultPrevented).toBe(true);
     expect(secondListenerCalled).toBe(false);
-    expect(invokeSpy).toHaveBeenCalledWith(
-      "session.dispatchIntent",
-      expect.objectContaining({
-        sessionId: SESSION_A,
-        intentId: expect.any(String),
-        expectedOwner: { hostInstanceId: "host-escape", sessionEpoch: 4 },
-        intent: { kind: "interrupt" },
-      }),
-    );
+    expect(invokeSpy).toHaveBeenCalledWith("session.escape", {
+      sessionId: SESSION_A,
+      requestId: expect.any(String),
+      expectedHostInstanceId: "host-escape",
+      expectedSessionEpoch: 4,
+    });
+    mounted.unmount();
+  });
+
+  it("uses the retained validated owner while semantic authority is synchronizing", () => {
+    useSessionsStore.setState((state) => {
+      const sessions = new Map(state.sessions);
+      const current = sessions.get(SESSION_A)!;
+      const projection = current.authorityProjection!;
+      if (projection.semantic.state !== "following")
+        throw new Error("expected following authority");
+      sessions.set(SESSION_A, {
+        ...current,
+        hostInstanceId: undefined,
+        authorityProjection: {
+          ...projection,
+          semantic: {
+            state: "synchronizing",
+            lastCursor: projection.semantic.cursor,
+            reason: "semantic_transport_gap",
+          },
+          authoritativeSnapshot: undefined,
+          staleDiagnosticSnapshot: projection.authoritativeSnapshot,
+        },
+      });
+      return { sessions };
+    });
+    const mounted = mountHook();
+
+    const { defaultPrevented, secondListenerCalled } = dispatchKey();
+
+    expect(defaultPrevented).toBe(true);
+    expect(secondListenerCalled).toBe(false);
+    expect(invokeSpy).toHaveBeenCalledWith("session.escape", {
+      sessionId: SESSION_A,
+      requestId: expect.any(String),
+      expectedHostInstanceId: "host-escape",
+      expectedSessionEpoch: 4,
+    });
     mounted.unmount();
   });
 

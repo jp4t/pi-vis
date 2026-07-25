@@ -15,6 +15,7 @@ import type { SessionSearchOpenResult } from "@shared/session-search.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildDiffModel } from "../lib/diff/diff-model.js";
 import { nextPanelInputSequence } from "../lib/panel-input-sequence.js";
+import { dispatchSessionIntent } from "../lib/session-intent.js";
 import {
   isNewSessionPending,
   isPendingNewSessionActiveFor,
@@ -3579,6 +3580,85 @@ describe("sessions store - queue restoration", () => {
     expect(session?.queueRestorations).toBeUndefined();
   });
 
+  it("does not duplicate a correlated preflight restoration already held as a draft", () => {
+    vi.stubGlobal("window", {
+      pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) },
+    });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      sessionDrafts: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setSessionDraft(SESSION_A, "still visible");
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "preflight-interrupted",
+      owner: { hostInstanceId: "host-1", sessionEpoch: 1 },
+      editorRevision: 2,
+      draftScope: "session",
+      composerText: "still visible",
+      composerAttachments: [],
+      submittedText: "/transformed/path\n\nstill visible",
+      submittedComments: [],
+    });
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "preflight-interrupted-restoration",
+      intentIds: ["preflight-interrupted"],
+      text: "/transformed/path\n\nstill visible",
+      attachments: [],
+      disposition: "restore",
+    });
+
+    const state = useSessionsStore.getState();
+    expect(state.sessionDrafts.get(SESSION_A)).toBe("still visible");
+    expect(state.sessions.get(SESSION_A)?.editorInjection).toBeUndefined();
+    expect(state.sessions.get(SESSION_A)?.pendingComposerSubmission).toBeUndefined();
+    store.setSessionDraft(SESSION_A, "");
+  });
+
+  it("merges a restored first-session submit after a newer workspace draft", () => {
+    vi.stubGlobal("window", {
+      pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) },
+    });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      newSessionDrafts: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setNewSessionDraft(WORKSPACE, "older first prompt");
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "first-prompt-unknown",
+      owner: { hostInstanceId: "host-1", sessionEpoch: 1 },
+      editorRevision: 2,
+      draftScope: "workspace",
+      composerText: "older first prompt",
+      composerAttachments: [],
+      submittedText: "older first prompt",
+      submittedComments: [],
+    });
+    store.setNewSessionDraft(WORKSPACE, "newer local text");
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "first-prompt-restoration",
+      intentIds: ["first-prompt-unknown"],
+      text: "older first prompt",
+      attachments: [],
+      disposition: "restore",
+    });
+
+    const state = useSessionsStore.getState();
+    expect(state.newSessionDrafts.get(WORKSPACE)).toBe("newer local text");
+    expect(state.sessions.get(SESSION_A)?.editorInjection?.text).toBe(
+      "newer local text\n\nolder first prompt",
+    );
+    expect(state.sessions.get(SESSION_A)?.pendingComposerSubmission).toBeUndefined();
+    store.clearNewSessionDraft(WORKSPACE);
+  });
+
   it("retains an unconsumed restored candidate across the initial authority baseline", () => {
     vi.stubGlobal("window", { pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) } });
     useSessionsStore.setState({ sessions: new Map(), activeSessionId: null });
@@ -3717,6 +3797,257 @@ describe("sessions store - queue restoration", () => {
     ).toHaveLength(1);
   });
 
+  it("retires the exact renderer draft custody when crash reconciliation proves it persisted", () => {
+    const invoke = vi.fn(async () => ({ acknowledged: true }));
+    vi.stubGlobal("window", { pivis: { invoke } });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      sessionDrafts: new Map(),
+      diffComments: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setSessionDraft(SESSION_A, "already persisted");
+    store.setDiffComment(SESSION_A, {
+      filePath: "a.ts",
+      lineNumber: 10,
+      lineText: "target();",
+      text: "Persisted review comment",
+    });
+    const submittedComments = store.getDiffCommentsForPrompt(SESSION_A);
+    const composerAttachments = [{ kind: "file", name: "a.txt", path: "/tmp/a.txt" }];
+    store.stageEditorAttachments(SESSION_A, composerAttachments);
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "persisted-submit",
+      owner: { hostInstanceId: "failed-host", sessionEpoch: 4 },
+      editorRevision: 3,
+      draftScope: "session",
+      composerText: "already persisted",
+      composerAttachments,
+      submittedText: "already persisted",
+      submittedComments,
+    });
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "ambiguous-submission:persisted-submit",
+      intentIds: ["persisted-submit"],
+      text: "already persisted",
+      attachments: composerAttachments,
+      disposition: "dropped",
+    });
+
+    const state = useSessionsStore.getState();
+    const session = state.sessions.get(SESSION_A);
+    expect(state.sessionDrafts.has(SESSION_A)).toBe(false);
+    expect(state.getDiffCommentsForPrompt(SESSION_A)).toEqual([]);
+    expect(session?.pendingComposerSubmission).toBeUndefined();
+    expect(session?.editorInjection).toMatchObject({ text: "", attachments: [] });
+  });
+
+  it("does not clear newer renderer edits when an older persisted submit is dropped", () => {
+    vi.stubGlobal("window", {
+      pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) },
+    });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      sessionDrafts: new Map(),
+      diffComments: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setSessionDraft(SESSION_A, "older submit");
+    store.setDiffComment(SESSION_A, {
+      filePath: "a.ts",
+      lineNumber: 10,
+      lineText: "target();",
+      text: "Older comment",
+    });
+    const submittedComments = store.getDiffCommentsForPrompt(SESSION_A);
+    const olderAttachments = [{ kind: "file", name: "old.txt", path: "/tmp/old.txt" }];
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "older-submit",
+      owner: { hostInstanceId: "failed-host", sessionEpoch: 4 },
+      editorRevision: 3,
+      draftScope: "session",
+      composerText: "older submit",
+      composerAttachments: olderAttachments,
+      submittedText: "older submit",
+      submittedComments,
+    });
+    store.setSessionDraft(SESSION_A, "newer unsent edit");
+    store.stageEditorAttachments(SESSION_A, [
+      { kind: "file", name: "new.txt", path: "/tmp/new.txt" },
+    ]);
+    store.setDiffComment(SESSION_A, {
+      filePath: "a.ts",
+      lineNumber: 10,
+      lineText: "target();",
+      text: "Newer comment",
+    });
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "ambiguous-submission:older-submit",
+      intentIds: ["older-submit"],
+      text: "older submit",
+      attachments: olderAttachments,
+      disposition: "dropped",
+    });
+
+    const state = useSessionsStore.getState();
+    const session = state.sessions.get(SESSION_A);
+    expect(state.sessionDrafts.get(SESSION_A)).toBe("newer unsent edit");
+    expect(state.getDiffCommentsForPrompt(SESSION_A)).toMatchObject([{ text: "Newer comment" }]);
+    expect(session?.editorAttachments).toEqual([expect.objectContaining({ name: "new.txt" })]);
+    expect(session?.pendingComposerSubmission).toBeUndefined();
+    expect(session?.editorInjection).toBeUndefined();
+  });
+
+  it("retains identical draft text when only its attachment payload changed", () => {
+    vi.stubGlobal("window", {
+      pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) },
+    });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      sessionDrafts: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setSessionDraft(SESSION_A, "same text");
+    const oldAttachments = [{ kind: "file", name: "old.txt", path: "/tmp/old.txt" }];
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "older-attachments",
+      owner: { hostInstanceId: "failed-host", sessionEpoch: 4 },
+      editorRevision: 3,
+      draftScope: "session",
+      composerText: "same text",
+      composerAttachments: oldAttachments,
+      submittedText: "same text",
+      submittedComments: [],
+    });
+    store.stageEditorAttachments(SESSION_A, [
+      { kind: "file", name: "new.txt", path: "/tmp/new.txt" },
+    ]);
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "ambiguous-submission:older-attachments",
+      intentIds: ["older-attachments"],
+      text: "same text",
+      attachments: oldAttachments,
+      disposition: "dropped",
+    });
+
+    const state = useSessionsStore.getState();
+    const session = state.sessions.get(SESSION_A);
+    expect(state.sessionDrafts.get(SESSION_A)).toBe("same text");
+    expect(session?.editorAttachments).toEqual([expect.objectContaining({ name: "new.txt" })]);
+    expect(session?.pendingComposerSubmission).toBeUndefined();
+    expect(session?.editorInjection).toBeUndefined();
+    store.setSessionDraft(SESSION_A, "");
+  });
+
+  it("retains a matching draft while a newer attachment read owns renderer custody", () => {
+    vi.stubGlobal("window", {
+      pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) },
+    });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      sessionDrafts: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setSessionDraft(SESSION_A, "same text");
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "before-new-read",
+      owner: { hostInstanceId: "failed-host", sessionEpoch: 4 },
+      editorRevision: 3,
+      draftScope: "session",
+      composerText: "same text",
+      composerAttachments: [],
+      submittedText: "same text",
+      submittedComments: [],
+    });
+    store.beginEditorAttachmentRead(SESSION_A);
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "ambiguous-submission:before-new-read",
+      intentIds: ["before-new-read"],
+      text: "same text",
+      attachments: [],
+      disposition: "dropped",
+    });
+
+    const state = useSessionsStore.getState();
+    expect(state.sessionDrafts.get(SESSION_A)).toBe("same text");
+    expect(state.sessions.get(SESSION_A)?.editorInjection).toBeUndefined();
+    store.endEditorAttachmentRead(SESSION_A);
+    store.setSessionDraft(SESSION_A, "");
+  });
+
+  it("does not let an older dropped submit erase a newer resolved restoration injection", () => {
+    vi.stubGlobal("window", {
+      pivis: { invoke: vi.fn(async () => ({ acknowledged: true })) },
+    });
+    useSessionsStore.setState({
+      sessions: new Map(),
+      activeSessionId: null,
+      newSessionDrafts: new Map(),
+    });
+    const store = useSessionsStore.getState();
+    store.createSession(SESSION_A, WORKSPACE);
+    store.setNewSessionDraft(WORKSPACE, "already persisted");
+    const submittedAttachments = [
+      { kind: "file", name: "submitted.txt", path: "/tmp/submitted.txt" },
+    ];
+    store.stageEditorAttachments(SESSION_A, submittedAttachments);
+    store.registerPendingComposerSubmission(SESSION_A, {
+      intentId: "persisted-before-new-restoration",
+      owner: { hostInstanceId: "failed-host", sessionEpoch: 4 },
+      editorRevision: 3,
+      draftScope: "workspace",
+      composerText: "already persisted",
+      composerAttachments: submittedAttachments,
+      submittedText: "already persisted",
+      submittedComments: [],
+    });
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "newer-attachment-restoration",
+      text: "",
+      attachments: [{ mimeType: "image/png", data: "newer-image" }],
+      disposition: "restore",
+    });
+    const beforeDrop = useSessionsStore.getState().sessions.get(SESSION_A)?.editorInjection;
+    expect(beforeDrop).toMatchObject({
+      text: "already persisted",
+      attachments: [
+        expect.objectContaining({ name: "submitted.txt" }),
+        expect.objectContaining({
+          name: "restored-image-1.png",
+          dataUrl: "data:image/png;base64,newer-image",
+        }),
+      ],
+    });
+
+    store.applyRestoreDraft(SESSION_A, {
+      restorationId: "ambiguous-submission:persisted-before-new-restoration",
+      intentIds: ["persisted-before-new-restoration"],
+      text: "already persisted",
+      attachments: submittedAttachments,
+      disposition: "dropped",
+    });
+
+    const state = useSessionsStore.getState();
+    const session = state.sessions.get(SESSION_A);
+    expect(state.newSessionDrafts.get(WORKSPACE)).toBe("already persisted");
+    expect(session?.pendingComposerSubmission).toBeUndefined();
+    expect(session?.editorInjection).toEqual(beforeDrop);
+    store.clearNewSessionDraft(WORKSPACE);
+  });
+
   it("does not acknowledge restoration custody that an absent renderer session never assumed", () => {
     const invoke = vi.fn(async () => ({ acknowledged: true }));
     vi.stubGlobal("window", { pivis: { invoke } });
@@ -3821,6 +4152,7 @@ describe("sessions store - unified TUI submit (handleUnifiedSubmitRequest)", () 
             kind: string;
             editorRevision: number;
             text: string;
+            inputKind?: "ordinary" | "slash_command";
             surface: string;
             images: Array<{ type: "image"; data: string; mimeType: string }>;
           };
@@ -3979,6 +4311,7 @@ describe("sessions store - unified TUI submit (handleUnifiedSubmitRequest)", () 
     expect(submission?.text).toContain("  /tmp/file is relevant");
     expect(submission?.text).toContain("/tmp/notes.txt");
     expect(submission?.text).toContain("### User comments on the code");
+    expect(submission?.inputKind).toBe("ordinary");
     expect(submission?.images).toEqual([{ type: "image", data: "eA==", mimeType: "image/png" }]);
     expect(lastUnifiedResponse()).toMatchObject({ id: "id-leading-space", ok: true });
     expect(useSessionsStore.getState().getDiffCommentsForPrompt(SESSION_A)).toEqual([]);
@@ -4495,17 +4828,102 @@ describe("sessions store - host-authoritative escape", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
+  it("does not dispatch an unfenced escape before any validated owner exists", () => {
+    useSessionsStore.getState().applyRuntimeState(SESSION_A, runtimeState(false));
+    useSessionsStore.getState().setSessionStatus(SESSION_A, "ready");
+    useSessionsStore.getState().abortSession(SESSION_A);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
   it("binds escape to the currently available host and epoch", () => {
     installAuthority();
     useSessionsStore.getState().abortSession(SESSION_A);
-    expect(invokeMock).toHaveBeenCalledWith(
-      "session.dispatchIntent",
-      expect.objectContaining({
-        sessionId: SESSION_A,
-        expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 1 },
-        intent: { kind: "interrupt" },
-      }),
+    expect(invokeMock).toHaveBeenCalledWith("session.escape", {
+      sessionId: SESSION_A,
+      requestId: expect.any(String),
+      expectedHostInstanceId: "host-1",
+      expectedSessionEpoch: 1,
+    });
+  });
+
+  it("uses the last validated owner when semantic authority is synchronizing", () => {
+    installAuthority();
+    // Skip both the expected publication and semantic transport sequence. The
+    // reducer fences the projection but retains the owner installed by attach.
+    publishSemantic(SESSION_A, 3, semanticSnapshot(3));
+    const session = useSessionsStore.getState().sessions.get(SESSION_A);
+    expect(session?.authorityProjection?.semantic.state).toBe("synchronizing");
+    expect(session?.authorityProjection?.owner).toEqual({
+      hostInstanceId: "host-1",
+      sessionEpoch: 1,
+    });
+
+    useSessionsStore.getState().abortSession(SESSION_A);
+
+    expect(invokeMock).toHaveBeenCalledWith("session.escape", {
+      sessionId: SESSION_A,
+      requestId: expect.any(String),
+      expectedHostInstanceId: "host-1",
+      expectedSessionEpoch: 1,
+    });
+  });
+
+  it("bypasses a held intent admission when dispatching escape", async () => {
+    installAuthority();
+    let releaseAdmission!: () => void;
+    const admission = new Promise<void>((resolve) => {
+      releaseAdmission = resolve;
+    });
+    invokeMock.mockImplementation(async (channel: string, payload: unknown) => {
+      if (channel === "session.dispatchIntent") {
+        await admission;
+        const envelope = payload as IntentEnvelope;
+        return {
+          status: "admitted" as const,
+          intentId: envelope.intentId,
+          owner: envelope.expectedOwner,
+        };
+      }
+      return {
+        requestId: "escape",
+        hostInstanceId: "host-1",
+        sessionEpoch: 1,
+        disposition: "abort_requested" as const,
+        target: "streaming" as const,
+      };
+    });
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 1 };
+    const pendingAdmission = dispatchSessionIntent(
+      SESSION_A,
+      {
+        kind: "submit",
+        editorRevision: 0,
+        text: "queued steering",
+        inputKind: "ordinary",
+        images: [],
+        requestedMode: "steer",
+        surface: "composer",
+      },
+      { owner },
+      "held-admission",
     );
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        "session.dispatchIntent",
+        expect.objectContaining({ intentId: "held-admission" }),
+      ),
+    );
+
+    useSessionsStore.getState().abortSession(SESSION_A);
+
+    expect(invokeMock).toHaveBeenCalledWith("session.escape", {
+      sessionId: SESSION_A,
+      requestId: expect.any(String),
+      expectedHostInstanceId: "host-1",
+      expectedSessionEpoch: 1,
+    });
+    releaseAdmission();
+    await pendingAdmission;
   });
 });
 
@@ -5556,13 +5974,12 @@ describe("sessions store - recovered authority-frame regressions", () => {
     const invoke = vi.fn(async () => ({ disposition: "already_inactive" }));
     vi.stubGlobal("window", { pivis: { invoke } });
     useSessionsStore.getState().abortSession(SESSION_A);
-    expect(invoke).toHaveBeenCalledWith(
-      "session.dispatchIntent",
-      expect.objectContaining({
-        expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 1 },
-        intent: { kind: "interrupt" },
-      }),
-    );
+    expect(invoke).toHaveBeenCalledWith("session.escape", {
+      sessionId: SESSION_A,
+      requestId: expect.any(String),
+      expectedHostInstanceId: "host-1",
+      expectedSessionEpoch: 1,
+    });
     vi.unstubAllGlobals();
   });
 

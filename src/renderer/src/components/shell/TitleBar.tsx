@@ -51,7 +51,9 @@ export function TitleBar({
           )}
         </svg>
       </button>
-      {activeSessionId ? <SessionHeader sessionId={activeSessionId as SessionId} /> : null}
+      {activeSessionId ? (
+        <SessionHeader key={activeSessionId} sessionId={activeSessionId as SessionId} />
+      ) : null}
     </div>
   );
 }

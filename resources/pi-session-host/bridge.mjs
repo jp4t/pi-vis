@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { basename } from "node:path";
 import { createStateAuthority } from "./state-authority.mjs";
 
 /**
@@ -242,6 +243,7 @@ export function setupCommandBridge({
   // in-process behavior; host.mjs always supplies the real main handshake.
   requestTransitionPermit = async () => ({ allowed: true, reason: "test/local permit" }),
   initialBinding = false,
+  initialPresentedSessionFile,
   lifecycleUiTracker = { track: (promise) => promise },
   uiState = {
     catalogSnapshot: () => ({}),
@@ -273,6 +275,7 @@ export function setupCommandBridge({
   const authority = createStateAuthority({
     hostInstanceId,
     initialSession: session,
+    initialPresentedSessionFile,
     sendControl,
     sendFrame,
     sendPresentation,
@@ -305,6 +308,43 @@ export function setupCommandBridge({
           : operation(),
       ),
   });
+
+  // A confined search open gives Pi an inode-stable transport path while the
+  // authority presents the validated canonical source. Extensions can read
+  // that transport path through Pi's public ReadonlySessionManager and pass it
+  // back through replacement actions. Translate only the exact initial pin;
+  // arbitrary extension-supplied paths remain untouched.
+  const initialRuntimeSessionFile =
+    typeof initialPresentedSessionFile === "string" &&
+    typeof session.sessionFile === "string" &&
+    initialPresentedSessionFile !== session.sessionFile
+      ? session.sessionFile
+      : undefined;
+  function canonicalizeSessionReference(reference) {
+    return initialRuntimeSessionFile && reference === initialRuntimeSessionFile
+      ? initialPresentedSessionFile
+      : reference;
+  }
+
+  function canonicalizeNewSessionOptions(options) {
+    if (!options || typeof options.parentSession !== "string") return options;
+    const parentSession = canonicalizeSessionReference(options.parentSession);
+    return parentSession === options.parentSession ? options : { ...options, parentSession };
+  }
+
+  function defaultExportOutputPath(outputPath) {
+    if (typeof outputPath === "string" && outputPath.length > 0) return outputPath;
+    const sessionFile = authority.presentedSessionFile;
+    if (typeof sessionFile !== "string" || sessionFile.length === 0) return outputPath;
+    // Pi's public export API accepts an explicit path. Supplying the same
+    // default shape Pi uses keeps all file I/O inside that public operation
+    // while deriving the visible name from canonical session identity.
+    return `pi-session-${basename(sessionFile, ".jsonl")}.html`;
+  }
+
+  function exportSessionToHtml(outputPath) {
+    return _session.exportToHtml(defaultExportOutputPath(outputPath));
+  }
 
   if (initialBinding) authority.beginTransition(authority.sessionEpoch, false);
 
@@ -376,7 +416,7 @@ export function setupCommandBridge({
     _unsubscribe?.();
     _unsubscribe = s.subscribe((event) => {
       // Events repair transcript/UI detail; direct snapshots own runtime state.
-      authority.observeEvent(event);
+      authority.observeEvent(event, admissionContext.getStore());
       // Pi 0.80.4's cache-miss notices normally live in InteractiveMode, which
       // the SDK host does not instantiate. Re-derive the same opt-in notice
       // from public session/message data so showCacheMissNotices still works.
@@ -405,6 +445,8 @@ export function setupCommandBridge({
         runtime,
         authority,
         reload: () => handleReload(),
+        canonicalizeSessionReference,
+        canonicalizeNewSessionOptions,
         replace: (operation, details) =>
           runReplacement(operation, {
             ...details,
@@ -482,7 +524,7 @@ export function setupCommandBridge({
       isBashRunning: s.isBashRunning,
       steeringMode: s.steeringMode,
       followUpMode: s.followUpMode,
-      sessionFile: s.sessionFile,
+      sessionFile: authority.presentedSessionFile,
       sessionId: s.sessionId,
       sessionName: s.sessionName,
       autoCompactionEnabled: s.autoCompactionEnabled,
@@ -493,6 +535,12 @@ export function setupCommandBridge({
       followUp:
         typeof s.getFollowUpMessages === "function" ? [...s.getFollowUpMessages()] : undefined,
     };
+  }
+
+  function getSessionStats() {
+    const stats = _session.getSessionStats();
+    const sessionFile = authority.presentedSessionFile;
+    return typeof sessionFile === "string" ? { ...stats, sessionFile } : stats;
   }
 
   /** Build the get_commands response, mirroring rpc-mode.js exactly. */
@@ -768,7 +816,12 @@ export function setupCommandBridge({
     const oldSession = _session;
     const transitionId = authority.transitionId;
     try {
-      await requestReplacementPermit(transitionId, "prepare", "reload", _session.sessionFile);
+      await requestReplacementPermit(
+        transitionId,
+        "prepare",
+        "reload",
+        authority.presentedSessionFile,
+      );
       // Reload retains the AgentSession and therefore its host-owned editor.
       // Consume only the exact Composer command that its intent identified.
       // This child-owned acknowledgement closes the renderer-patch/reload race
@@ -783,6 +836,7 @@ export function setupCommandBridge({
         editor.conflictText === undefined
       ) {
         uiState.acceptEditorSubmission({
+          intentId: reloadEditorCommand.intentId,
           editorRevision: reloadEditorCommand.editorRevision,
           text: reloadEditorCommand.editorText,
         });
@@ -802,7 +856,12 @@ export function setupCommandBridge({
       );
       // reload keeps the AgentSession object and subscription but replaces
       // extension bindings; publish all buffered events with one terminal read.
-      await requestReplacementPermit(transitionId, "successor", "reload", _session.sessionFile);
+      await requestReplacementPermit(
+        transitionId,
+        "successor",
+        "reload",
+        authority.presentedSessionFile,
+      );
       authority.commitTransition();
     } catch (err) {
       if (!err?.lifecycleTimeout && !authority.transitionBoundaryCrossed) {
@@ -886,19 +945,21 @@ export function setupCommandBridge({
           result: await replace(() => runtime.fork(words[0]), { kind: "fork" }),
         };
       case "resume":
-      case "switch":
+      case "switch": {
         if (!args) throw new Error(`Usage: /${name} <session-path>`);
+        const sessionPath = canonicalizeSessionReference(args);
         return {
           handled: true,
-          result: await replace(() => runtime.switchSession(args), {
+          result: await replace(() => runtime.switchSession(sessionPath), {
             kind: "switch",
-            targetFile: args,
+            targetFile: sessionPath,
           }),
         };
+      }
       case "export":
         return {
           handled: true,
-          result: { response: { path: await _session.exportToHtml(args || undefined) } },
+          result: { response: { path: await exportSessionToHtml(args || undefined) } },
         };
       case "model":
         return {
@@ -954,7 +1015,7 @@ export function setupCommandBridge({
         if (args) throw new Error("Usage: /session");
         return {
           handled: true,
-          result: { response: { stats: _session.getSessionStats(), state: getState() } },
+          result: { response: { stats: getSessionStats(), state: getState() } },
         };
       case "compact": {
         // Same deferral as the compact intent below: the invocation barrier
@@ -1033,6 +1094,7 @@ export function setupCommandBridge({
             expectedEpoch: owner.sessionEpoch,
             editorRevision: intent.editorRevision,
             text,
+            inputKind: intent.inputKind,
             images: intent.images ?? [],
             requestedMode: intent.requestedMode ?? "followUp",
             surface: intent.surface ?? "composer",
@@ -1117,7 +1179,7 @@ export function setupCommandBridge({
           if (resolved.handled) return resolved.result;
           // Only extension/template/skill commands (and intentional unknown
           // slash prompt text) reach Pi's public prompt parser.
-          return submission(intent.text, { images: [] });
+          return submission(intent.text, { inputKind: "slash_command", images: [] });
         }
         case "compact": {
           // beginCompactionInvocation opens the admission barrier inside this
@@ -1300,6 +1362,7 @@ export function setupCommandBridge({
           return { name: intent.name };
         case "reload":
           await handleReload(true, {
+            intentId: envelope.intentId,
             editorRevision: intent.editorRevision,
             editorText: intent.editorText,
           });
@@ -1307,7 +1370,7 @@ export function setupCommandBridge({
             successorIdentity: { hostInstanceId, sessionEpoch: authority.sessionEpoch },
           };
         case "export": {
-          const path = await _session.exportToHtml(intent.outputPath);
+          const path = await exportSessionToHtml(intent.outputPath);
           if (typeof path !== "string" || path.length === 0)
             throw new Error("Session export did not return a file path");
           return { path };
@@ -1674,7 +1737,7 @@ export function setupCommandBridge({
 
         // ── Introspection ──────────────────────────────────────────────
         case "get_session_stats": {
-          send({ type: "response", id, success: true, data: _session.getSessionStats() });
+          send({ type: "response", id, success: true, data: getSessionStats() });
           break;
         }
 
@@ -1709,7 +1772,7 @@ export function setupCommandBridge({
         }
 
         case "export_html": {
-          const outPath = await _session.exportToHtml(command.outputPath);
+          const outPath = await exportSessionToHtml(command.outputPath);
           send({ type: "response", id, success: true, data: { path: outPath } });
           break;
         }
@@ -1862,9 +1925,10 @@ export function setupCommandBridge({
         }
 
         case "switch_session": {
-          const result = await runReplacement(() => runtime.switchSession(command.sessionPath), {
+          const sessionPath = canonicalizeSessionReference(command.sessionPath);
+          const result = await runReplacement(() => runtime.switchSession(sessionPath), {
             kind: "switch",
-            targetFile: command.sessionPath,
+            targetFile: sessionPath,
           });
           send({
             type: "response",
@@ -2356,20 +2420,31 @@ async function collectLogoutProviders(session) {
  * fork/navigateTree/switchSession/reload). navigateTree maps to fork with
  * position "before" (the closest runtime equivalent).
  */
-function buildCommandContextActions({ runtime, authority, reload, replace, waitForIdle }) {
+function buildCommandContextActions({
+  runtime,
+  authority,
+  reload,
+  replace,
+  waitForIdle,
+  canonicalizeSessionReference,
+  canonicalizeNewSessionOptions,
+}) {
   return {
     waitForIdle,
-    newSession: async (options) => replace(() => runtime.newSession(options), { kind: "new" }),
+    newSession: async (options) =>
+      replace(() => runtime.newSession(canonicalizeNewSessionOptions(options)), { kind: "new" }),
     fork: async (entryId, options) =>
       replace(() => runtime.fork(entryId, options), { kind: "fork" }),
     navigateTree: async (targetId, options) =>
       authority.runNavigation(() => authority.currentSession.navigateTree(targetId, options)),
 
-    switchSession: async (sessionPath, options) =>
-      replace(() => runtime.switchSession(sessionPath, options), {
+    switchSession: async (sessionPath, options) => {
+      const canonicalSessionPath = canonicalizeSessionReference(sessionPath);
+      return replace(() => runtime.switchSession(canonicalSessionPath, options), {
         kind: "switch",
-        targetFile: sessionPath,
-      }),
+        targetFile: canonicalSessionPath,
+      });
+    },
     // Use the same transition-aware path as the external reload message.
     // Reload can emit extension/UI events before and after its rebind point.
     reload: async () => reload(),

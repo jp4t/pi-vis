@@ -14,6 +14,8 @@ import {
   SessionQueryEnvelopeSchema,
   SessionQueryResultSchema,
   SessionQuerySchema,
+  SessionRuntimeResumeStateSchema,
+  SessionSubmissionSchema,
 } from "./runtime-state.js";
 
 const owner = { hostInstanceId: "host-a", sessionEpoch: 4 };
@@ -83,6 +85,35 @@ function baseline(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+describe("session runtime resume state", () => {
+  it("accepts a typed owner-local model and thinking selection", () => {
+    expect(
+      SessionRuntimeResumeStateSchema.parse({
+        model: { provider: "provider-a", modelId: "model-a" },
+        thinkingLevel: "xhigh",
+      }),
+    ).toEqual({
+      model: { provider: "provider-a", modelId: "model-a" },
+      thinkingLevel: "xhigh",
+    });
+    expect(
+      SessionRuntimeResumeStateSchema.parse({
+        model: null,
+        thinkingLevel: "off",
+      }),
+    ).toEqual({ model: null, thinkingLevel: "off" });
+  });
+
+  it("rejects ambiguous model references and unknown thinking levels", () => {
+    expect(
+      SessionRuntimeResumeStateSchema.safeParse({
+        model: { modelId: "model-a" },
+        thinkingLevel: "extreme",
+      }).success,
+    ).toBe(false);
+  });
+});
 
 describe("authority protocol schemas", () => {
   it("enforces cursor identity and semantic ownership as a property of every projection", () => {
@@ -169,12 +200,19 @@ describe("authority protocol schemas", () => {
         kind: "submit",
         editorRevision: 0,
         text: "hello",
+        inputKind: "ordinary",
         images: [],
         requestedMode: "steer",
         surface: "composer",
       },
     };
     expect(IntentEnvelopeSchema.safeParse(envelope).success).toBe(true);
+    expect(
+      IntentEnvelopeSchema.safeParse({
+        ...envelope,
+        intent: { ...envelope.intent, inputKind: "unknown" },
+      }).success,
+    ).toBe(false);
     expect(
       IntentEnvelopeSchema.safeParse({
         ...envelope,
@@ -247,6 +285,26 @@ describe("authority protocol schemas", () => {
         },
       }).success,
     ).toBe(false);
+  });
+
+  it("validates original editor input classification on compatibility submissions", () => {
+    const submission = {
+      intentId: "submit-a",
+      expectedHostId: "host-a",
+      expectedEpoch: 4,
+      editorRevision: 2,
+      text: "/tmp/notes.txt\n\nExplain these notes",
+      inputKind: "ordinary",
+      images: [],
+      requestedMode: "steer",
+      surface: "composer",
+    };
+    expect(SessionSubmissionSchema.safeParse(submission).success).toBe(true);
+    expect(SessionSubmissionSchema.safeParse({ ...submission, inputKind: "unknown" }).success).toBe(
+      false,
+    );
+    const { inputKind: _legacyMissing, ...legacySubmission } = submission;
+    expect(SessionSubmissionSchema.safeParse(legacySubmission).success).toBe(true);
   });
 
   it("models catalog refresh as a bounded mutation rather than a query", () => {
@@ -493,12 +551,25 @@ describe("authority protocol schemas", () => {
       frameId: "frame-7",
       records: [],
       terminalSnapshot: snapshot(),
+      runtimeResumeState: {
+        model: { provider: "provider-a", modelId: "model-a" },
+        thinkingLevel: "high",
+      },
     };
     expect(AuthorityFrameSchema.safeParse(frame).success).toBe(true);
     expect(
       AuthorityFrameSchema.safeParse({
         ...frame,
         terminalSnapshot: snapshot({ owner: otherOwner }),
+      }).success,
+    ).toBe(false);
+    expect(
+      AuthorityFrameSchema.safeParse({
+        ...frame,
+        runtimeResumeState: {
+          model: { provider: "", modelId: "model-a" },
+          thinkingLevel: "high",
+        },
       }).success,
     ).toBe(false);
 

@@ -81,9 +81,10 @@ export function openConfinedRegularFileForHost(filePath: string, confinementRoot
 }
 
 /**
- * Creates a renderer-inaccessible path to the descriptor-pinned inode for
- * Windows, where `/proc/self/fd` and `/dev/fd` do not exist. The identity check
- * after link creation closes the pathname race around `linkSync`.
+ * Creates a renderer-inaccessible stable path to the descriptor-pinned inode.
+ * This is used where a descriptor filesystem is unavailable or where reopening
+ * its path shares the inherited file offset. The identity check after link
+ * creation closes the pathname race around `linkSync`.
  */
 export function createPinnedSessionHardLink(filePath: string, descriptor: number): string {
   const alias = path.join(

@@ -1513,6 +1513,7 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
             ? {
                 ...parsedAction,
                 text: dispatchPromptText,
+                inputKind: isSlashCommand ? ("slash_command" as const) : ("ordinary" as const),
                 ...(dispatchImages.length > 0
                   ? {
                       images: runtimeImagesFromAttachments(dispatchImages),
@@ -1702,6 +1703,7 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
                     editorRevision: submittedEditorRevision,
                     draftScope: pending ? "workspace" : "session",
                     composerText: submittedLocalText,
+                    composerAttachments: replicatedAttachmentsRef.current,
                     submittedText: finalAction.text,
                     submittedComments: isRealPrompt ? pendingDiffComments : [],
                   });

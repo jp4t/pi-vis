@@ -7,6 +7,16 @@ import {
 } from "../../src/shared/pi-protocol/runtime-state.ts";
 import { assertHostCapabilities, setupCommandBridge } from "./bridge.mjs";
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 // The bridge translates pi-vis wire commands → pi SDK method calls. It is plain
 // .mjs (not type-checked against pi's .d.ts), so a wrong field name or argument
 // shape slips past tsc AND every other test — exactly the failure class the
@@ -132,7 +142,14 @@ function setup(sessionOverrides, bridgeOverrides = {}) {
     panelBridge,
     ...bridgeOverrides,
   });
-  const { handleCommand, handleSubmit, handleReload, dispatchIntent, bindExtensions } = bridge;
+  const {
+    handleCommand,
+    handleSubmit,
+    handleEscape,
+    handleReload,
+    dispatchIntent,
+    bindExtensions,
+  } = bridge;
   let nextId = 0;
   const run = async (command) => {
     const id = `cmd-${++nextId}`;
@@ -150,6 +167,7 @@ function setup(sessionOverrides, bridgeOverrides = {}) {
     panelBridge,
     interruptActiveOperation: bridge.interruptActiveOperation,
     handleSubmit,
+    handleEscape,
     handleReload,
     dispatchIntent,
     bindExtensions,
@@ -236,6 +254,28 @@ describe("setupCommandBridge — wiring", () => {
     expect(resetExtensionPresentation).toHaveBeenCalledTimes(1);
   });
 
+  it("uses the canonical source for both reload lock permits from a runtime pin", async () => {
+    const requestTransitionPermit = vi.fn(async () => ({ allowed: true }));
+    const { session, handleReload } = setup(
+      { sessionFile: "/sessions/.pivis-session.runtime-pin" },
+      {
+        initialPresentedSessionFile: "/sessions/original.jsonl",
+        requestTransitionPermit,
+      },
+    );
+    session.reload.mockImplementationOnce(async ({ beforeSessionStart }) => {
+      await beforeSessionStart();
+    });
+
+    await handleReload();
+
+    expect(requestTransitionPermit).toHaveBeenCalledTimes(2);
+    expect(requestTransitionPermit.mock.calls.map(([request]) => request.targetFile)).toEqual([
+      "/sessions/original.jsonl",
+      "/sessions/original.jsonl",
+    ]);
+  });
+
   it("clears reload command text in the successor editor baseline", async () => {
     const editor = {
       revision: 7,
@@ -276,6 +316,7 @@ describe("setupCommandBridge — wiring", () => {
     );
 
     expect(acceptEditorSubmission).toHaveBeenCalledWith({
+      intentId: "reload-editor-command",
       editorRevision: 7,
       text: "/reload",
     });
@@ -417,8 +458,85 @@ describe("setupCommandBridge — wiring", () => {
     );
   });
 
+  it("canonicalizes a confined runtime pin before extension replacement actions", async () => {
+    const runtimePin = "/sessions/.pivis-session-42-runtime.runtime-pin";
+    const canonicalSessionFile = "/sessions/source.jsonl";
+    const requestTransitionPermit = vi.fn(async () => ({ allowed: true }));
+    const parentSetup = vi.fn();
+    const parentWithSession = vi.fn();
+    const newFixture = setup(
+      { sessionFile: runtimePin },
+      { initialPresentedSessionFile: canonicalSessionFile, requestTransitionPermit },
+    );
+    await newFixture.bindExtensions(newFixture.session);
+    const newActions = newFixture.session.bindExtensions.mock.calls[0][0].commandContextActions;
+    const newSuccessor = makeSession({
+      sessionId: "canonical-new-successor",
+      sessionFile: "/sessions/new-successor.jsonl",
+    });
+    newFixture.runtime.newSession.mockImplementationOnce(async () => {
+      await newFixture.runtime.setRebindSession.mock.calls[0][0](newSuccessor);
+      return { cancelled: false };
+    });
+
+    await newActions.newSession({
+      parentSession: runtimePin,
+      setup: parentSetup,
+      withSession: parentWithSession,
+    });
+
+    expect(newFixture.runtime.newSession).toHaveBeenCalledWith({
+      parentSession: canonicalSessionFile,
+      setup: parentSetup,
+      withSession: parentWithSession,
+    });
+    expect(JSON.stringify(requestTransitionPermit.mock.calls)).not.toContain(runtimePin);
+
+    const switchPermits = vi.fn(async () => ({ allowed: true }));
+    const switchFixture = setup(
+      { sessionFile: runtimePin },
+      { initialPresentedSessionFile: canonicalSessionFile, requestTransitionPermit: switchPermits },
+    );
+    await switchFixture.bindExtensions(switchFixture.session);
+    const switchActions =
+      switchFixture.session.bindExtensions.mock.calls[0][0].commandContextActions;
+    const switchOptions = { withSession: vi.fn() };
+    const switchSuccessor = makeSession({
+      sessionId: "canonical-switch-successor",
+      sessionFile: canonicalSessionFile,
+    });
+    switchFixture.runtime.switchSession.mockImplementationOnce(async () => {
+      await switchFixture.runtime.setRebindSession.mock.calls[0][0](switchSuccessor);
+      return { cancelled: false };
+    });
+
+    await switchActions.switchSession(runtimePin, switchOptions);
+
+    expect(switchFixture.runtime.switchSession).toHaveBeenCalledWith(
+      canonicalSessionFile,
+      switchOptions,
+    );
+    expect(switchPermits).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ phase: "prepare", targetFile: canonicalSessionFile }),
+    );
+    expect(switchPermits).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ phase: "successor", targetFile: canonicalSessionFile }),
+    );
+    expect(JSON.stringify(switchPermits.mock.calls)).not.toContain(runtimePin);
+  });
+
   it("allows a command-context replacement to own its one active submission", async () => {
-    const { session, runtime, handleSubmit, bindExtensions } = setup();
+    const { session, runtime, handleSubmit, bindExtensions } = setup(undefined, {
+      uiState: makeUiState({
+        editorSnapshot: () => ({
+          revision: 0,
+          text: "/replace-from-extension",
+          attachments: [],
+        }),
+      }),
+    });
     await bindExtensions(session);
     const actions = session.bindExtensions.mock.calls[0][0].commandContextActions;
     runtime.newSession.mockImplementationOnce(async () => {
@@ -440,6 +558,7 @@ describe("setupCommandBridge — wiring", () => {
           expectedEpoch: 0,
           editorRevision: 0,
           text: "/replace-from-extension",
+          inputKind: "slash_command",
           images: [],
           requestedMode: "followUp",
           surface: "composer",
@@ -459,7 +578,13 @@ describe("setupCommandBridge — wiring", () => {
           getRegisteredCommands: vi.fn(() => []),
         },
       },
-      { sendControl, sendFrame },
+      {
+        sendControl,
+        sendFrame,
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "/replace", attachments: [] }),
+        }),
+      },
     );
     await bindExtensions(session);
     const actions = session.bindExtensions.mock.calls[0][0].commandContextActions;
@@ -858,7 +983,12 @@ describe("setupCommandBridge — target intent dispatch", () => {
   }
 
   it("records admission separately from terminal outcomes for every child-owned intent kind", async () => {
-    const { session, runtime, send, dispatchIntent } = setup();
+    let editorText = "";
+    const { session, runtime, send, dispatchIntent } = setup(undefined, {
+      uiState: makeUiState({
+        editorSnapshot: () => ({ revision: 0, text: editorText, attachments: [] }),
+      }),
+    });
     session.prompt.mockImplementation(async (_text, options) => options.preflightResult(true));
     const intents = [
       ["interrupt", {}],
@@ -866,8 +996,9 @@ describe("setupCommandBridge — target intent dispatch", () => {
         "submit",
         {
           editorRevision: 0,
-          text: "hello",
-          images: [],
+          text: "/tmp/notes.txt\n\nhello",
+          inputKind: "ordinary",
+          images: [{ type: "image", data: "bytes", mimeType: "image/png" }],
           requestedMode: "followUp",
           surface: "composer",
         },
@@ -888,6 +1019,8 @@ describe("setupCommandBridge — target intent dispatch", () => {
     ];
 
     for (const [kind, payload] of intents) {
+      if (kind === "submit") editorText = "hello";
+      else if (kind === "invokeCommand") editorText = payload.text;
       await expect(
         dispatchIntent(envelope(`intent-${kind}`, { kind, ...payload })),
       ).resolves.toEqual(
@@ -914,6 +1047,13 @@ describe("setupCommandBridge — target intent dispatch", () => {
     expect(session.reload).toHaveBeenCalledOnce();
     // Both text intents use the child public prompt/extension path; no
     // renderer-selected PiRpcCommand type enters this dispatch.
+    expect(session.prompt).toHaveBeenCalledWith(
+      "/tmp/notes.txt\n\nhello",
+      expect.objectContaining({
+        images: [{ type: "image", data: "bytes", mimeType: "image/png" }],
+        expandPromptTemplates: false,
+      }),
+    );
     expect(session.prompt).toHaveBeenCalledWith("/extension arg", expect.any(Object));
     expect(runtime.newSession).not.toHaveBeenCalled();
   });
@@ -1459,6 +1599,30 @@ describe("setupCommandBridge — target intent dispatch", () => {
     expect(session.prompt).not.toHaveBeenCalled();
   });
 
+  it("derives default export names from the canonical presented session file", async () => {
+    const runtimePin = "/sessions/.pivis-session-42-runtime.runtime-pin";
+    const canonicalSessionFile = "/sessions/canonical-source.jsonl";
+    const { session, dispatchIntent, run } = setup(
+      { sessionFile: runtimePin },
+      { initialPresentedSessionFile: canonicalSessionFile },
+    );
+
+    await expect(
+      dispatchIntent(
+        envelope("canonical-export", {
+          kind: "export",
+        }),
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() =>
+      expect(session.exportToHtml).toHaveBeenCalledWith("pi-session-canonical-source.html"),
+    );
+
+    session.exportToHtml.mockClear();
+    await expect(run({ type: "export_html" })).resolves.toMatchObject({ success: true });
+    expect(session.exportToHtml).toHaveBeenCalledWith("pi-session-canonical-source.html");
+  });
+
   it("lists stored logout credentials through Pi's public model runtime", async () => {
     const { run } = setup({
       modelRuntime: {
@@ -1519,7 +1683,14 @@ describe("setupCommandBridge — target intent dispatch", () => {
   });
 
   it("leaves a template that shadows a builtin on Pi's prompt path", async () => {
-    const { session, runtime, dispatchIntent } = setup({ promptTemplates: [{ name: "new" }] });
+    const { session, runtime, dispatchIntent } = setup(
+      { promptTemplates: [{ name: "new" }] },
+      {
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "/new", attachments: [] }),
+        }),
+      },
+    );
     session.prompt.mockImplementation(async (_text, options) => options.preflightResult(true));
 
     await dispatchIntent(
@@ -1565,6 +1736,38 @@ describe("setupCommandBridge — command mapping", () => {
       pendingMessageCount: 0,
       steering: ["s1"],
       followUp: ["f1"],
+    });
+  });
+
+  it("hides an initial runtime-pin path but exposes a genuine rebound successor", async () => {
+    const alias = "/sessions/.pivis-session.runtime-pin";
+    const canonical = "/sessions/original.jsonl";
+    const { runtime, run } = setup(
+      {
+        sessionFile: alias,
+        getSessionStats: vi.fn(() => ({ sessionFile: alias, tokens: { input: 1 } })),
+      },
+      { initialPresentedSessionFile: canonical },
+    );
+
+    await expect(run({ type: "get_state" })).resolves.toMatchObject({
+      success: true,
+      data: { sessionFile: canonical },
+    });
+    await expect(run({ type: "get_session_stats" })).resolves.toMatchObject({
+      success: true,
+      data: { sessionFile: canonical },
+    });
+
+    const successor = makeSession({
+      sessionId: "successor",
+      sessionFile: "/sessions/successor.jsonl",
+    });
+    await runtime.setRebindSession.mock.calls[0][0](successor);
+
+    await expect(run({ type: "get_state" })).resolves.toMatchObject({
+      success: true,
+      data: { sessionFile: "/sessions/successor.jsonl" },
     });
   });
 
@@ -2283,6 +2486,90 @@ describe("setupCommandBridge — command mapping", () => {
     expect(acceptEditorSubmission).toHaveBeenCalledWith(
       expect.objectContaining({ intentId: "clear-editor", editorRevision: 3 }),
     );
+  });
+
+  it("propagates prompt admission context to synchronous Pi queue updates", async () => {
+    const queueAppend = deferred();
+    let emitSessionEvent;
+    let steering = [];
+    const extensionRunner = {
+      getCommand: vi.fn(() => undefined),
+      getRegisteredCommands: vi.fn(() => []),
+      hasHandlers: vi.fn(() => false),
+    };
+    const { handleSubmit, handleEscape, send } = setup(
+      {
+        isStreaming: true,
+        isIdle: false,
+        extensionRunner,
+        subscribe: vi.fn((listener) => {
+          emitSessionEvent = listener;
+          return vi.fn();
+        }),
+        getSteeringMessages: vi.fn(() => steering),
+        clearQueue: vi.fn(() => {
+          const cleared = [...steering];
+          steering = [];
+          emitSessionEvent({ type: "queue_update", steering: [], followUp: [] });
+          return { steering: cleared, followUp: [] };
+        }),
+        prompt: vi.fn(async (text, options) => {
+          try {
+            steering.push(text);
+            emitSessionEvent({
+              type: "queue_update",
+              steering: [...steering],
+              followUp: [],
+            });
+            await queueAppend.promise;
+            options.preflightResult(true);
+          } catch (error) {
+            options.preflightResult(false);
+            throw error;
+          }
+        }),
+      },
+      {
+        uiState: makeUiState({
+          editorSnapshot: () => ({
+            revision: 4,
+            text: "bridge appended",
+            attachments: [],
+          }),
+        }),
+      },
+    );
+    const pending = handleSubmit({
+      submission: {
+        intentId: "bridge-admission",
+        expectedHostId: "test-host",
+        expectedEpoch: 0,
+        editorRevision: 4,
+        text: "bridge appended",
+        inputKind: "ordinary",
+        images: [],
+        requestedMode: "steer",
+        surface: "composer",
+      },
+    });
+    await vi.waitFor(() => expect(steering).toEqual(["bridge appended"]));
+
+    const escaped = await handleEscape("bridge-escape");
+    await expect(pending).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    expect(
+      send.mock.calls
+        .map(([message]) => message)
+        .filter((message) => message.type === "queue_restoration"),
+    ).toEqual([
+      expect.objectContaining({
+        restorationId: escaped.restorationId,
+        steering: ["bridge appended"],
+        clearedIntentIds: ["bridge-admission"],
+        certainty: "unknown",
+      }),
+    ]);
+
+    queueAppend.resolve();
   });
 
   it("prompt responds early via preflightResult(true) without awaiting the turn", async () => {

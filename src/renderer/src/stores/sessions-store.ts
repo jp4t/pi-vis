@@ -109,6 +109,8 @@ interface PendingComposerSubmission {
   draftScope: "workspace" | "session";
   /** Renderer text that may be cleared only while it is still the saved draft. */
   composerText: string;
+  /** Replicated attachment payload paired with composerText at dispatch. */
+  composerAttachments?: unknown[] | undefined;
   /** Actual prompt after staged files/comments; used for untagged legacy echoes. */
   submittedText: string;
   submittedComments: CodeComment[];
@@ -679,6 +681,35 @@ function authorityObservation(session: SessionViewState) {
   const semantic = session.authorityProjection;
   if (!snapshot || semantic?.semantic.state !== "following") return undefined;
   return { owner: snapshot.owner, cursor: semantic.semantic.cursor };
+}
+
+/**
+ * Bare Escape is the one latency-sensitive mutation allowed through a semantic
+ * synchronization fence. Its owner still comes from the last validated attach;
+ * main rechecks that identity immediately before child dispatch. Every ordinary
+ * mutation continues to require a complete following semantic projection.
+ */
+function escapeOwner(session: SessionViewState): RuntimeIdentity | undefined {
+  const current = authorityObservation(session);
+  if (current) return current.owner;
+  const projection = session.authorityProjection;
+  if (
+    session.status !== "ready" ||
+    session.availability !== "available" ||
+    projection?.semantic.state !== "synchronizing" ||
+    !projection.owner
+  ) {
+    return undefined;
+  }
+  const evidence = projection.semantic.lastCursor ?? projection.staleDiagnosticSnapshot?.owner;
+  if (
+    !evidence ||
+    evidence.hostInstanceId !== projection.owner.hostInstanceId ||
+    evidence.sessionEpoch !== projection.owner.sessionEpoch
+  ) {
+    return undefined;
+  }
+  return projection.owner;
 }
 
 export function sessionMatchesRuntime(
@@ -1334,6 +1365,7 @@ interface SessionsStore {
     sessionId: SessionId,
     restoration: {
       restorationId: string;
+      intentIds?: string[] | undefined;
       text: string;
       attachments: unknown[];
       disposition: "restore" | "dropped";
@@ -2899,11 +2931,109 @@ const buildSessionsStore = (
         restoration.restorationId,
       ];
       if (restoration.disposition === "dropped") {
-        sessions.set(sessionId, { ...current, appliedRestoreDraftIds });
+        const pending = current.pendingComposerSubmission;
+        const matchesPending =
+          pending !== undefined && restoration.intentIds?.includes(pending.intentId) === true;
+        if (!matchesPending || !pending) {
+          sessions.set(sessionId, { ...current, appliedRestoreDraftIds });
+          return { sessions };
+        }
+
+        const draftKey = pending.draftScope === "workspace" ? current.workspacePath : sessionId;
+        const drafts =
+          pending.draftScope === "workspace" ? state.newSessionDrafts : state.sessionDrafts;
+        const matchingDraft = drafts.get(draftKey) === pending.composerText;
+        const submittedAttachments = pending.composerAttachments;
+        // A prior resolved restoration can install a newer renderer-owned
+        // text/attachment candidate before React consumes the injection. That
+        // candidate outranks the older authoritative attachment snapshot just
+        // as a newer draft-map edit does; never replace it with an empty clear.
+        const injectedCandidate =
+          current.editorInjection?.attachments !== undefined ? current.editorInjection : undefined;
+        const candidateTextStillMatches =
+          injectedCandidate === undefined || injectedCandidate.text === pending.composerText;
+        const candidateAttachments = injectedCandidate?.attachments ?? current.editorAttachments;
+        const attachmentsStillMatch =
+          submittedAttachments === undefined ||
+          JSON.stringify(candidateAttachments) === JSON.stringify(submittedAttachments);
+        const matchingRendererCandidate =
+          matchingDraft &&
+          candidateTextStillMatches &&
+          attachmentsStillMatch &&
+          current.editorAttachmentReads === 0;
+        const newSessionDrafts =
+          matchingRendererCandidate && pending.draftScope === "workspace"
+            ? clearMatchingDraft(
+                state.newSessionDrafts,
+                current.workspacePath,
+                pending.composerText,
+              )
+            : state.newSessionDrafts;
+        const sessionDrafts =
+          matchingRendererCandidate && pending.draftScope === "session"
+            ? clearMatchingDraft(state.sessionDrafts, sessionId, pending.composerText)
+            : state.sessionDrafts;
+        const existingComments = state.diffComments.get(sessionId);
+        const remainingComments = withoutSubmittedCommentRevisions(
+          existingComments,
+          pending.submittedComments,
+        );
+        let diffComments = state.diffComments;
+        if (remainingComments !== existingComments) {
+          diffComments = new Map(state.diffComments);
+          if (!remainingComments || remainingComments.size === 0) diffComments.delete(sessionId);
+          else diffComments.set(sessionId, remainingComments);
+          persistCodeComments(diffComments);
+        }
+        sessions.set(sessionId, {
+          ...current,
+          appliedRestoreDraftIds,
+          pendingComposerSubmission: undefined,
+          ...(matchingRendererCandidate
+            ? {
+                // This renderer-owned injection clears a mounted Composer and
+                // revision-patches the restarted host. Explicit attachments
+                // make the injection authoritative instead of draft-preserving.
+                editorInjection: {
+                  text: "",
+                  attachments: [],
+                  nonce: ++editorInjectionNonce,
+                },
+              }
+            : {}),
+        });
+        return { sessions, newSessionDrafts, sessionDrafts, diffComments };
+      }
+      const pending = current.pendingComposerSubmission;
+      const matchesPending =
+        pending !== undefined && restoration.intentIds?.includes(pending.intentId) === true;
+      const pendingDraftStillPresent =
+        pending?.draftScope === "workspace"
+          ? state.newSessionDrafts.get(current.workspacePath) === pending.composerText
+          : pending?.draftScope === "session"
+            ? state.sessionDrafts.get(sessionId) === pending.composerText
+            : false;
+      const pendingAttachmentsStillPresent =
+        pending?.composerAttachments === undefined ||
+        JSON.stringify(current.editorAttachments) === JSON.stringify(pending.composerAttachments);
+      if (matchesPending && pendingDraftStillPresent && pendingAttachmentsStillPresent) {
+        // Preflight interruption can return recovery custody while the
+        // renderer still visibly owns the exact raw submission. Do not append
+        // the host's transformed transport text or duplicate its attachments;
+        // the restoration is the terminal handoff for this correlation.
+        sessions.set(sessionId, {
+          ...current,
+          appliedRestoreDraftIds,
+          pendingComposerSubmission: undefined,
+        });
         return { sessions };
       }
+      const rendererDraft =
+        pending?.draftScope === "workspace" || current.isNewPending
+          ? state.newSessionDrafts.get(current.workspacePath)
+          : state.sessionDrafts.get(sessionId);
       const draft =
-        state.sessionDrafts.get(sessionId) ??
+        rendererDraft ??
         current.editorInjection?.text ??
         current.runtimeSnapshot?.editor.text ??
         "";
@@ -2919,6 +3049,7 @@ const buildSessionsStore = (
       sessions.set(sessionId, {
         ...current,
         appliedRestoreDraftIds,
+        ...(matchesPending ? { pendingComposerSubmission: undefined } : {}),
         editorInjection: { text, attachments, nonce: ++editorInjectionNonce },
       });
       return { sessions };
@@ -3019,16 +3150,33 @@ const buildSessionsStore = (
   },
 
   abortSession: (sessionId) => {
-    // A receipt is admission feedback only. Interrupt outcome and liveness are
-    // reduced later from the semantic authority frame.
+    // Bare Escape deliberately bypasses the serialized intent ingress queue.
+    // A prompt/steering admission can be awaiting Pi preflight there, while
+    // the host's direct escape path can signal the active operation at once.
     const session = get().sessions.get(sessionId);
     if (!session) return;
-    const observation = authorityObservation(session);
-    if (!observation) return;
-    void dispatchSessionIntent(sessionId, { kind: "interrupt" }, observation).catch((error) => {
-      const message = describeIpcError(error);
-      if (message) get().addToast(sessionId, message, "error");
-    });
+    const owner = escapeOwner(session);
+    if (!owner) return;
+    const requestId = crypto.randomUUID();
+    void window.pivis
+      .invoke("session.escape", {
+        sessionId,
+        requestId,
+        expectedHostInstanceId: owner.hostInstanceId,
+        expectedSessionEpoch: owner.sessionEpoch,
+      })
+      .then((result) => {
+        if (result.disposition !== "failed" && result.disposition !== "outcome_unknown") return;
+        get().addToast(
+          sessionId,
+          result.message ?? "Interrupt outcome is unknown.",
+          result.disposition === "outcome_unknown" ? "warning" : "error",
+        );
+      })
+      .catch((error) => {
+        const message = describeIpcError(error);
+        if (message) get().addToast(sessionId, message, "error");
+      });
   },
 
   addUiRequest: (sessionId, request) => {
@@ -3358,6 +3506,7 @@ const buildSessionsStore = (
         ? {
             ...parsedAction,
             text: promptText,
+            inputKind: text.startsWith("/") ? ("slash_command" as const) : ("ordinary" as const),
             ...(promptImages.length > 0
               ? { images: runtimeImagesFromAttachments(promptImages) }
               : {}),
@@ -3497,6 +3646,7 @@ const buildSessionsStore = (
             kind: "submit",
             editorRevision: submission.editorRevision,
             text: submission.text,
+            inputKind: submission.inputKind,
             images: submission.images,
             requestedMode: submission.requestedMode,
             surface: submission.surface,
@@ -4872,6 +5022,9 @@ const buildSessionsStore = (
         pendingComposerSubmission: {
           ...submission,
           owner: { ...submission.owner },
+          ...(submission.composerAttachments !== undefined
+            ? { composerAttachments: structuredClone(submission.composerAttachments) }
+            : {}),
           submittedComments: submission.submittedComments.map((comment) => ({ ...comment })),
         },
       });

@@ -568,6 +568,8 @@ export interface IpcEventContract {
   "session.restoreDraft": {
     sessionId: SessionId;
     restorationId: string;
+    /** Exact renderer submission correlations represented by this recovery item. */
+    intentIds?: string[];
     text: string;
     attachments: unknown[];
     disposition: "restore" | "dropped";

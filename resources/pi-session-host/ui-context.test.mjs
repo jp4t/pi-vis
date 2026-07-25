@@ -373,10 +373,15 @@ function renderedWidgetLines(container) {
 
 /** Pull the id from the most recent unified_submit_request sendToMain call. */
 function lastSubmitId(sendToMain) {
+  return lastSubmitRequest(sendToMain).id;
+}
+
+/** Pull the most recent unified_submit_request sent to main. */
+function lastSubmitRequest(sendToMain) {
   const reqs = sendToMain.mock.calls
     .map((c) => c[0])
     .filter((m) => m.type === "unified_submit_request");
-  return reqs[reqs.length - 1].id;
+  return reqs[reqs.length - 1];
 }
 
 /** Pull the id from the most recent clipboard_read_image_request sendToMain call. */
@@ -1113,6 +1118,7 @@ describe("unified TUI: authoritative submit draft", () => {
       h.bundle.state.acceptEditorSubmission({
         editorRevision: 1,
         text: "/widget-on",
+        inputKind: "slash_command",
       }),
     ).toBe(true);
     expect(h.bundle.state.editorSnapshot()).toMatchObject({
@@ -1120,6 +1126,133 @@ describe("unified TUI: authoritative submit draft", () => {
       text: "",
       attachments,
     });
+  });
+
+  it("clears attachments for ordinary input whose transported text starts with a file path", () => {
+    const h = makeHarness();
+    const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 0,
+        revision: 1,
+        text: "Explain these notes",
+        attachments,
+      }),
+    ).toMatchObject({ accepted: true });
+
+    expect(
+      h.bundle.state.acceptEditorSubmission({
+        editorRevision: 1,
+        text: "/tmp/notes.txt\n\nExplain these notes",
+        inputKind: "ordinary",
+      }),
+    ).toBe(true);
+    expect(h.bundle.state.editorSnapshot()).toMatchObject({
+      revision: 2,
+      text: "",
+      attachments: [],
+    });
+  });
+
+  it("rejects an explicit classification that disagrees with authoritative editor text", () => {
+    const h = makeHarness();
+    const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 0,
+        revision: 1,
+        text: "/extension",
+        attachments,
+      }),
+    ).toMatchObject({ accepted: true });
+
+    expect(
+      h.bundle.state.acceptEditorSubmission({
+        editorRevision: 1,
+        text: "/extension",
+        inputKind: "ordinary",
+      }),
+    ).toBe(false);
+    expect(h.bundle.state.editorSnapshot()).toMatchObject({
+      revision: 1,
+      text: "/extension",
+      attachments,
+    });
+  });
+
+  it("accepts transformed ordinary unified input against its pending raw editor text", () => {
+    const h = makeHarness();
+    h.context.setWidget("k", makeFactory());
+    const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 0,
+        revision: 1,
+        text: "Explain these notes",
+        attachments,
+      }),
+    ).toMatchObject({ accepted: true });
+
+    h.editor.onSubmit("Explain these notes");
+    expect(
+      h.bundle.state.acceptEditorSubmission({
+        editorRevision: 1,
+        text: "/tmp/notes.txt\n\nExplain these notes",
+        inputKind: "ordinary",
+      }),
+    ).toBe(true);
+    expect(h.bundle.state.editorSnapshot()).toMatchObject({
+      revision: 2,
+      text: "",
+      attachments: [],
+    });
+  });
+
+  it("acknowledges the exact pending intent when two unified submits share a revision", () => {
+    const h = makeHarness();
+    h.context.setWidget("k", makeFactory());
+    const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 0,
+        revision: 1,
+        text: "first prompt",
+        attachments,
+      }),
+    ).toMatchObject({ accepted: true });
+
+    h.editor.onSubmit("first prompt");
+    const first = lastSubmitRequest(h.sendToMain);
+    h.editor.onSubmit("Explain these notes");
+    const second = lastSubmitRequest(h.sendToMain);
+    expect(first.editorRevision).toBe(1);
+    expect(second.editorRevision).toBe(1);
+
+    expect(
+      h.bundle.state.acceptEditorSubmission({
+        intentId: second.submissionIntentId,
+        editorRevision: 1,
+        text: "/tmp/notes.txt\n\nExplain these notes",
+        inputKind: "ordinary",
+      }),
+    ).toBe(true);
+    expect(h.bundle.state.editorSnapshot()).toMatchObject({
+      revision: 1,
+      text: "first prompt",
+      attachments: [],
+    });
+
+    // Resolving the acknowledged second request must not advance the editor a
+    // second time. If the first pending item had been marked by revision
+    // alone, this compare-and-set patch would see revision 3 and be rejected.
+    h.unified.resolveSubmit(second.id, { ok: true });
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 2,
+        revision: 3,
+        text: "new draft",
+      }),
+    ).toMatchObject({ accepted: true, revision: 3 });
   });
 
   it("clears the authoritative pending draft only after custody", () => {
@@ -1298,6 +1431,7 @@ describe("unified TUI: editor submit + guard bail-restore", () => {
         type: "unified_submit_request",
         text: "hello world",
         editorRevision: 1,
+        submissionIntentId: expect.any(String),
       }),
     );
   });
@@ -1345,7 +1479,12 @@ describe("unified TUI: editor submit + guard bail-restore", () => {
 
     h.unified.dispose({ preservePendingSubmits: true });
     expect(h.bundle.state.pendingUnifiedSubmissions()).toEqual([
-      { id, text: "reload-safe prompt", revision: 0 },
+      {
+        id,
+        text: "reload-safe prompt",
+        revision: 0,
+        submissionIntentId: expect.any(String),
+      },
     ]);
     h.unified.resolveSubmit(id, { ok: false, bailed: true });
 

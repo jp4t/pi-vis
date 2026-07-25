@@ -33,6 +33,16 @@ export type EscapeDisposition = z.infer<typeof EscapeDispositionSchema>;
 export const SubmissionSurfaceSchema = z.enum(["composer", "unified"]);
 export type SubmissionSurface = z.infer<typeof SubmissionSurfaceSchema>;
 
+/**
+ * Classifies the editor input before renderer-side prompt context (for
+ * example absolute attachment paths) is added to the transported text.
+ * Optional parsing preserves one-version compatibility; current renderers
+ * always send it and hosts fall back to the legacy text heuristic only when
+ * it is absent.
+ */
+export const SubmissionInputKindSchema = z.enum(["ordinary", "slash_command"]);
+export type SubmissionInputKind = z.infer<typeof SubmissionInputKindSchema>;
+
 export const RuntimeIdentitySchema = z.object({
   hostInstanceId: z.string().min(1),
   sessionEpoch: z.number().int().nonnegative(),
@@ -93,6 +103,7 @@ export const SessionSubmissionSchema = z.object({
   expectedEpoch: z.number().int().nonnegative(),
   editorRevision: z.number().int().nonnegative(),
   text: z.string(),
+  inputKind: SubmissionInputKindSchema.optional(),
   images: z.array(RuntimeImageSchema).default([]),
   requestedMode: z.enum(["steer", "followUp"]),
   surface: SubmissionSurfaceSchema,
@@ -130,6 +141,26 @@ export const RuntimeModelSchema = z
     name: z.string().optional(),
   })
   .passthrough();
+
+/**
+ * Owner-local runtime selection retained by main while replacing the host for
+ * the same session record. The child treats this only as a fallback when the
+ * active persisted branch does not identify its own model/thinking choice.
+ */
+export const SessionRuntimeResumeStateSchema = z
+  .object({
+    model: z
+      .object({
+        provider: z.string().min(1),
+        modelId: z.string().min(1),
+      })
+      .strict()
+      .nullable()
+      .optional(),
+    thinkingLevel: ThinkingLevelSchema.optional(),
+  })
+  .strict();
+export type SessionRuntimeResumeState = z.infer<typeof SessionRuntimeResumeStateSchema>;
 
 export const RuntimeCatalogSchema = z.object({
   notifications: z
@@ -649,6 +680,7 @@ export const SessionIntentSchema = z.union([
       kind: z.literal("submit"),
       editorRevision: NonNegativeIntegerSchema,
       text: z.string(),
+      inputKind: SubmissionInputKindSchema.optional(),
       images: z.array(RuntimeImageSchema),
       requestedMode: z.enum(["steer", "followUp"]),
       surface: SubmissionSurfaceSchema,
@@ -1274,6 +1306,12 @@ export const AuthorityFrameSchema = z
     frameId: NonEmptyIdSchema,
     records: z.array(AuthorityRecordSchema),
     terminalSnapshot: SemanticSnapshotSchema,
+    /**
+     * Child-authored continuation state. Main retains and returns it opaquely
+     * only when replacing this same session's host; it never derives a Pi
+     * selection from the compatibility snapshot.
+     */
+    runtimeResumeState: SessionRuntimeResumeStateSchema.optional(),
   })
   .strict()
   .superRefine((frame, ctx) => {

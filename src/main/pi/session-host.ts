@@ -40,6 +40,8 @@ import {
   type LifecyclePermitOperation,
   type LifecyclePermitVerdict,
   LifecyclePermitVerdictSchema,
+  type SessionRuntimeResumeState,
+  SessionRuntimeResumeStateSchema,
   type SessionSubmission,
   type SubmissionResult,
   SubmissionResultSchema,
@@ -98,6 +100,48 @@ function resolveHostScript(): string {
 }
 
 const HOST_SCRIPT = resolveHostScript();
+
+export type ConfinedSessionRuntimeStrategy = "inherited-descriptor" | "hard-link-alias";
+
+/**
+ * Linux `/proc/self/fd/<n>` reopens a regular file with an independent read
+ * position. Darwin `/dev/fd/<n>` duplicates the inherited open-file
+ * description instead, so Pi's two-pass SessionManager.open() leaves its
+ * second read at EOF. A verified hard-link alias is also required on Windows,
+ * which has no descriptor filesystem.
+ */
+export function confinedSessionRuntimeStrategyForPlatform(
+  platform: NodeJS.Platform,
+): ConfinedSessionRuntimeStrategy {
+  return platform === "linux" ? "inherited-descriptor" : "hard-link-alias";
+}
+
+/**
+ * Resolve the path given to the SDK host. Kept pure so every supported
+ * platform policy can be tested regardless of the machine running the suite.
+ */
+export function resolveHostSessionFile(
+  sessionFile: string | undefined,
+  confinedSessionDescriptor: number | undefined,
+  confinedSessionAlias: string | undefined,
+  platform: NodeJS.Platform,
+): string | undefined {
+  if (confinedSessionDescriptor !== undefined && confinedSessionAlias) {
+    throw new Error("Confined session runtime cannot use both a descriptor and an alias");
+  }
+  if (!sessionFile) {
+    if (confinedSessionDescriptor !== undefined || confinedSessionAlias) {
+      throw new Error("Confined session runtime requires a session file");
+    }
+    return undefined;
+  }
+  if (confinedSessionAlias) return confinedSessionAlias;
+  if (confinedSessionDescriptor === undefined) return sessionFile;
+  if (confinedSessionRuntimeStrategyForPlatform(platform) !== "inherited-descriptor") {
+    throw new Error("Inherited session descriptors are supported only on Linux");
+  }
+  return "/proc/self/fd/4";
+}
 
 /**
  * Test seam: when set, `SessionHost` constructs its ChildProcess by calling
@@ -219,7 +263,12 @@ export interface SessionHostEvents {
   panelMode: (panelId: number, mode: "content" | "viewport") => void;
   panelClearAll: () => void;
   /** Unified TUI panel events */
-  unifiedSubmitRequest: (id: string, text: string, editorRevision: number) => void;
+  unifiedSubmitRequest: (
+    id: string,
+    text: string,
+    editorRevision: number,
+    submissionIntentId?: string,
+  ) => void;
   snapshot: (snapshot: AgentSessionSnapshot, full: boolean) => void;
   transitionBatch: (batch: TransitionBatch) => void;
   transitionStarted: (transitionId: string, provisionalEpoch: number) => void;
@@ -257,6 +306,10 @@ interface InitMessage {
   // pi.getAgentDir() so the runtime, services, and ProjectTrustStore agree and
   // honor PI_* env overrides (staying shared with the user's terminal pi).
   sessionFile?: string;
+  /** Canonical validated source when sessionFile is an internal runtime pin. */
+  canonicalSessionFile?: string;
+  /** Last authoritative selection from this same main-owned session record. */
+  runtimeResumeState?: SessionRuntimeResumeState;
 }
 
 /** Wire messages sent from the host subprocess to the main process.
@@ -292,7 +345,13 @@ type HostWireMessage =
   | { type: "panel_close"; panelId: number }
   | { type: "panel_mode"; panelId: number; mode: "content" | "viewport" }
   | { type: "panel_clear_all" }
-  | { type: "unified_submit_request"; id: string; text: string; editorRevision: number }
+  | {
+      type: "unified_submit_request";
+      id: string;
+      text: string;
+      editorRevision: number;
+      submissionIntentId?: string;
+    }
   | { type: "clipboard_read_image_request"; id: string }
   | { type: "submission_disposition"; result: SubmissionResult }
   | { type: "intent_outcome"; outcome: unknown }
@@ -389,16 +448,29 @@ export class SessionHost extends EventEmitter {
      */
     nodeExecPath?: string,
     /**
-     * Optional descriptor pinned by a validated search open. It is inherited as
-     * child fd 4 so SessionManager opens the validated inode, not a pathname
-     * that may have changed during the renderer activation IPC gap.
+     * Optional Linux descriptor pinned by a validated search open. It is
+     * inherited as child fd 4 so SessionManager opens the validated inode, not
+     * a pathname that may have changed during the renderer activation IPC gap.
      */
     confinedSessionDescriptor?: number,
-    /** Windows hard-link alias to the descriptor-pinned inode. */
+    /** Identity-verified hard-link alias to the descriptor-pinned inode. */
     confinedSessionAlias?: string,
+    /** Owner-local fallback for a same-session host replacement. */
+    runtimeResumeState?: SessionRuntimeResumeState,
   ) {
     super();
     this.sessionFile = sessionFile;
+    const validatedRuntimeResumeState = runtimeResumeState
+      ? SessionRuntimeResumeStateSchema.parse(runtimeResumeState)
+      : undefined;
+    const hostSessionFile = resolveHostSessionFile(
+      sessionFile,
+      confinedSessionDescriptor,
+      confinedSessionAlias,
+      process.platform,
+    );
+    const canonicalSessionFile =
+      sessionFile && hostSessionFile && sessionFile !== hostSessionFile ? sessionFile : undefined;
 
     // E2E seam: when PIVIS_TEST_HOST_SCRIPT is set, fork that script instead of
     // the real host.mjs. Lets the unified-panel Playwright test drive the
@@ -491,15 +563,9 @@ export class SessionHost extends EventEmitter {
       piPath,
       cwd: workspacePath,
     };
-    if (sessionFile) {
-      initMsg.sessionFile = confinedSessionAlias
-        ? confinedSessionAlias
-        : confinedSessionDescriptor === undefined
-          ? sessionFile
-          : process.platform === "linux"
-            ? "/proc/self/fd/4"
-            : "/dev/fd/4";
-    }
+    if (hostSessionFile) initMsg.sessionFile = hostSessionFile;
+    if (canonicalSessionFile) initMsg.canonicalSessionFile = canonicalSessionFile;
+    if (validatedRuntimeResumeState) initMsg.runtimeResumeState = validatedRuntimeResumeState;
 
     this.sendChildMessage(initMsg);
 
@@ -1087,7 +1153,13 @@ export class SessionHost extends EventEmitter {
       }
 
       case "unified_submit_request": {
-        this.emit("unifiedSubmitRequest", msg.id, msg.text, msg.editorRevision);
+        this.emit(
+          "unifiedSubmitRequest",
+          msg.id,
+          msg.text,
+          msg.editorRevision,
+          msg.submissionIntentId,
+        );
         break;
       }
 
@@ -1770,7 +1842,12 @@ export interface SessionHost {
   on(event: "panelClearAll", listener: () => void): this;
   on(
     event: "unifiedSubmitRequest",
-    listener: (id: string, text: string, editorRevision: number) => void,
+    listener: (
+      id: string,
+      text: string,
+      editorRevision: number,
+      submissionIntentId?: string,
+    ) => void,
   ): this;
   on(event: "snapshot", listener: (snapshot: AgentSessionSnapshot, full: boolean) => void): this;
   on(event: "transitionBatch", listener: (batch: TransitionBatch) => void): this;
@@ -1822,7 +1899,13 @@ export interface SessionHost {
   emit(event: "panelClose", panelId: number): boolean;
   emit(event: "panelMode", panelId: number, mode: "content" | "viewport"): boolean;
   emit(event: "panelClearAll"): boolean;
-  emit(event: "unifiedSubmitRequest", id: string, text: string, editorRevision: number): boolean;
+  emit(
+    event: "unifiedSubmitRequest",
+    id: string,
+    text: string,
+    editorRevision: number,
+    submissionIntentId?: string,
+  ): boolean;
   emit(event: "snapshot", snapshot: AgentSessionSnapshot, full: boolean): boolean;
   emit(event: "transitionBatch", batch: TransitionBatch): boolean;
   emit(event: "transitionStarted", transitionId: string, provisionalEpoch: number): boolean;

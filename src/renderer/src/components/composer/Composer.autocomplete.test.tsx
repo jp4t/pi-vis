@@ -2078,6 +2078,7 @@ describe("Composer attachments under authority outcomes", () => {
     await vi.waitFor(() => expect(intentCalls(invoke)).toHaveLength(2));
     const prompt = intentCalls(invoke)[1]!.intent as Extract<SessionIntent, { kind: "submit" }>;
     expect(prompt.text).toContain("/tmp/notes.txt");
+    expect(prompt.inputKind).toBe("ordinary");
     expect(prompt.text).not.toContain("### User comments on the code");
     expect(prompt.images).toHaveLength(1);
     await vi.waitFor(() =>

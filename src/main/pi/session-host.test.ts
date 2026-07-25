@@ -7,7 +7,9 @@ import {
   HostVersionTooLowError,
   SessionHost,
   __forkOverride,
+  confinedSessionRuntimeStrategyForPlatform,
   isSessionHost,
+  resolveHostSessionFile,
 } from "./session-host.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -146,9 +148,21 @@ describe("SessionHost", () => {
         frameId: "semantic-1",
         records: [],
         terminalSnapshot: baseline.semantic.snapshot,
+        runtimeResumeState: {
+          model: { provider: "fake", modelId: "fake-model" },
+          thinkingLevel: "off",
+        },
       },
     });
-    expect(frames).toHaveBeenCalledWith(expect.objectContaining({ frameId: "semantic-1" }));
+    expect(frames).toHaveBeenCalledWith(
+      expect.objectContaining({
+        frameId: "semantic-1",
+        runtimeResumeState: {
+          model: { provider: "fake", modelId: "fake-model" },
+          thinkingLevel: "off",
+        },
+      }),
+    );
 
     const attach = host.requestAuthorityAttach(3);
     const request = fake.sent.find((message) => message.type === "authority_attach");
@@ -799,17 +813,28 @@ describe("SessionHost", () => {
     it("forwards unified_submit_request as a unifiedSubmitRequest event", async () => {
       await fake.emitReady("0.80.0");
       await host.waitForReady();
-      let captured: { id: string; text: string; editorRevision: number } | null = null;
-      host.on("unifiedSubmitRequest", (id, text, editorRevision) => {
-        captured = { id, text, editorRevision };
+      let captured: {
+        id: string;
+        text: string;
+        editorRevision: number;
+        submissionIntentId: string | undefined;
+      } | null = null;
+      host.on("unifiedSubmitRequest", (id, text, editorRevision, submissionIntentId) => {
+        captured = { id, text, editorRevision, submissionIntentId };
       });
       fake.emitMessage({
         type: "unified_submit_request",
         id: "u1",
         text: "hello",
         editorRevision: 7,
+        submissionIntentId: "intent-u1",
       });
-      expect(captured).toEqual({ id: "u1", text: "hello", editorRevision: 7 });
+      expect(captured).toEqual({
+        id: "u1",
+        text: "hello",
+        editorRevision: 7,
+        submissionIntentId: "intent-u1",
+      });
     });
 
     it("sendUnifiedSubmitResponse forwards {type:unified_submit_response} to the host", async () => {
@@ -918,44 +943,111 @@ describe("nodeExecPath (host runtime retarget)", () => {
     __forkOverride.fn = null;
   });
 
-  it("inherits a confined search descriptor and opens that child fd", () => {
+  it("sends a validated same-session runtime selection in the init protocol", () => {
     const fake = new FakeHostProcess();
-    let capturedOpts: Record<string, unknown> = {};
-    __forkOverride.fn = (_p: string, _a: string[], opts: object) => {
-      capturedOpts = opts as Record<string, unknown>;
-      return fake as unknown as ReturnType<typeof import("node:child_process").fork>;
-    };
+    __forkOverride.fn = () =>
+      fake as unknown as ReturnType<typeof import("node:child_process").fork>;
     const host = new SessionHost(
       "/fake/pi",
       "/tmp/ws",
       "/sessions/original.jsonl",
       {},
       undefined,
-      42,
+      undefined,
+      undefined,
+      {
+        model: { provider: "provider-a", modelId: "model-a" },
+        thinkingLevel: "high",
+      },
     );
     host.on("error", () => {});
 
-    expect(capturedOpts.stdio).toEqual(["pipe", "pipe", "pipe", "ipc", 42]);
-    expect(fake.sent[0]).toMatchObject({
+    expect(fake.sent[0]).toEqual({
       type: "init",
-      sessionFile: process.platform === "linux" ? "/proc/self/fd/4" : "/dev/fd/4",
+      piPath: "/fake/pi",
+      cwd: "/tmp/ws",
+      sessionFile: "/sessions/original.jsonl",
+      runtimeResumeState: {
+        model: { provider: "provider-a", modelId: "model-a" },
+        thinkingLevel: "high",
+      },
     });
     host.stop();
     __forkOverride.fn = null;
   });
 
-  it("uses a pinned hard-link path without fd filesystems on Windows", () => {
+  it.skipIf(process.platform !== "linux")(
+    "inherits a confined search descriptor and opens that child fd on Linux",
+    () => {
+      const fake = new FakeHostProcess();
+      let capturedOpts: Record<string, unknown> = {};
+      __forkOverride.fn = (_p: string, _a: string[], opts: object) => {
+        capturedOpts = opts as Record<string, unknown>;
+        return fake as unknown as ReturnType<typeof import("node:child_process").fork>;
+      };
+      const host = new SessionHost(
+        "/fake/pi",
+        "/tmp/ws",
+        "/sessions/original.jsonl",
+        {},
+        undefined,
+        42,
+      );
+      host.on("error", () => {});
+
+      expect(capturedOpts.stdio).toEqual(["pipe", "pipe", "pipe", "ipc", 42]);
+      expect(fake.sent[0]).toMatchObject({
+        type: "init",
+        sessionFile: "/proc/self/fd/4",
+        canonicalSessionFile: "/sessions/original.jsonl",
+      });
+      host.stop();
+      __forkOverride.fn = null;
+    },
+  );
+
+  it("uses hard-link aliases on Darwin and Windows, with descriptors confined to Linux", () => {
+    expect(confinedSessionRuntimeStrategyForPlatform("linux")).toBe("inherited-descriptor");
+    expect(confinedSessionRuntimeStrategyForPlatform("darwin")).toBe("hard-link-alias");
+    expect(confinedSessionRuntimeStrategyForPlatform("win32")).toBe("hard-link-alias");
+    expect(confinedSessionRuntimeStrategyForPlatform("freebsd")).toBe("hard-link-alias");
+
+    expect(
+      resolveHostSessionFile(
+        "/sessions/original.jsonl",
+        undefined,
+        "/sessions/.pivis-session.runtime-pin",
+        "darwin",
+      ),
+    ).toBe("/sessions/.pivis-session.runtime-pin");
+    expect(resolveHostSessionFile("/sessions/original.jsonl", 42, undefined, "linux")).toBe(
+      "/proc/self/fd/4",
+    );
+    expect(() =>
+      resolveHostSessionFile("/sessions/original.jsonl", 42, undefined, "darwin"),
+    ).toThrow("supported only on Linux");
+    expect(() =>
+      resolveHostSessionFile(
+        "/sessions/original.jsonl",
+        42,
+        "/sessions/.pivis-session.runtime-pin",
+        "linux",
+      ),
+    ).toThrow("both a descriptor and an alias");
+  });
+
+  it("uses a pinned hard-link path without inheriting a descriptor", () => {
     const fake = new FakeHostProcess();
     let capturedOpts: Record<string, unknown> = {};
     __forkOverride.fn = (_p: string, _a: string[], opts: object) => {
       capturedOpts = opts as Record<string, unknown>;
       return fake as unknown as ReturnType<typeof import("node:child_process").fork>;
     };
-    const alias = "C:\\sessions\\.pivis-session.runtime-pin";
+    const alias = "/sessions/.pivis-session.runtime-pin";
     const host = new SessionHost(
       "/fake/pi",
       "/tmp/ws",
-      "C:\\sessions\\original.jsonl",
+      "/sessions/original.jsonl",
       {},
       undefined,
       undefined,
@@ -964,7 +1056,11 @@ describe("nodeExecPath (host runtime retarget)", () => {
     host.on("error", () => {});
 
     expect(capturedOpts.stdio).toEqual(["pipe", "pipe", "pipe", "ipc"]);
-    expect(fake.sent[0]).toMatchObject({ type: "init", sessionFile: alias });
+    expect(fake.sent[0]).toMatchObject({
+      type: "init",
+      sessionFile: alias,
+      canonicalSessionFile: "/sessions/original.jsonl",
+    });
     host.stop();
     __forkOverride.fn = null;
   });

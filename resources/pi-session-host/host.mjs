@@ -6,7 +6,7 @@
  * Communicates via process.send() / process.on("message").
  *
  * Protocol (main -> host):
- *   { type: "init", piPath, cwd, sessionFile? }
+ *   { type: "init", piPath, cwd, sessionFile?, canonicalSessionFile?, runtimeResumeState? }
  *   { type: "command", id, command: PiRpcCommand }
  *   { type: "dialog_response", id, response: ExtensionUiResponse }
  *   { type: "interrupt" }
@@ -36,6 +36,7 @@ import * as crypto from "node:crypto";
 import {
   applyPiVisTheme,
   configureHttpDispatcher,
+  createSessionRuntimeOverrideResolver,
   createTrustResolver,
   importPi,
   importPiTui,
@@ -44,6 +45,10 @@ import {
 import { assertHostCapabilities, setupCommandBridge } from "./bridge.mjs";
 import { buildEditorTheme } from "./editor-theme.mjs";
 import { createPanelReconstruction } from "./panel-reconstruction.mjs";
+import {
+  canonicalizeConfinedSessionLineage,
+  canonicalizeConfinedSessionStartEvent,
+} from "./session-lineage.mjs";
 import { createDialogResolver, createUIContext } from "./ui-context.mjs";
 
 // --- State ---
@@ -431,9 +436,12 @@ async function handleInit(msg) {
   // (below) is authoritative and honors PI_* env overrides, so the runtime,
   // the services, and the ProjectTrustStore all agree — and stay shared with
   // the user's terminal pi even under a custom agent dir.
-  const { piPath, cwd, sessionFile } = msg;
+  const { piPath, cwd, sessionFile, canonicalSessionFile, runtimeResumeState } = msg;
 
   try {
+    if (canonicalSessionFile && !sessionFile) {
+      throw new Error("A canonical session source requires an internal runtime session path");
+    }
     // Step 1: Import pi SDK
     const pi = await importPi(piPath);
 
@@ -538,6 +546,14 @@ async function handleInit(msg) {
     const sessionManager = sessionFile
       ? pi.SessionManager.open(sessionFile, configuredSessionDir)
       : pi.SessionManager.create(cwd, configuredSessionDir);
+    const confinedSource =
+      canonicalSessionFile && sessionFile !== canonicalSessionFile
+        ? {
+            runtimeSessionFile: sessionFile,
+            canonicalSessionFile,
+          }
+        : undefined;
+    const resolveRuntimeOverrides = createSessionRuntimeOverrideResolver(runtimeResumeState);
 
     const createRuntime = async ({
       cwd: sc,
@@ -545,6 +561,16 @@ async function handleInit(msg) {
       sessionManager: sm,
       sessionStartEvent,
     }) => {
+      // AgentSessionRuntime derives fork lineage and lifecycle metadata from
+      // AgentSession.sessionFile. For a confined search open that value is an
+      // inode-stable transport path, not user-visible identity. Canonicalize
+      // metadata at the runtime-factory boundary without reopening the
+      // replaceable canonical pathname for I/O.
+      canonicalizeConfinedSessionLineage(sm, sessionStartEvent, confinedSource);
+      const presentedSessionStartEvent = canonicalizeConfinedSessionStartEvent(
+        sessionStartEvent,
+        confinedSource,
+      );
       // SECURITY: wire deny-by-default project trust. Built per-cwd because the
       // runtime can be recreated for a different cwd on session swap, and the
       // ProjectTrustStore is keyed by cwd. Without resolveProjectTrust, pi
@@ -555,12 +581,17 @@ async function handleInit(msg) {
         agentDir: ad,
         resourceLoaderReloadOptions: { resolveProjectTrust: resolveTrust },
       });
-      // Model/thinking are NOT set here: pi-vis starts at the settings default
-      // and the renderer switches via the set_model command after ready.
+      // Preserve explicit model/thinking metadata even when the active branch
+      // has no messages. Pi's ordinary SDK resume path gates those values on
+      // message count, which would let another session's global defaults leak
+      // into an already-created empty session. New sessions and unavailable
+      // stored models still use Pi's normal settings fallback.
+      const sessionOverrides = resolveRuntimeOverrides(sm, services.modelRuntime);
       const result = await pi.createAgentSessionFromServices({
         services,
         sessionManager: sm,
-        sessionStartEvent,
+        sessionStartEvent: presentedSessionStartEvent,
+        ...sessionOverrides,
       });
       return { ...result, services, diagnostics: services.diagnostics };
     };
@@ -648,6 +679,7 @@ async function handleInit(msg) {
       hostInstanceId,
       sendControl,
       requestTransitionPermit: requestMainTransitionPermit,
+      initialPresentedSessionFile: canonicalSessionFile,
       // Frames are opaque semantic commits. `send` envelopes the child frame
       // without re-emitting its records/snapshot on compatibility channels.
       sendFrame: (frame) => send({ type: "authority_frame", frame }),

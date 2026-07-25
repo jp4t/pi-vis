@@ -18,6 +18,11 @@ export type ComposerAction =
   | {
       kind: "send-prompt";
       text: string;
+      /**
+       * Classification of the original editor input before file paths,
+       * comments, or image fallbacks are added to the transport text.
+       */
+      inputKind?: "ordinary" | "slash_command";
       commandSource?: "extension" | "prompt" | "skill";
       images?: Array<{ data: string; mimeType: string; dataUrl: string }>;
       /** User delivery preference carried into the host-owned submit intent. */

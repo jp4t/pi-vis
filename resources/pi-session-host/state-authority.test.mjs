@@ -1,3 +1,6 @@
+import { linkSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AgentSessionSnapshotSchema,
@@ -33,7 +36,10 @@ function makeSession(overrides = {}) {
     pendingMessageCount: 0,
     getSteeringMessages: vi.fn(() => []),
     getFollowUpMessages: vi.fn(() => []),
-    extensionRunner: { getCommand: vi.fn(() => undefined) },
+    extensionRunner: {
+      getCommand: vi.fn(() => undefined),
+      hasHandlers: vi.fn(() => false),
+    },
     prompt: vi.fn((_text, options) => {
       options.preflightResult(true);
       return Promise.resolve();
@@ -105,15 +111,28 @@ afterEach(() => {
 describe("state authority", () => {
   it("keeps ESC restoration in authority frames and detached attach baselines until acknowledgement", async () => {
     const sendFrame = vi.fn();
-    const { authority, session } = setup(
+    let steering = [];
+    const harness = setup(
       {
         isStreaming: true,
         isIdle: false,
-        getSteeringMessages: vi.fn(() => ["queued bytes"]),
-        clearQueue: vi.fn(() => ({ steering: ["queued bytes"], followUp: [] })),
+        getSteeringMessages: vi.fn(() => steering),
+        prompt: vi.fn((text, options) => {
+          steering = [text];
+          options.preflightResult(true);
+          return Promise.resolve();
+        }),
+        clearQueue: vi.fn(() => {
+          const cleared = [...steering];
+          steering = [];
+          // Real Pi emits this synchronously after emptying its queues.
+          harness.authority.observeEvent({ type: "queue_update", steering: [], followUp: [] });
+          return { steering: cleared, followUp: [] };
+        }),
       },
       { sendFrame },
     );
+    const { authority, session, sendRecord } = harness;
     const image = { mimeType: "image/png", data: "AAEC/frozen" };
     await authority.submit(
       makeRequest("esc-restoration", {
@@ -122,6 +141,9 @@ describe("state authority", () => {
         images: [image],
       }),
     );
+    // Let the queued prompt promise settle so active-intent retention cannot
+    // mask attachment-ledger pruning during the re-entrant queue_update.
+    await flush();
     await authority.requestEscape("esc");
 
     const frame = sendFrame.mock.calls
@@ -221,6 +243,7 @@ describe("state authority", () => {
       authority.submit(
         makeRequest("slash", {
           text: "/widget-on",
+          inputKind: "slash_command",
           images: [{ data: "image-bytes", mimeType: "image/png" }],
         }),
       ),
@@ -228,8 +251,9 @@ describe("state authority", () => {
 
     expect(session.prompt).toHaveBeenCalledWith(
       "/widget-on",
-      expect.not.objectContaining({ images: expect.anything() }),
+      expect.objectContaining({ expandPromptTemplates: true }),
     );
+    expect(session.prompt.mock.calls[0][1]).not.toHaveProperty("images");
     expect(acceptEditorSubmission).toHaveBeenCalledWith(
       expect.objectContaining({ text: "/widget-on", images: [] }),
     );
@@ -250,6 +274,116 @@ describe("state authority", () => {
     );
     expect(acceptEditorSubmission).toHaveBeenCalledWith(
       expect.objectContaining({ text: "  /tmp/file is relevant", images }),
+    );
+  });
+
+  it("uses explicit ordinary input semantics when file context makes transport text start with slash", async () => {
+    let steering = [];
+    const acceptEditorSubmission = vi.fn(() => true);
+    const images = [{ data: "image-bytes", mimeType: "image/png" }];
+    const { authority, session } = setup(
+      {
+        isStreaming: true,
+        isIdle: false,
+        getSteeringMessages: vi.fn(() => [...steering]),
+        prompt: vi.fn((text, options) => {
+          steering = [...steering, text];
+          options.preflightResult(true);
+          return Promise.resolve();
+        }),
+      },
+      {
+        getEditor: () => ({ revision: 1, text: "Explain these notes", attachments: [] }),
+        acceptEditorSubmission,
+      },
+    );
+    const text = "/tmp/notes.txt\n\nExplain these notes";
+
+    await expect(
+      authority.submit(
+        makeRequest("file-prefixed", {
+          text,
+          inputKind: "ordinary",
+          images,
+          requestedMode: "steer",
+        }),
+      ),
+    ).resolves.toMatchObject({ disposition: "consumed", queued: true });
+
+    expect(session.prompt).toHaveBeenCalledWith(
+      text,
+      expect.objectContaining({ images, expandPromptTemplates: false }),
+    );
+    expect(acceptEditorSubmission).toHaveBeenCalledWith(
+      expect.objectContaining({ text, inputKind: "ordinary", images }),
+    );
+    expect(authority.snapshot().steeringIntentIds).toEqual(["file-prefixed"]);
+  });
+
+  it("rejects explicit input classification mismatches before Pi admission", async () => {
+    for (const scenario of [
+      {
+        id: "slash-as-ordinary",
+        editorText: "/extension",
+        transportText: "/extension",
+        inputKind: "ordinary",
+      },
+      {
+        id: "ordinary-as-slash",
+        editorText: "Explain these notes",
+        transportText: "Explain these notes",
+        inputKind: "slash_command",
+      },
+    ]) {
+      const acceptEditorSubmission = vi.fn();
+      const { authority, session } = setup(
+        {},
+        {
+          getEditor: () => ({ revision: 1, text: scenario.editorText, attachments: [] }),
+          acceptEditorSubmission,
+        },
+      );
+
+      await expect(
+        authority.submit(
+          makeRequest(scenario.id, {
+            text: scenario.transportText,
+            inputKind: scenario.inputKind,
+            images: [{ data: "must-not-reach-pi", mimeType: "image/png" }],
+          }),
+        ),
+      ).resolves.toMatchObject({
+        disposition: "rejected",
+        message: "Submission input classification does not match the authoritative editor",
+      });
+      expect(session.prompt).not.toHaveBeenCalled();
+      expect(acceptEditorSubmission).not.toHaveBeenCalled();
+    }
+  });
+
+  it("derives legacy classification from raw editor text and retains it through custody", async () => {
+    const acceptEditorSubmission = vi.fn(() => true);
+    const images = [{ data: "legacy-image", mimeType: "image/png" }];
+    const text = "/tmp/notes.txt\n\nExplain these notes";
+    const { authority, session } = setup(
+      {},
+      {
+        getEditor: () => ({ revision: 1, text: "Explain these notes", attachments: [] }),
+        acceptEditorSubmission,
+      },
+    );
+    authority.observeEvent({ type: "compaction_start" });
+
+    await expect(
+      authority.submit(makeRequest("legacy-custody", { text, images })),
+    ).resolves.toMatchObject({ disposition: "in_custody" });
+    expect(acceptEditorSubmission).toHaveBeenCalledWith(
+      expect.objectContaining({ inputKind: "ordinary", text, images }),
+    );
+
+    authority.observeEvent({ type: "compaction_end" });
+    await vi.waitFor(() =>
+      expect(session.prompt).toHaveBeenCalledWith(text, expect.objectContaining({ images })),
     );
   });
 
@@ -342,7 +476,7 @@ describe("state authority", () => {
       isStreaming: true,
       getSteeringMessages: vi.fn(() => steering),
       prompt: vi.fn((_text, options) => {
-        steering = ["transformed queued"];
+        steering = ["original"];
         options.preflightResult(true);
         steering = [];
         authority.observeEvent({
@@ -394,6 +528,44 @@ describe("state authority", () => {
     await submission;
   });
 
+  it("does not treat a non-growing input-hook queue update as queued acceptance", async () => {
+    const promptDone = deferred();
+    const harness = setup({
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      prompt: vi.fn((_text, options) => {
+        harness.authority.observeEvent(
+          { type: "queue_update", steering: [], followUp: [] },
+          "direct-after-empty-update",
+        );
+        options.preflightResult(true);
+        harness.authority.observeEvent({
+          type: "message_start",
+          message: { role: "user", content: "direct after empty queue update" },
+        });
+        return promptDone.promise;
+      }),
+    });
+    const { authority, sendRecord } = harness;
+
+    const submission = authority.submit(
+      makeRequest("direct-after-empty-update", { text: "direct input" }),
+    );
+    await flush();
+    expect(sendRecord).toHaveBeenCalledWith({
+      type: "event",
+      event: {
+        type: "message_start",
+        message: { role: "user", content: "direct after empty queue update" },
+        queueIntentId: "direct-after-empty-update",
+      },
+    });
+    promptDone.resolve();
+    await expect(submission).resolves.toMatchObject({ queued: false });
+  });
+
   it("synchronizes external queue additions before capturing the admission baseline", async () => {
     const promptDone = deferred();
     let steering = [];
@@ -401,7 +573,7 @@ describe("state authority", () => {
       isStreaming: true,
       getSteeringMessages: vi.fn(() => steering),
       prompt: vi.fn((_text, options) => {
-        steering.push("GUI transformed");
+        steering.push("original");
         options.preflightResult(true);
         return promptDone.promise;
       }),
@@ -443,7 +615,7 @@ describe("state authority", () => {
     );
     expect(authority.snapshot().steeringIntentIds).toEqual([]);
 
-    steering = ["transformed delayed queue"];
+    steering = ["original"];
     expect(authority.snapshot().steeringIntentIds).toEqual(["intent-delayed-queue"]);
     await authority.requestEscape("esc-delayed-queue");
 
@@ -451,7 +623,7 @@ describe("state authority", () => {
       .flatMap(([frame]) => frame.records)
       .find((record) => record.type === "queue_restoration");
     expect(restoration).toMatchObject({
-      steering: ["transformed delayed queue"],
+      steering: ["original"],
       clearedIntentIds: ["intent-delayed-queue"],
     });
     promptDone.resolve();
@@ -620,7 +792,7 @@ describe("state authority", () => {
       {
         queuedText: "extension transformed text",
         images: [],
-        expectedMessage: "transformed before queuing",
+        expectedMessage: "outside Pi-Vis",
       },
       {
         queuedText: "plain text",
@@ -666,31 +838,39 @@ describe("state authority", () => {
     const extensionDone = deferred();
     const normalDone = deferred();
     let steering = [];
-    const { authority, sendRecord } = setup({
-      isStreaming: true,
-      getSteeringMessages: vi.fn(() => steering),
-      extensionRunner: {
-        getCommand: vi.fn((name) => (name === "e2e-notify" ? { handler: vi.fn() } : undefined)),
+    let editorText = "/e2e-notify";
+    const { authority, sendRecord } = setup(
+      {
+        isStreaming: true,
+        getSteeringMessages: vi.fn(() => steering),
+        extensionRunner: {
+          getCommand: vi.fn((name) => (name === "e2e-notify" ? { handler: vi.fn() } : undefined)),
+          hasHandlers: vi.fn(() => false),
+        },
+        prompt: vi.fn((text, options) => {
+          options.preflightResult(true);
+          if (text === "/e2e-notify") return extensionDone.promise;
+          steering = [text];
+          return normalDone.promise;
+        }),
       },
-      prompt: vi.fn((text, options) => {
-        options.preflightResult(true);
-        if (text === "/e2e-notify") return extensionDone.promise;
-        steering = ["transformed ordinary queue"];
-        return normalDone.promise;
-      }),
-    });
+      { getEditor: () => ({ revision: 1, text: editorText, attachments: [] }) },
+    );
 
     await authority.submit(
       makeRequest("extension-command", {
         text: "/e2e-notify",
+        inputKind: "slash_command",
         requestedMode: "steer",
       }),
     );
     expect(authority.snapshot().steeringIntentIds).toEqual([]);
 
+    editorText = "ordinary queue";
     await authority.submit(
       makeRequest("ordinary-prompt", {
         text: "ordinary queue",
+        inputKind: "ordinary",
         requestedMode: "steer",
       }),
     );
@@ -699,13 +879,13 @@ describe("state authority", () => {
     steering = [];
     authority.observeEvent({
       type: "message_start",
-      message: { role: "user", content: "transformed ordinary delivery" },
+      message: { role: "user", content: "ordinary queue" },
     });
     expect(sendRecord).toHaveBeenLastCalledWith({
       type: "event",
       event: {
         type: "message_start",
-        message: { role: "user", content: "transformed ordinary delivery" },
+        message: { role: "user", content: "ordinary queue" },
         queueIntentId: "ordinary-prompt",
       },
     });
@@ -745,7 +925,7 @@ describe("state authority", () => {
     promptDone.resolve();
   });
 
-  it("tracks transformed queue slots and decorates their transformed delivery by intent", async () => {
+  it("does not infer GUI ownership for a transformed single queue slot", async () => {
     const promptDone = deferred();
     let steering = [];
     const { authority, sendRecord } = setup({
@@ -765,7 +945,7 @@ describe("state authority", () => {
     ).resolves.toMatchObject({ disposition: "consumed", queued: true });
     expect(authority.snapshot()).toMatchObject({
       steering: ["extension prefix original"],
-      steeringIntentIds: ["intent-transformed"],
+      steeringIntentIds: [null],
     });
 
     steering = [];
@@ -778,9 +958,61 @@ describe("state authority", () => {
       event: {
         type: "message_start",
         message: { role: "user", content: "fully rewritten delivery" },
-        queueIntentId: "intent-transformed",
       },
     });
+    promptDone.resolve();
+  });
+
+  it("does not let handled input claim an unrelated sole queue append", async () => {
+    const promptDone = deferred();
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((_text, options) => {
+        steering = ["handled extension work"];
+        harness.authority.observeEvent(
+          {
+            type: "queue_update",
+            steering: [...steering],
+            followUp: [],
+          },
+          "handled-normal",
+        );
+        options.preflightResult(true);
+        return promptDone.promise;
+      }),
+    });
+    const { authority, session } = harness;
+
+    await expect(
+      authority.submit(
+        makeRequest("handled-normal", {
+          text: "GUI text was handled",
+          requestedMode: "steer",
+        }),
+      ),
+    ).resolves.toMatchObject({ disposition: "consumed", queued: true });
+    expect(authority.snapshot()).toMatchObject({
+      steering: ["handled extension work"],
+      steeringIntentIds: [null],
+    });
+    await expect(
+      authority.manageQueue({
+        kind: "manageQueue",
+        operation: "update",
+        targetIntentId: "handled-normal",
+        text: "must not replace extension work",
+      }),
+    ).resolves.toMatchObject({
+      message: expect.stringContaining("managed outside Pi-Vis"),
+    });
+    expect(session.clearQueue).not.toHaveBeenCalled();
     promptDone.resolve();
   });
 
@@ -808,6 +1040,65 @@ describe("state authority", () => {
     promptDone.resolve();
   });
 
+  it("does not attach a rejected idle admission's images to unrelated hook-started work", async () => {
+    vi.useFakeTimers();
+    const promptDone = deferred();
+    const image = { data: "rejected-image", mimeType: "image/png" };
+    let reportPreflight;
+    let steering = [];
+    const harness = setup({
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({ type: "queue_update", steering: [], followUp: [] });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn((_text, options) => {
+        reportPreflight = options.preflightResult;
+        // The hook starts unrelated work in the same lane, then remains
+        // unresolved beyond the diagnostic admission deadline.
+        harness.session.isStreaming = true;
+        harness.session.isIdle = false;
+        steering = ["unrelated hook work"];
+        harness.authority.observeEvent(
+          { type: "queue_update", steering: [...steering], followUp: [] },
+          "idle-rejected-image",
+        );
+        return promptDone.promise;
+      }),
+    });
+    const { authority, sendRecord } = harness;
+
+    const pending = authority.submit(
+      makeRequest("idle-rejected-image", {
+        text: "eventually rejected",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(pending).resolves.toMatchObject({ disposition: "admitting" });
+
+    reportPreflight(false);
+    promptDone.reject(new Error("input rejected"));
+    await flush();
+    await authority.requestEscape("esc-unrelated-hook-work");
+
+    expect(sendRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queue_restoration",
+        steering: ["unrelated hook work"],
+        originalAttachments: [],
+        certainty: "not_processed",
+      }),
+    );
+  });
+
   it("reports uncertainty when prompt rejects after successful idle preflight", async () => {
     const acceptEditorSubmission = vi.fn();
     const { authority } = setup(
@@ -827,29 +1118,864 @@ describe("state authority", () => {
     expect(acceptEditorSubmission).not.toHaveBeenCalled();
   });
 
-  it("aborts an existing turn before reporting unresolved submission preflight", async () => {
-    const promptDone = deferred();
-    let reportPreflight;
-    const { authority, session } = setup({
+  it("fences a post-hook admission from starting a new turn after streaming Escape", async () => {
+    const inputHook = deferred();
+    const image = { data: "pending-image", mimeType: "image/png" };
+    const startedTurns = [];
+    const harness = setup({
       isStreaming: true,
-      prompt: vi.fn((_text, options) => {
-        reportPreflight = options.preflightResult;
-        return promptDone.promise;
+      isIdle: false,
+      abort: vi.fn(() => {
+        harness.session.isStreaming = false;
+        harness.session.isIdle = true;
+        return Promise.resolve();
+      }),
+      prompt: vi.fn(async (text, options) => {
+        try {
+          // Mirror Pi's public prompt branch after its awaited input hook.
+          await inputHook.promise;
+          if (harness.session.isStreaming) {
+            options.preflightResult(true);
+            return;
+          }
+          // Pi invokes this immediately before _runAgentPrompt(). The host
+          // fence must throw here so this post-abort branch never starts.
+          options.preflightResult(true);
+          startedTurns.push(text);
+        } catch (error) {
+          // Pi reports the caught callback failure, then rethrows it.
+          options.preflightResult(false);
+          throw error;
+        }
       }),
     });
+    const { authority, session, sendRecord } = harness;
 
-    const pending = authority.submit(makeRequest("pending-steer"));
+    const pending = authority.submit(
+      makeRequest("pending-steer", {
+        text: "must not restart",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
     await flush();
-    await expect(authority.requestEscape("esc-preflight")).resolves.toMatchObject({
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    const escaped = await authority.requestEscape("esc-preflight");
+    expect(escaped).toMatchObject({
       disposition: "abort_requested",
       target: "streaming",
+      restorationId: expect.any(String),
     });
     expect(session.abort).toHaveBeenCalledTimes(1);
     expect(session.clearQueue).toHaveBeenCalledTimes(1);
+    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(
+      session.clearQueue.mock.invocationCallOrder[0],
+    );
+    expect(sendRecord).toHaveBeenCalledWith({
+      type: "queue_restoration",
+      restorationId: escaped.restorationId,
+      steering: ["must not restart"],
+      followUp: [],
+      originalAttachments: [{ intentId: "pending-steer", images: [image] }],
+      clearedIntentIds: ["pending-steer"],
+      certainty: "unknown",
+    });
+    await expect(pending).resolves.toMatchObject({
+      intentId: "pending-steer",
+      disposition: "outcome_unknown",
+    });
+    expect(authority.snapshot().hostFacts.submitting).toBe(true);
 
-    reportPreflight(true);
-    await expect(pending).resolves.toMatchObject({ disposition: "consumed" });
-    promptDone.resolve();
+    inputHook.resolve();
+    await flush();
+
+    expect(startedTurns).toEqual([]);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(authority.snapshot().hostFacts.submitting).toBe(false);
+    const terminalResults = sendRecord.mock.calls
+      .map(([record]) => record)
+      .filter(
+        (record) => record.type === "submission" && record.result.intentId === "pending-steer",
+      );
+    expect(terminalResults).toEqual([
+      expect.objectContaining({
+        result: expect.objectContaining({ disposition: "outcome_unknown" }),
+      }),
+    ]);
+  });
+
+  it("classifies an idle admission queued after an input hook starts a turn", async () => {
+    const inputHook = deferred();
+    const image = { data: "dynamic-image", mimeType: "image/png" };
+    let steering = [];
+    const harness = setup({
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({ type: "queue_update", steering: [], followUp: [] });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (text, options) => {
+        // An input hook can use Pi's public sendMessage({ triggerTurn: true })
+        // while prompt() is awaiting the hook, changing the branch Pi takes.
+        harness.session.isStreaming = true;
+        harness.session.isIdle = false;
+        await inputHook.promise;
+        steering.push(text);
+        harness.authority.observeEvent(
+          { type: "queue_update", steering: [...steering], followUp: [] },
+          "idle-to-streaming",
+        );
+        // The prior turn can settle after Pi's synchronous queue_update but
+        // before the immediately following preflight callback.
+        harness.session.isStreaming = false;
+        harness.session.isIdle = true;
+        options.preflightResult(true);
+      }),
+    });
+    const { authority, sendRecord } = harness;
+
+    const pending = authority.submit(
+      makeRequest("idle-to-streaming", {
+        text: "queued after hook",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
+    await flush();
+    inputHook.resolve();
+
+    await expect(pending).resolves.toMatchObject({ disposition: "consumed", queued: true });
+    await flush();
+    authority.observeEvent({
+      type: "message_start",
+      message: { role: "user", content: "unrelated direct echo" },
+    });
+    expect(sendRecord).toHaveBeenCalledWith({
+      type: "event",
+      event: {
+        type: "message_start",
+        message: { role: "user", content: "unrelated direct echo" },
+      },
+    });
+    harness.session.isStreaming = true;
+    harness.session.isIdle = false;
+    await authority.requestEscape("esc-dynamic-queue");
+
+    expect(sendRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queue_restoration",
+        steering: ["queued after hook"],
+        originalAttachments: [{ intentId: "idle-to-streaming", images: [image] }],
+        certainty: "not_processed",
+      }),
+    );
+  });
+
+  it("clears a cancelled prompt queued after an idle input hook starts a turn", async () => {
+    const inputHook = deferred();
+    const abortDone = deferred();
+    const image = { data: "dynamic-cancel-image", mimeType: "image/png" };
+    const startedTurns = [];
+    let steering = [];
+    const harness = setup({
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      abort: vi.fn(() => abortDone.promise),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({ type: "queue_update", steering: [], followUp: [] });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (text, options) => {
+        try {
+          // Abort has been signalled but can remain observably streaming while
+          // Pi waits for its active turn to settle.
+          harness.session.isStreaming = true;
+          harness.session.isIdle = false;
+          await inputHook.promise;
+          steering.push(text);
+          harness.authority.observeEvent(
+            { type: "queue_update", steering: [...steering], followUp: [] },
+            "idle-dynamic-cancel",
+          );
+          options.preflightResult(true);
+          startedTurns.push(text);
+        } catch (error) {
+          options.preflightResult(false);
+          throw error;
+        }
+      }),
+    });
+    const { authority, session, sendRecord } = harness;
+
+    const pending = authority.submit(
+      makeRequest("idle-dynamic-cancel", {
+        text: "must be cleared after hook",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
+    await flush();
+
+    await authority.requestEscape("esc-idle-dynamic");
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(session.clearQueue).toHaveBeenCalledTimes(1);
+
+    inputHook.resolve();
+    await expect(pending).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    await vi.waitFor(() => expect(session.clearQueue).toHaveBeenCalledTimes(2));
+
+    expect(steering).toEqual([]);
+    expect(startedTurns).toEqual([]);
+    expect(sendRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queue_restoration",
+        steering: ["must be cleared after hook"],
+        originalAttachments: [{ intentId: "idle-dynamic-cancel", images: [image] }],
+        certainty: "unknown",
+      }),
+    );
+    abortDone.resolve();
+  });
+
+  it("clears Pi's enqueue-before-preflight window without consuming later ingress", async () => {
+    const inputHook = deferred();
+    const image = { data: "late-image", mimeType: "image/png" };
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn(() => false),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({
+          type: "queue_update",
+          steering: [],
+          followUp: [],
+        });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (text, options) => {
+        try {
+          if (text === "late cancelled queue") await inputHook.promise;
+          // Faithfully model pinned Pi: _queueSteer appends and emits its
+          // synchronous queue_update before prompt() invokes preflightResult.
+          steering.push(text);
+          harness.authority.observeEvent(
+            {
+              type: "queue_update",
+              steering: [...steering],
+              followUp: [],
+            },
+            "late-queue",
+          );
+          await Promise.resolve();
+          options.preflightResult(true);
+        } catch (error) {
+          options.preflightResult(false);
+          throw error;
+        }
+      }),
+    });
+    const { authority, session, sendRecord } = harness;
+    const cancelled = authority.submit(
+      makeRequest("late-queue", {
+        text: "late cancelled queue",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
+    await flush();
+
+    const escaped = await authority.requestEscape("esc-late-queue");
+    expect(session.abort).toHaveBeenCalledTimes(1);
+    expect(session.clearQueue).toHaveBeenCalledTimes(1);
+    await expect(cancelled).resolves.toMatchObject({ disposition: "outcome_unknown" });
+
+    const later = authority.submit(
+      makeRequest("after-escape", {
+        text: "after escape",
+        requestedMode: "steer",
+      }),
+    );
+    await expect(later).resolves.toMatchObject({ disposition: "in_custody" });
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+
+    inputHook.resolve();
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(2));
+    await flush();
+
+    // The second clear removes the cancelled prompt from both Pi queue layers.
+    // The post-Escape prompt entered Pi only after that cleanup completed.
+    expect(session.clearQueue).toHaveBeenCalledTimes(2);
+    expect(steering).toEqual(["after escape"]);
+    expect(sendRecord).toHaveBeenCalledWith({
+      type: "queue_restoration",
+      restorationId: escaped.restorationId,
+      steering: ["late cancelled queue"],
+      followUp: [],
+      originalAttachments: [{ intentId: "late-queue", images: [image] }],
+      clearedIntentIds: ["late-queue"],
+      certainty: "unknown",
+    });
+    expect(
+      sendRecord.mock.calls
+        .map(([record]) => record)
+        .filter((record) => record.type === "queue_restoration"),
+    ).toHaveLength(1);
+  });
+
+  it("restores handled-input same-lane work instead of treating it as the cancelled append", async () => {
+    const inputHook = deferred();
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({
+          type: "queue_update",
+          steering: [],
+          followUp: [],
+        });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (_text, options) => {
+        try {
+          await inputHook.promise;
+          // A handled input hook may enqueue its own work and then return
+          // success without Pi automatically appending the submitted prompt.
+          steering.push("extension-owned same lane");
+          harness.authority.observeEvent(
+            {
+              type: "queue_update",
+              steering: [...steering],
+              followUp: [],
+            },
+            "handled-cancelled",
+          );
+          options.preflightResult(true);
+        } catch (error) {
+          options.preflightResult(false);
+          throw error;
+        }
+      }),
+    });
+    const { authority, session, sendRecord } = harness;
+    const cancelled = authority.submit(
+      makeRequest("handled-cancelled", {
+        text: "handled submission",
+        requestedMode: "steer",
+      }),
+    );
+    await flush();
+
+    await authority.requestEscape("esc-handled");
+    await expect(cancelled).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    inputHook.resolve();
+    await vi.waitFor(() => expect(session.clearQueue).toHaveBeenCalledTimes(2));
+
+    expect(steering).toEqual([]);
+    expect(
+      sendRecord.mock.calls
+        .map(([record]) => record)
+        .filter((record) => record.type === "queue_restoration"),
+    ).toEqual([
+      expect.objectContaining({
+        steering: ["handled submission"],
+        clearedIntentIds: ["handled-cancelled"],
+        certainty: "unknown",
+      }),
+      expect.objectContaining({
+        steering: ["extension-owned same lane"],
+        clearedIntentIds: [],
+        certainty: "not_processed",
+      }),
+    ]);
+  });
+
+  it("removes the attributed cancelled slot when unrelated work appends after it", async () => {
+    const inputHook = deferred();
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn(() => false),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({
+          type: "queue_update",
+          steering: [],
+          followUp: [],
+        });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (text, options) => {
+        try {
+          await inputHook.promise;
+          steering.push(text);
+          harness.authority.observeEvent(
+            {
+              type: "queue_update",
+              steering: [...steering],
+              followUp: [],
+            },
+            "cancelled-before-unrelated",
+          );
+          // _queueSteer emits before awaiting agent.steer(). Unrelated work can
+          // append during that await, so the cancelled slot need not be newest.
+          await Promise.resolve();
+          steering.push("unrelated after cancelled");
+          harness.authority.observeEvent(
+            {
+              type: "queue_update",
+              steering: [...steering],
+              followUp: [],
+            },
+            "cancelled-before-unrelated",
+          );
+          options.preflightResult(true);
+        } catch (error) {
+          options.preflightResult(false);
+          throw error;
+        }
+      }),
+    });
+    const { authority, session, sendRecord } = harness;
+    const cancelled = authority.submit(
+      makeRequest("cancelled-before-unrelated", {
+        text: "cancelled first",
+        requestedMode: "steer",
+      }),
+    );
+    await flush();
+
+    await authority.requestEscape("esc-before-unrelated");
+    await expect(cancelled).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    inputHook.resolve();
+    await vi.waitFor(() => expect(session.clearQueue).toHaveBeenCalledTimes(2));
+
+    expect(steering).toEqual([]);
+    expect(
+      sendRecord.mock.calls
+        .map(([record]) => record)
+        .filter((record) => record.type === "queue_restoration"),
+    ).toEqual([
+      expect.objectContaining({
+        steering: ["cancelled first"],
+        clearedIntentIds: ["cancelled-before-unrelated"],
+        certainty: "unknown",
+      }),
+      expect.objectContaining({
+        steering: ["unrelated after cancelled"],
+        clearedIntentIds: [],
+        certainty: "not_processed",
+      }),
+    ]);
+  });
+
+  it("does not duplicate an attributed cancelled slot cleared by the immediate Escape", async () => {
+    const queueAppend = deferred();
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn(() => false),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({
+          type: "queue_update",
+          steering: [],
+          followUp: [],
+        });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (text, options) => {
+        try {
+          steering.push(text);
+          harness.authority.observeEvent(
+            {
+              type: "queue_update",
+              steering: [...steering],
+              followUp: [],
+            },
+            "already-appended",
+          );
+          await queueAppend.promise;
+          options.preflightResult(true);
+        } catch (error) {
+          options.preflightResult(false);
+          throw error;
+        }
+      }),
+    });
+    const { authority, sendRecord } = harness;
+    const cancelled = authority.submit(
+      makeRequest("already-appended", {
+        text: "already appended",
+        requestedMode: "steer",
+      }),
+    );
+    await vi.waitFor(() => expect(steering).toEqual(["already appended"]));
+
+    const escaped = await authority.requestEscape("esc-already-appended");
+    await expect(cancelled).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    expect(
+      sendRecord.mock.calls
+        .map(([record]) => record)
+        .filter((record) => record.type === "queue_restoration"),
+    ).toEqual([
+      expect.objectContaining({
+        restorationId: escaped.restorationId,
+        steering: ["already appended"],
+        clearedIntentIds: ["already-appended"],
+        certainty: "unknown",
+      }),
+    ]);
+
+    queueAppend.resolve();
+    await flush();
+  });
+
+  it("keeps a permanent admission fence when late queue cleanup fails", async () => {
+    const inputHook = deferred();
+    const onAdmissionStuck = vi.fn();
+    let steering = [];
+    let clearCount = 0;
+    const harness = setup(
+      {
+        isStreaming: true,
+        isIdle: false,
+        extensionRunner: {
+          getCommand: vi.fn(() => undefined),
+          hasHandlers: vi.fn(() => false),
+        },
+        getSteeringMessages: vi.fn(() => steering),
+        clearQueue: vi.fn(() => {
+          clearCount++;
+          if (clearCount === 2) throw new Error("late clear failed");
+          const cleared = [...steering];
+          steering = [];
+          harness.authority.observeEvent({
+            type: "queue_update",
+            steering: [],
+            followUp: [],
+          });
+          return { steering: cleared, followUp: [] };
+        }),
+        prompt: vi.fn(async (text, options) => {
+          try {
+            await inputHook.promise;
+            steering.push(text);
+            harness.authority.observeEvent(
+              {
+                type: "queue_update",
+                steering: [...steering],
+                followUp: [],
+              },
+              "unsafe-cancelled",
+            );
+            options.preflightResult(true);
+          } catch (error) {
+            options.preflightResult(false);
+            throw error;
+          }
+        }),
+      },
+      { onAdmissionStuck },
+    );
+    const { authority, session, sendRecord } = harness;
+    const cancelled = authority.submit(
+      makeRequest("unsafe-cancelled", {
+        text: "unsafe cancelled",
+        requestedMode: "steer",
+      }),
+    );
+    await flush();
+    await authority.requestEscape("esc-cleanup-failure");
+    await expect(cancelled).resolves.toMatchObject({ disposition: "outcome_unknown" });
+
+    await expect(
+      authority.submit(
+        makeRequest("must-remain-custody", {
+          text: "must remain custody",
+          requestedMode: "steer",
+        }),
+      ),
+    ).resolves.toMatchObject({ disposition: "in_custody" });
+
+    const schedulerGate = deferred();
+    const blockerExecute = vi.fn(() => schedulerGate.promise);
+    const unsafeExecute = vi.fn(() => ({ applied: true }));
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "scheduler-blocker",
+          expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+          intent: { kind: "runBash", command: "pwd" },
+        },
+        blockerExecute,
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() => expect(blockerExecute).toHaveBeenCalledTimes(1));
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "unsafe-queued-mutation",
+          expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+          intent: { kind: "setModel", provider: "anthropic", modelId: "other" },
+        },
+        unsafeExecute,
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+
+    inputHook.resolve();
+    await vi.waitFor(() => expect(onAdmissionStuck).toHaveBeenCalledTimes(1));
+    schedulerGate.resolve({ output: "", exitCode: 0 });
+    await vi.waitFor(() =>
+      expect(sendRecord).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "intent_outcome",
+          outcome: expect.objectContaining({
+            intentId: "unsafe-queued-mutation",
+            state: "outcome_unknown",
+          }),
+        }),
+      ),
+    );
+    await flush();
+
+    expect(session.clearQueue).toHaveBeenCalledTimes(2);
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    expect(unsafeExecute).not.toHaveBeenCalled();
+    expect(steering).toEqual(["unsafe cancelled"]);
+    expect(authority.snapshot().hostFacts.submitting).toBe(true);
+    expect(authority.hasActiveWork).toBe(true);
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "unsafe-new-mutation",
+          expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+          intent: { kind: "setModel", provider: "anthropic", modelId: "newer" },
+        },
+        unsafeExecute,
+      ),
+    ).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "unsafe-new-mutation",
+      reason: "closing",
+    });
+  });
+
+  it("publishes one independently reconcilable restoration per cancelled admission", async () => {
+    vi.useFakeTimers();
+    const firstPrompt = deferred();
+    const secondPrompt = deferred();
+    const firstImage = { data: "first-image", mimeType: "image/png" };
+    const secondImage = { data: "second-image", mimeType: "image/png" };
+    const { authority, session, sendRecord } = setup({
+      isStreaming: true,
+      isIdle: false,
+      prompt: vi.fn((text) =>
+        text === "first pending" ? firstPrompt.promise : secondPrompt.promise,
+      ),
+    });
+
+    const first = authority.submit(
+      makeRequest("first-pending", {
+        text: "first pending",
+        requestedMode: "steer",
+        images: [firstImage],
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(first).resolves.toMatchObject({ disposition: "admitting" });
+
+    const second = authority.submit(
+      makeRequest("second-pending", {
+        text: "second pending",
+        requestedMode: "followUp",
+        images: [secondImage],
+      }),
+    );
+    await flush();
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+
+    const escaped = await authority.requestEscape("esc-two-admissions");
+    await expect(second).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    const restorationRecords = sendRecord.mock.calls
+      .map(([record]) => record)
+      .filter((record) => record.type === "queue_restoration");
+
+    expect(restorationRecords).toEqual([
+      {
+        type: "queue_restoration",
+        restorationId: escaped.restorationId,
+        steering: ["first pending"],
+        followUp: [],
+        originalAttachments: [{ intentId: "first-pending", images: [firstImage] }],
+        clearedIntentIds: ["first-pending"],
+        certainty: "unknown",
+      },
+      {
+        type: "queue_restoration",
+        restorationId: expect.any(String),
+        steering: [],
+        followUp: ["second pending"],
+        originalAttachments: [{ intentId: "second-pending", images: [secondImage] }],
+        clearedIntentIds: ["second-pending"],
+        certainty: "unknown",
+      },
+    ]);
+    expect(restorationRecords[1].restorationId).not.toBe(escaped.restorationId);
+
+    firstPrompt.resolve();
+    secondPrompt.resolve();
+    await flush();
+  });
+
+  it("does not duplicate another cancelled admission cleared by the first late callback", async () => {
+    vi.useFakeTimers();
+    const resume = deferred();
+    const firstAppended = deferred();
+    const secondAppended = deferred();
+    const releaseSecondCallback = deferred();
+    const firstImage = { data: "first-late-image", mimeType: "image/png" };
+    const secondImage = { data: "second-late-image", mimeType: "image/png" };
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn(() => false),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        harness.authority.observeEvent({
+          type: "queue_update",
+          steering: [],
+          followUp: [],
+        });
+        return { steering: cleared, followUp: [] };
+      }),
+      prompt: vi.fn(async (text, options) => {
+        try {
+          await resume.promise;
+          if (text === "first late") {
+            steering.push(text);
+            harness.authority.observeEvent(
+              {
+                type: "queue_update",
+                steering: [...steering],
+                followUp: [],
+              },
+              "first-late",
+            );
+            firstAppended.resolve();
+            await secondAppended.promise;
+          } else {
+            await firstAppended.promise;
+            steering.push(text);
+            harness.authority.observeEvent(
+              {
+                type: "queue_update",
+                steering: [...steering],
+                followUp: [],
+              },
+              "second-late",
+            );
+            secondAppended.resolve();
+            await releaseSecondCallback.promise;
+          }
+          options.preflightResult(true);
+        } catch (error) {
+          options.preflightResult(false);
+          throw error;
+        }
+      }),
+    });
+    const { authority, session, sendRecord } = harness;
+    const first = authority.submit(
+      makeRequest("first-late", {
+        text: "first late",
+        requestedMode: "steer",
+        images: [firstImage],
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(first).resolves.toMatchObject({ disposition: "admitting" });
+    const second = authority.submit(
+      makeRequest("second-late", {
+        text: "second late",
+        requestedMode: "steer",
+        images: [secondImage],
+      }),
+    );
+    await flush();
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+
+    await authority.requestEscape("esc-two-late");
+    await expect(second).resolves.toMatchObject({ disposition: "outcome_unknown" });
+    resume.resolve();
+    await firstAppended.promise;
+    await secondAppended.promise;
+    await flush();
+    expect(session.clearQueue).toHaveBeenCalledTimes(2);
+
+    releaseSecondCallback.resolve();
+    await flush();
+    const restorationRecords = sendRecord.mock.calls
+      .map(([record]) => record)
+      .filter((record) => record.type === "queue_restoration");
+    expect(restorationRecords).toEqual([
+      expect.objectContaining({
+        steering: ["first late"],
+        originalAttachments: [{ intentId: "first-late", images: [firstImage] }],
+        clearedIntentIds: ["first-late"],
+        certainty: "unknown",
+      }),
+      expect.objectContaining({
+        steering: ["second late"],
+        originalAttachments: [{ intentId: "second-late", images: [secondImage] }],
+        clearedIntentIds: ["second-late"],
+        certainty: "unknown",
+      }),
+    ]);
   });
 
   it("drains compaction custody FIFO before a later normal submit and retains a failed suffix", async () => {
@@ -1137,16 +2263,24 @@ describe("state authority", () => {
   });
 
   it("retires a consumed extension failure from custody instead of executing it twice", async () => {
-    const { authority, session, sendRecord } = setup({
-      extensionRunner: { getCommand: vi.fn(() => ({ name: "side-effect" })) },
-      prompt: vi.fn((_text, options) => {
-        options.preflightResult(true);
-        return Promise.reject(new Error("extension failed after invocation"));
-      }),
-    });
+    const { authority, session, sendRecord } = setup(
+      {
+        extensionRunner: { getCommand: vi.fn(() => ({ name: "side-effect" })) },
+        prompt: vi.fn((_text, options) => {
+          options.preflightResult(true);
+          return Promise.reject(new Error("extension failed after invocation"));
+        }),
+      },
+      { getEditor: () => ({ revision: 1, text: "/side-effect", attachments: [] }) },
+    );
     authority.observeEvent({ type: "compaction_start" });
     await expect(
-      authority.submit(makeRequest("extension-custody", { text: "/side-effect" })),
+      authority.submit(
+        makeRequest("extension-custody", {
+          text: "/side-effect",
+          inputKind: "slash_command",
+        }),
+      ),
     ).resolves.toMatchObject({ disposition: "in_custody" });
 
     authority.observeEvent({ type: "compaction_end" });
@@ -1279,7 +2413,7 @@ describe("state authority", () => {
         return { steering: cleared, followUp: [] };
       }),
       prompt: vi.fn((_text, options) => {
-        steering = ["transformed queued"];
+        steering = ["original"];
         options.preflightResult(true);
         return promptDone.promise;
       }),
@@ -1395,6 +2529,144 @@ describe("state authority", () => {
     expect(session.abortBash).toHaveBeenCalledTimes(1);
   });
 
+  it("signals streaming abort before reporting a queue cleanup failure", async () => {
+    const { authority, session, sendRecord } = setup({
+      isStreaming: true,
+      isIdle: false,
+      clearQueue: vi.fn(() => {
+        throw new Error("queue cleanup exploded");
+      }),
+    });
+
+    await expect(authority.requestEscape("cleanup-failure")).resolves.toMatchObject({
+      requestId: "cleanup-failure",
+      disposition: "failed",
+      target: "streaming",
+      message:
+        "Abort was requested, but queued prompt cleanup/restoration failed: queue cleanup exploded",
+    });
+
+    expect(session.abort).toHaveBeenCalledOnce();
+    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(
+      session.clearQueue.mock.invocationCallOrder[0],
+    );
+    expect(sendRecord).toHaveBeenCalledWith({
+      type: "escape",
+      result: expect.objectContaining({
+        requestId: "cleanup-failure",
+        disposition: "failed",
+        target: "streaming",
+      }),
+    });
+  });
+
+  it("retains queued image custody when clearQueue throws before changing the queue", async () => {
+    let steering = [];
+    const image = { data: "image-bytes", mimeType: "image/png" };
+    const { authority, session, sendRecord } = setup({
+      isStreaming: true,
+      isIdle: false,
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((text, options) => {
+        steering = [text];
+        options.preflightResult(true);
+        return Promise.resolve();
+      }),
+      clearQueue: vi
+        .fn()
+        .mockImplementationOnce(() => {
+          throw new Error("queue cleanup exploded");
+        })
+        .mockImplementationOnce(() => {
+          const cleared = [...steering];
+          steering = [];
+          return { steering: cleared, followUp: [] };
+        }),
+    });
+    await authority.submit(
+      makeRequest("cleanup-image", {
+        text: "queued with image",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
+    await flush();
+
+    await expect(authority.requestEscape("cleanup-failure")).resolves.toMatchObject({
+      disposition: "failed",
+      target: "streaming",
+    });
+    expect(
+      sendRecord.mock.calls
+        .map(([record]) => record)
+        .filter((record) => record.type === "queue_restoration"),
+    ).toEqual([]);
+
+    const recovered = await authority.requestEscape("cleanup-retry");
+    expect(recovered).toMatchObject({
+      disposition: "abort_requested",
+      target: "streaming",
+      restorationId: expect.any(String),
+    });
+    expect(sendRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queue_restoration",
+        restorationId: recovered.restorationId,
+        steering: ["queued with image"],
+        originalAttachments: [{ intentId: "cleanup-image", images: [image] }],
+      }),
+    );
+    expect(session.abort.mock.invocationCallOrder[0]).toBeLessThan(
+      session.clearQueue.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("publishes unknown image custody when clearQueue empties the queue and then throws", async () => {
+    let steering = [];
+    const image = { data: "image-bytes", mimeType: "image/png" };
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((text, options) => {
+        steering = [text];
+        options.preflightResult(true);
+        return Promise.resolve();
+      }),
+      clearQueue: vi.fn(() => {
+        steering = [];
+        harness.authority.observeEvent({ type: "queue_update", steering: [], followUp: [] });
+        throw new Error("queue update listener exploded");
+      }),
+    });
+    const { authority } = harness;
+    await authority.submit(
+      makeRequest("cleanup-image-after-clear", {
+        text: "queued with image",
+        requestedMode: "steer",
+        images: [image],
+      }),
+    );
+    await flush();
+
+    const failed = await authority.requestEscape("cleanup-after-clear");
+    expect(failed).toMatchObject({
+      disposition: "failed",
+      target: "streaming",
+      restorationId: expect.any(String),
+    });
+    expect(harness.sendRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queue_restoration",
+        restorationId: failed.restorationId,
+        steering: ["queued with image"],
+        originalAttachments: [{ intentId: "cleanup-image-after-clear", images: [image] }],
+        clearedIntentIds: ["cleanup-image-after-clear"],
+        certainty: "unknown",
+      }),
+    );
+  });
+
   it("rejects an editor revision mismatch before prompt admission", async () => {
     const { authority, session, setEditor } = setup();
     setEditor({ revision: 2, text: "new draft" });
@@ -1481,6 +2753,59 @@ describe("state authority", () => {
 
     authority.commitTransition();
     expect(authority.transportSessionEpoch).toBe(1);
+  });
+
+  it("projects a real Pi runtime pin as its canonical source until a genuine successor", async () => {
+    const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+    const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "pivis-authority-pin-")));
+    try {
+      const source = path.join(root, "source.jsonl");
+      const alias = path.join(root, ".pivis-session-runtime-pin");
+      writeFileSync(source, "");
+      SessionManager.open(source, root, root).appendSessionInfo("source");
+      linkSync(source, alias);
+      const resumed = SessionManager.open(alias, root);
+      expect(resumed.getSessionFile()).toBe(alias);
+
+      const internalSession = makeSession({
+        sessionId: resumed.getSessionId(),
+        sessionFile: resumed.getSessionFile(),
+      });
+      const authority = createStateAuthority({
+        hostInstanceId: "host-pinned",
+        initialSession: internalSession,
+        initialPresentedSessionFile: source,
+      });
+
+      expect(authority.snapshot().sessionFile).toBe(source);
+      expect((await readyAttach(authority, 1)).transcript).toMatchObject({
+        persistedHistoryCursor: source,
+        overlapBoundary: `persisted:${source}`,
+      });
+
+      // Reload adopts the same AgentSession object and must retain the
+      // canonical presentation even though Pi still owns the alias internally.
+      authority.beginTransition(1);
+      authority.adoptSession(internalSession, 1);
+      expect(authority.commitTransition().sessionFile).toBe(source);
+
+      const successorPath = path.join(root, "successor.jsonl");
+      writeFileSync(successorPath, "");
+      const successorManager = SessionManager.open(successorPath, root, root);
+      const successor = makeSession({
+        sessionId: successorManager.getSessionId(),
+        sessionFile: successorManager.getSessionFile(),
+      });
+      authority.beginTransition(2);
+      authority.adoptSession(successor, 2);
+      expect(authority.commitTransition().sessionFile).toBe(successorPath);
+      expect((await readyAttach(authority, 2)).transcript).toMatchObject({
+        persistedHistoryCursor: successorPath,
+        overlapBoundary: `persisted:${successorPath}`,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps a predecessor terminal result out of the successor transition batch", async () => {
@@ -1579,7 +2904,26 @@ describe("state authority", () => {
     expect(AgentSessionSnapshotSchema.safeParse(response).success).toBe(true);
     expect(response).not.toHaveProperty("terminalSnapshot");
     expect(sendFrame).toHaveBeenCalledWith(
-      expect.objectContaining({ terminalSnapshot: expect.any(Object) }),
+      expect.objectContaining({
+        terminalSnapshot: expect.any(Object),
+        runtimeResumeState: {
+          model: { provider: "anthropic", modelId: "claude" },
+          thinkingLevel: "medium",
+        },
+      }),
+    );
+  });
+
+  it("represents an authoritative no-model selection explicitly in restart custody", async () => {
+    const sendFrame = vi.fn();
+    const { authority } = setup({ model: null, thinkingLevel: "off" }, { sendFrame });
+
+    await authority.requestFullSnapshot();
+
+    expect(sendFrame).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeResumeState: { model: null, thinkingLevel: "off" },
+      }),
     );
   });
 
@@ -1805,7 +3149,7 @@ describe("state authority", () => {
     });
   });
 
-  it("does not terminally report an admission timeout and records one later disposition", async () => {
+  it("settles an Escape-fenced timed-out admission once as recoverable unknown", async () => {
     vi.useFakeTimers();
     const pending = deferred();
     const onAdmissionStuck = vi.fn();
@@ -1818,9 +3162,20 @@ describe("state authority", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     await expect(result).resolves.toMatchObject({ disposition: "admitting" });
     expect(authority.snapshot().hostFacts.submitting).toBe(true);
-    await expect(authority.requestEscape("stuck-escape")).resolves.toMatchObject({
+    const escaped = await authority.requestEscape("stuck-escape");
+    expect(escaped).toMatchObject({
       disposition: "outcome_unknown",
+      restorationId: expect.any(String),
     });
+    expect(sendRecord).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queue_restoration",
+        restorationId: escaped.restorationId,
+        followUp: ["slow"],
+        clearedIntentIds: ["slow"],
+        certainty: "unknown",
+      }),
+    );
     await vi.advanceTimersByTimeAsync(60_000);
     expect(onAdmissionStuck).toHaveBeenCalledWith({ intentId: "slow", sessionEpoch: 0 });
 
@@ -1830,8 +3185,11 @@ describe("state authority", () => {
       .map(([record]) => record)
       .filter((record) => record.type === "submission" && record.result.intentId === "slow");
     expect(terminals).toEqual([
-      expect.objectContaining({ result: expect.objectContaining({ disposition: "completed" }) }),
+      expect.objectContaining({
+        result: expect.objectContaining({ disposition: "outcome_unknown" }),
+      }),
     ]);
+    expect(authority.snapshot().hostFacts.submitting).toBe(false);
   });
 
   it("observes an independent compaction from direct getter evidence", () => {
@@ -1986,6 +3344,26 @@ describe("state authority", () => {
     expect(authority.snapshot().recentIntentOutcomes).toContainEqual(
       expect.objectContaining({ intentId: "stable-id", disposition: "completed" }),
     );
+  });
+
+  it("rejects a duplicate submission that flips only its input classification", async () => {
+    const { authority, session } = setup();
+    const ordinary = makeRequest("classification-id", {
+      text: "/tmp/notes.txt\n\nExplain these notes",
+      inputKind: "ordinary",
+    });
+    await expect(authority.submit(ordinary)).resolves.toMatchObject({
+      disposition: "consumed",
+    });
+    await flush();
+
+    await expect(
+      authority.submit({ ...ordinary, inputKind: "slash_command" }),
+    ).resolves.toMatchObject({
+      disposition: "rejected",
+      message: "Intent ID was reused with a different payload",
+    });
+    expect(session.prompt).toHaveBeenCalledTimes(1);
   });
 
   it("records dispatch admission before Pi, retains outcomes, and separates receipt from settlement", async () => {
@@ -2222,7 +3600,10 @@ describe("state authority", () => {
           return Promise.reject(new Error("extension exploded"));
         }),
       },
-      { sendFrame },
+      {
+        sendFrame,
+        getEditor: () => ({ revision: 1, text: "/explode", attachments: [] }),
+      },
     );
     const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
     await authority.dispatchIntent(
@@ -2239,6 +3620,7 @@ describe("state authority", () => {
             expectedEpoch: 0,
             editorRevision: intent.editorRevision,
             text: intent.text,
+            inputKind: "slash_command",
             images: [],
             requestedMode: "followUp",
             surface: "composer",

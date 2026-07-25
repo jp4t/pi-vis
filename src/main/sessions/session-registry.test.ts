@@ -2,18 +2,66 @@ import fs from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { SessionId } from "@shared/ids.js";
 import type { PiRpcResponse } from "@shared/pi-protocol/responses.js";
-import type { AgentSessionSnapshot, IntentEnvelope } from "@shared/pi-protocol/runtime-state.js";
+import type {
+  AgentSessionSnapshot,
+  AuthorityFrame,
+  IntentEnvelope,
+  SessionRuntimeResumeState,
+} from "@shared/pi-protocol/runtime-state.js";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeHostProcess } from "../../../tests/fixtures/fake-host-process.mjs";
-import { HostRequestTimeoutError, __forkOverride } from "../pi/session-host.js";
+import {
+  HostRequestTimeoutError,
+  __forkOverride,
+  confinedSessionRuntimeStrategyForPlatform,
+} from "../pi/session-host.js";
 import { type SessionRecord, SessionRegistry } from "./session-registry.js";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const runtimeIdentity = (record: NonNullable<ReturnType<SessionRegistry["getSession"]>>) =>
   [record.proc!.hostInstanceId!, record.proc!.sessionEpoch] as const;
+
+function publishRuntimeResumeCheckpoint(
+  record: NonNullable<ReturnType<SessionRegistry["getSession"]>>,
+  state: SessionRuntimeResumeState,
+  transportSequence = 1,
+): void {
+  const owner = {
+    hostInstanceId: record.proc!.hostInstanceId!,
+    sessionEpoch: record.proc!.sessionEpoch,
+  };
+  record.proc!.emit("authorityFrame", {
+    owner,
+    transportSequence,
+    frameId: `resume-checkpoint-${transportSequence}`,
+    records: [],
+    // This registry test exercises opaque continuation custody. SessionHost
+    // schema validation and state-authority frame construction are covered in
+    // their focused suites.
+    terminalSnapshot: {} as AuthorityFrame["terminalSnapshot"],
+    runtimeResumeState: structuredClone(state),
+  });
+}
+
+function persistedSessionFixture(id: string): { root: string; sessionFile: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `pivis-${id}-`));
+  const sessionFile = path.join(root, "session.jsonl");
+  fs.writeFileSync(
+    sessionFile,
+    `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id,
+      timestamp: new Date().toISOString(),
+      cwd: root,
+    })}\n`,
+  );
+  return { root, sessionFile };
+}
 
 function harness(
   options: {
@@ -279,23 +327,48 @@ describe("SessionRegistry direct AgentSession authority", () => {
     const file = path.join(root, "session.jsonl");
     fs.writeFileSync(file, '{"type":"session","id":"pinned"}\n');
     const descriptor = fs.openSync(file, "r");
-    const h = harness();
+    // The real child projects the canonical source supplied alongside its
+    // internal runtime pin. Model that explicit field here; the real Pi
+    // repeated-open behavior is covered at the state-authority boundary.
+    const h = harness({
+      configureFake: (fake) => {
+        Object.assign(fake.runtime, { sessionFile: file });
+      },
+    });
     try {
       const id = h.registry.openSession(root, file);
       expect(h.registry.adoptConfinedSessionDescriptor(id, file, descriptor, root)).toBe(true);
       await h.registry.activateSession(id, "/tmp/pi", {});
 
       const hostDescriptor = (h.spawnStdios[0] as Array<string | number> | undefined)?.[4];
-      expect(hostDescriptor).toEqual(expect.any(Number));
-      expect(hostDescriptor).not.toBe(descriptor);
-      expect(h.fakes[0]?.sent[0]).toMatchObject({
-        type: "init",
-        sessionFile: process.platform === "linux" ? "/proc/self/fd/4" : "/dev/fd/4",
-      });
+      const init = h.fakes[0]?.sent[0] as
+        | { type?: string; sessionFile?: string; canonicalSessionFile?: string }
+        | undefined;
+      const strategy = confinedSessionRuntimeStrategyForPlatform(process.platform);
+      let runtimeAlias: string | undefined;
+      if (strategy === "inherited-descriptor") {
+        expect(hostDescriptor).toEqual(expect.any(Number));
+        expect(hostDescriptor).not.toBe(descriptor);
+        expect(init).toMatchObject({
+          type: "init",
+          sessionFile: "/proc/self/fd/4",
+          canonicalSessionFile: file,
+        });
+      } else {
+        expect(hostDescriptor).toBeUndefined();
+        expect(h.spawnStdios[0]).toEqual(["pipe", "pipe", "pipe", "ipc"]);
+        expect(init).toMatchObject({ type: "init", canonicalSessionFile: file });
+        runtimeAlias = init?.sessionFile;
+        expect(runtimeAlias?.startsWith(path.join(root, ".pivis-session-"))).toBe(true);
+        expect(fs.statSync(runtimeAlias!).ino).toBe(fs.statSync(file).ino);
+      }
       expect(h.registry.getSession(id)?.snapshot?.sessionFile).toBe(file);
       expect(() => fs.fstatSync(descriptor)).toThrow();
       await h.registry.closeSessionGracefully(id);
-      expect(() => fs.fstatSync(hostDescriptor as number)).toThrow();
+      if (typeof hostDescriptor === "number") {
+        expect(() => fs.fstatSync(hostDescriptor)).toThrow();
+      }
+      if (runtimeAlias) expect(fs.existsSync(runtimeAlias)).toBe(false);
     } finally {
       h.registry.stopAll();
       fs.rmSync(root, { recursive: true, force: true });
@@ -741,10 +814,14 @@ describe("SessionRegistry direct AgentSession authority", () => {
     const nextFile = path.join(dir, "next.jsonl");
     await Promise.all([writeFile(oldFile, ""), writeFile(nextFile, "")]);
     const h = harness();
-    const id = h.registry.openSession(dir, oldFile);
+    const descriptor = fs.openSync(oldFile, "r");
+    const id = h.registry.openSession(dir, oldFile, undefined, descriptor, dir);
     try {
       await h.registry.activateSession(id, "/tmp/pi", {});
       const fake = h.fakes[0]!;
+      const initialRuntimePath = (
+        fake.sent[0] as { type?: string; sessionFile?: string } | undefined
+      )?.sessionFile;
       fake.emitControl({
         type: "transition_started",
         transitionId: "different-file-new",
@@ -805,6 +882,11 @@ describe("SessionRegistry direct AgentSession authority", () => {
         }),
       );
       expect(h.registry.getSession(id)?._transitionLock).toBeUndefined();
+      expect(h.registry.getSession(id)?._confinedSessionDescriptor).toBeUndefined();
+      expect(h.registry.getSession(id)?._confinedSessionAlias).toBeUndefined();
+      if (initialRuntimePath?.endsWith(".runtime-pin")) {
+        expect(fs.existsSync(initialRuntimePath)).toBe(false);
+      }
       expect(h.fileChanges).toContainEqual([
         id,
         { hostInstanceId: fake.hostInstanceId, sessionEpoch: 1 },
@@ -1187,6 +1269,366 @@ describe("SessionRegistry direct AgentSession authority", () => {
       0,
     );
     h.registry.stopAll();
+  });
+
+  it("drops a crash-restored draft when the exact prompt persisted after dispatch", async () => {
+    const { root, sessionFile } = persistedSessionFixture("persisted-crash");
+    const h = harness();
+    try {
+      const id = h.registry.openSession(root, sessionFile);
+      await h.registry.activateSession(id, "/tmp/pi", {});
+      const record = h.registry.getSession(id)!;
+      const first = h.fakes[0]!;
+      const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+      const editorText = "persisted before the host stopped";
+      const dispatchedText = `/tmp/context.txt\n${editorText}`;
+      first.editor = {
+        revision: 2,
+        text: editorText,
+        attachments: [{ kind: "file", name: "context.txt", path: "/tmp/context.txt" }],
+      };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(2));
+
+      const pending = h.registry.dispatchIntent({
+        sessionId: id,
+        intentId: "persisted-before-crash",
+        rendererGeneration: record._rendererGeneration,
+        expectedOwner: { hostInstanceId, sessionEpoch },
+        intent: {
+          kind: "submit",
+          editorRevision: 2,
+          // File paths are prepended after the editor revision is captured.
+          // Recovery ownership therefore cannot be inferred from text equality.
+          text: dispatchedText,
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "followUp",
+          surface: "composer",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(h.fakes[0]!.sent.some((message) => message.type === "dispatch_intent")).toBe(true),
+      );
+      fs.appendFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          type: "message",
+          id: "persisted-user",
+          message: { role: "user", content: dispatchedText },
+        })}\n`,
+      );
+      first.emitExit(1);
+
+      await expect(pending).resolves.toMatchObject({ status: "delivery_unknown" });
+      await vi.waitFor(() =>
+        expect(h.restorations).toContainEqual([
+          id,
+          expect.objectContaining({
+            restorationId: `ambiguous-intent:${hostInstanceId}:${sessionEpoch}:persisted-before-crash`,
+            intentIds: ["persisted-before-crash"],
+            disposition: "dropped",
+          }),
+        ]),
+      );
+      await vi.waitFor(() => expect(h.fakes).toHaveLength(2));
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+      expect(h.fakes[1]!.sent.some((message) => message.type === "dispatch_intent")).toBe(false);
+      expect(h.fakes[1]!.sent.some((message) => message.type === "editor_patch")).toBe(false);
+      expect(h.registry.getSession(id)?.snapshot?.editor).toMatchObject({
+        text: "",
+        attachments: [],
+      });
+    } finally {
+      h.registry.stopAll();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles a first prompt persisted after Pi materializes its deferred session file", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pivis-deferred-first-prompt-"));
+    const sessionDir = path.join(root, "sessions");
+    const manager = SessionManager.create(root, sessionDir);
+    const sessionFile = manager.getSessionFile();
+    if (!sessionFile) throw new Error("Pi did not allocate a persisted session path");
+    expect(fs.existsSync(sessionFile)).toBe(false);
+
+    const h = harness();
+    try {
+      const id = h.registry.openSession(root, sessionFile);
+      await h.registry.activateSession(id, "/tmp/pi", {});
+      const record = h.registry.getSession(id)!;
+      const first = h.fakes[0]!;
+      const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+      const prompt = "first prompt persisted before the host stopped";
+      first.editor = { revision: 1, text: prompt, attachments: [] };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(1));
+
+      const pending = h.registry.dispatchIntent({
+        sessionId: id,
+        intentId: "deferred-first-prompt",
+        rendererGeneration: record._rendererGeneration,
+        expectedOwner: { hostInstanceId, sessionEpoch },
+        intent: {
+          kind: "submit",
+          editorRevision: 1,
+          text: prompt,
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "followUp",
+          surface: "composer",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(first.sent.some((message) => message.type === "dispatch_intent")).toBe(true),
+      );
+
+      manager.appendMessage({ role: "user", content: prompt, timestamp: Date.now() });
+      manager.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "persisted response" }],
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "test",
+        usage: {
+          input: 1,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      });
+      expect(fs.existsSync(sessionFile)).toBe(true);
+      first.emitExit(1);
+
+      await expect(pending).resolves.toMatchObject({ status: "delivery_unknown" });
+      await vi.waitFor(() =>
+        expect(h.restorations).toContainEqual([
+          id,
+          expect.objectContaining({
+            restorationId: `ambiguous-intent:${hostInstanceId}:${sessionEpoch}:deferred-first-prompt`,
+            intentIds: ["deferred-first-prompt"],
+            disposition: "dropped",
+          }),
+        ]),
+      );
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+      expect(h.fakes[1]!.sent.some((message) => message.type === "editor_patch")).toBe(false);
+    } finally {
+      h.registry.stopAll();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves newer editor work when an older same-session dispatch persisted", async () => {
+    const { root, sessionFile } = persistedSessionFixture("newer-editor-crash");
+    const h = harness();
+    try {
+      const id = h.registry.openSession(root, sessionFile);
+      await h.registry.activateSession(id, "/tmp/pi", {});
+      const record = h.registry.getSession(id)!;
+      const first = h.fakes[0]!;
+      const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+      const dispatchedText = "older prompt that persisted";
+      first.editor = { revision: 2, text: dispatchedText, attachments: [] };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(2));
+
+      const pending = h.registry.dispatchIntent({
+        sessionId: id,
+        intentId: "older-persisted-submit",
+        rendererGeneration: record._rendererGeneration,
+        expectedOwner: { hostInstanceId, sessionEpoch },
+        intent: {
+          kind: "submit",
+          editorRevision: 2,
+          text: dispatchedText,
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "followUp",
+          surface: "composer",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(first.sent.some((message) => message.type === "dispatch_intent")).toBe(true),
+      );
+      first.editor = {
+        revision: 3,
+        text: "newer unsent edit",
+        attachments: [{ kind: "file", name: "new.txt", path: "/tmp/new.txt" }],
+      };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(3));
+      fs.appendFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          type: "message",
+          id: "older-persisted-user",
+          message: { role: "user", content: dispatchedText },
+        })}\n`,
+      );
+      first.emitExit(1);
+
+      await expect(pending).resolves.toMatchObject({ status: "delivery_unknown" });
+      await vi.waitFor(() =>
+        expect(h.restorations).toContainEqual([
+          id,
+          expect.objectContaining({
+            restorationId: `ambiguous-intent:${hostInstanceId}:${sessionEpoch}:older-persisted-submit`,
+            disposition: "dropped",
+          }),
+        ]),
+      );
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+      expect(h.registry.getSession(id)?.snapshot?.editor).toMatchObject({
+        text: "newer unsent edit",
+        attachments: [expect.objectContaining({ name: "new.txt" })],
+      });
+    } finally {
+      h.registry.stopAll();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a same-revision editor when post-dispatch persistence is unproven", async () => {
+    const { root, sessionFile } = persistedSessionFixture("unknown-persistence-crash");
+    const h = harness();
+    try {
+      const id = h.registry.openSession(root, sessionFile);
+      await h.registry.activateSession(id, "/tmp/pi", {});
+      const record = h.registry.getSession(id)!;
+      const first = h.fakes[0]!;
+      const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+      const editorText = "restore this unproven draft";
+      const dispatchedText = `/tmp/evidence.txt\n${editorText}`;
+      first.editor = {
+        revision: 4,
+        text: editorText,
+        attachments: [{ kind: "file", name: "evidence.txt", path: "/tmp/evidence.txt" }],
+      };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(4));
+
+      const pending = h.registry.dispatchIntent({
+        sessionId: id,
+        intentId: "unproven-submit",
+        rendererGeneration: record._rendererGeneration,
+        expectedOwner: { hostInstanceId, sessionEpoch },
+        intent: {
+          kind: "submit",
+          editorRevision: 4,
+          text: dispatchedText,
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "followUp",
+          surface: "composer",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(first.sent.some((message) => message.type === "dispatch_intent")).toBe(true),
+      );
+      first.emitExit(1);
+
+      await expect(pending).resolves.toMatchObject({ status: "delivery_unknown" });
+      await vi.waitFor(() =>
+        expect(h.restorations).toContainEqual([
+          id,
+          expect.objectContaining({
+            restorationId: `ambiguous-intent:${hostInstanceId}:${sessionEpoch}:unproven-submit`,
+            disposition: "restore",
+          }),
+        ]),
+      );
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+      expect(h.registry.getSession(id)?.snapshot?.editor).toMatchObject({
+        text: editorText,
+        attachments: [expect.objectContaining({ name: "evidence.txt" })],
+      });
+    } finally {
+      h.registry.stopAll();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("promotes distinct conflict candidates when the delivered primary is suppressed", async () => {
+    const { root, sessionFile } = persistedSessionFixture("conflict-candidate-crash");
+    const h = harness();
+    try {
+      const id = h.registry.openSession(root, sessionFile);
+      await h.registry.activateSession(id, "/tmp/pi", {});
+      const record = h.registry.getSession(id)!;
+      const first = h.fakes[0]!;
+      const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+      const dispatchedText = "delivered primary";
+      first.editor = {
+        revision: 6,
+        text: dispatchedText,
+        attachments: [],
+        conflictText: "first surviving candidate",
+        conflictAttachments: [],
+        alternateConflictText: "second surviving candidate",
+        alternateConflictAttachments: [],
+        additionalConflictCandidates: [
+          { text: "third surviving candidate", attachments: [] },
+          {
+            text: "fourth surviving candidate",
+            attachments: [{ kind: "file", name: "fourth.txt", path: "/tmp/fourth.txt" }],
+          },
+        ],
+      };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(6));
+
+      const pending = h.registry.dispatchIntent({
+        sessionId: id,
+        intentId: "delivered-primary-with-conflicts",
+        rendererGeneration: record._rendererGeneration,
+        expectedOwner: { hostInstanceId, sessionEpoch },
+        intent: {
+          kind: "submit",
+          editorRevision: 6,
+          text: dispatchedText,
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "followUp",
+          surface: "composer",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(first.sent.some((message) => message.type === "dispatch_intent")).toBe(true),
+      );
+      fs.appendFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          type: "message",
+          id: "delivered-primary-user",
+          message: { role: "user", content: dispatchedText },
+        })}\n`,
+      );
+      first.emitExit(1);
+
+      await expect(pending).resolves.toMatchObject({ status: "delivery_unknown" });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+      expect(h.registry.getSession(id)?.snapshot?.editor).toMatchObject({
+        text: "first surviving candidate",
+        conflictText: "second surviving candidate",
+        alternateConflictText: "third surviving candidate",
+        additionalConflictCandidates: [
+          {
+            text: "fourth surviving candidate",
+            attachments: [expect.objectContaining({ name: "fourth.txt" })],
+          },
+        ],
+      });
+      expect(h.registry.getSession(id)?.snapshot?.editor.text).not.toBe(dispatchedText);
+    } finally {
+      h.registry.stopAll();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("re-emits a resolved detached restoration after renderer replacement until acknowledged", async () => {
@@ -1870,6 +2312,65 @@ describe("SessionRegistry direct AgentSession authority", () => {
     h.registry.stopAll();
   });
 
+  it("suppresses legacy submit editor recovery only after exact persistence proof", async () => {
+    const { root, sessionFile } = persistedSessionFixture("legacy-persisted-crash");
+    const h = harness();
+    try {
+      const id = h.registry.openSession(root, sessionFile);
+      await h.registry.activateSession(id, "/tmp/pi", {});
+      const record = h.registry.getSession(id)!;
+      const first = h.fakes[0]!;
+      const editorText = "legacy submitted editor";
+      const dispatchedText = `/tmp/legacy.txt\n${editorText}`;
+      first.editor = {
+        revision: 8,
+        text: editorText,
+        attachments: [{ kind: "file", name: "legacy.txt", path: "/tmp/legacy.txt" }],
+      };
+      first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.snapshot?.editor.revision).toBe(8));
+
+      await expect(
+        h.registry.submit(id, {
+          intentId: "legacy-persisted-submit",
+          expectedHostId: record.proc!.hostInstanceId!,
+          expectedEpoch: record.snapshot!.sessionEpoch,
+          editorRevision: 8,
+          text: dispatchedText,
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "followUp",
+          surface: "composer",
+        }),
+      ).resolves.toMatchObject({ disposition: "consumed" });
+      fs.appendFileSync(
+        sessionFile,
+        `${JSON.stringify({
+          type: "message",
+          id: "legacy-persisted-user",
+          message: { role: "user", content: dispatchedText },
+        })}\n`,
+      );
+      first.emitExit(1);
+
+      await vi.waitFor(() =>
+        expect(h.restorations).toContainEqual([
+          id,
+          expect.objectContaining({
+            restorationId: "ambiguous-submission:legacy-persisted-submit",
+            disposition: "dropped",
+          }),
+        ]),
+      );
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+      expect(h.fakes[1]!.sent.some((message) => message.type === "editor_patch")).toBe(false);
+      expect(h.registry.getSession(id)?.snapshot?.editor.text).toBe("");
+    } finally {
+      h.registry.stopAll();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores active-turn work that completed prompt admission but remained queued", async () => {
     const h = harness();
     const id = h.registry.openSession("/tmp/project");
@@ -2231,6 +2732,42 @@ describe("SessionRegistry direct AgentSession authority", () => {
     expect(h.panelEvents).toContainEqual([id, { type: "panel_clear_all" }]);
     await vi.waitFor(() => expect(h.fakes).toHaveLength(2));
     await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+    h.registry.stopAll();
+  });
+
+  it("restarts a session with its own last authoritative model and thinking selection", async () => {
+    const h = harness();
+    const firstId = h.registry.openSession("/tmp/project-a");
+    await h.registry.activateSession(firstId, "/tmp/pi", {});
+    const firstRecord = h.registry.getSession(firstId)!;
+    publishRuntimeResumeCheckpoint(firstRecord, {
+      model: { provider: "provider-a", modelId: "model-a" },
+      thinkingLevel: "high",
+    });
+
+    const secondId = h.registry.openSession("/tmp/project-b");
+    await h.registry.activateSession(secondId, "/tmp/pi", {});
+    const secondRecord = h.registry.getSession(secondId)!;
+    publishRuntimeResumeCheckpoint(secondRecord, {
+      model: { provider: "provider-b", modelId: "model-b" },
+      thinkingLevel: "minimal",
+    });
+
+    h.fakes[0]!.emitExit(1);
+
+    await vi.waitFor(() => expect(h.fakes).toHaveLength(3));
+    expect(h.fakes[2]!.sent[0]).toMatchObject({
+      type: "init",
+      runtimeResumeState: {
+        model: { provider: "provider-a", modelId: "model-a" },
+        thinkingLevel: "high",
+      },
+    });
+    expect(h.fakes[2]!.sent[0]).not.toMatchObject({
+      runtimeResumeState: {
+        model: { provider: "provider-b", modelId: "model-b" },
+      },
+    });
     h.registry.stopAll();
   });
 
@@ -2879,12 +3416,13 @@ describe("SessionRegistry direct AgentSession authority", () => {
       id: "unified-1",
       text: "rapid prompt",
       editorRevision: 8,
+      submissionIntentId: "unified-intent-1",
     });
     await tick();
     const submissionIntentId = (
       h.unifiedRequests[0] as [unknown, { submissionIntentId: string }] | undefined
     )?.[1].submissionIntentId;
-    expect(submissionIntentId).toEqual(expect.any(String));
+    expect(submissionIntentId).toBe("unified-intent-1");
     h.unifiedRequests.length = 0;
 
     await h.registry.rendererAttach(id, 1);

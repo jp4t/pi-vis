@@ -134,6 +134,7 @@ describe("Composer intent execution — prompts and effects", () => {
         kind: "submit",
         editorRevision: 2,
         text: "hello",
+        inputKind: "ordinary",
         images: [{ type: "image", data: "bytes", mimeType: "image/png" }],
         requestedMode: "steer",
         surface: "composer",

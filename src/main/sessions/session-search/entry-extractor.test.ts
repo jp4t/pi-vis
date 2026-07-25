@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createPinnedSessionHardLink,
@@ -65,18 +66,17 @@ describe("streamJsonlRows", () => {
     await expect(read()).rejects.toThrow(/escaped the sessions root/u);
   });
 
-  it.skipIf(process.platform === "win32")(
-    "gives the child a readable append-only file description",
+  it.skipIf(process.platform !== "linux")(
+    "gives a Linux child a readable append-only file description",
     () => {
       const file = tempFile('{"id":"header"}\n');
       const descriptor = openConfinedRegularFileForHost(file, path.dirname(file));
-      const childPath = process.platform === "linux" ? "/proc/self/fd/4" : "/dev/fd/4";
       try {
         const child = spawnSync(
           process.execPath,
           [
             "-e",
-            `const fs=require("node:fs"); const file=${JSON.stringify(childPath)}; process.stdout.write(fs.readFileSync(file, "utf8")); fs.appendFileSync(file, '{"id":"appended"}\\n');`,
+            `const fs=require("node:fs"); const file="/proc/self/fd/4"; process.stdout.write(fs.readFileSync(file, "utf8")); fs.appendFileSync(file, '{"id":"appended"}\\n');`,
           ],
           { stdio: ["ignore", "pipe", "pipe", "ignore", descriptor] },
         );
@@ -89,7 +89,7 @@ describe("streamJsonlRows", () => {
     },
   );
 
-  it("creates a Windows-compatible runtime path to the pinned inode", () => {
+  it("creates an identity-verified runtime path to the pinned inode", () => {
     const file = tempFile('{"id":"pinned"}\n');
     const descriptor = openConfinedRegularFile(file, path.dirname(file));
     let alias: string | undefined;
@@ -101,6 +101,37 @@ describe("streamJsonlRows", () => {
       fs.appendFileSync(alias, '{"id":"continued"}\n');
       expect(fs.readFileSync(alias, "utf8")).toContain('"continued"');
       expect(fs.readFileSync(file, "utf8")).toBe('{"id":"replacement"}\n');
+    } finally {
+      fs.closeSync(descriptor);
+      if (alias) fs.rmSync(alias, { force: true });
+    }
+  });
+
+  it("survives Pi SessionManager.open's repeated reads and appends to the pinned inode", () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pivis-search-runtime-pin-"));
+    tempDirectories.push(cwd);
+    const file = path.join(cwd, "session.jsonl");
+    fs.writeFileSync(
+      file,
+      `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "pinned-session",
+        timestamp: new Date().toISOString(),
+        cwd,
+      })}\n`,
+    );
+    const descriptor = openConfinedRegularFile(file, cwd);
+    let alias: string | undefined;
+    try {
+      alias = createPinnedSessionHardLink(file, descriptor);
+      const manager = SessionManager.open(alias);
+      expect(manager.getSessionId()).toBe("pinned-session");
+
+      manager.appendSessionInfo("resumed through runtime pin");
+
+      expect(fs.readFileSync(file, "utf8")).toContain("resumed through runtime pin");
+      expect(fs.statSync(alias).ino).toBe(fs.statSync(file).ino);
     } finally {
       fs.closeSync(descriptor);
       if (alias) fs.rmSync(alias, { force: true });
