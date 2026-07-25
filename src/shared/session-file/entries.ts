@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PiUsageSchema } from "../pi-protocol/usage.js";
 
 export const SessionHeaderSchema = z
   .object({
@@ -32,6 +33,7 @@ const MessageBodySchema = z
     toolCallId: z.string().optional(),
     toolName: z.string().optional(),
     isError: z.boolean().optional(),
+    usage: PiUsageSchema.optional(),
   })
   .passthrough();
 
@@ -59,6 +61,7 @@ export const CompactionEntrySchema = BaseEntrySchema.extend({
   estimatedTokensAfter: z.number().optional(),
   firstKeptEntryId: z.string().optional(),
   details: z.unknown().optional(),
+  usage: PiUsageSchema.optional(),
   fromHook: z.boolean().optional(),
 });
 
@@ -67,6 +70,7 @@ export const BranchSummaryEntrySchema = BaseEntrySchema.extend({
   summary: z.string().optional(),
   fromId: z.string().optional(),
   details: z.unknown().optional(),
+  usage: PiUsageSchema.optional(),
   fromHook: z.boolean().optional(),
 });
 

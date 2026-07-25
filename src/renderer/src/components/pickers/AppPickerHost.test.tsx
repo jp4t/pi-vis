@@ -272,3 +272,170 @@ describe("AppPickerHost trust selection", () => {
     view.unmount();
   });
 });
+
+describe("AppPickerHost scoped model selection", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+    useOverlayStore.setState({ claims: [], count: 0 });
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("shows an unavailable saved model and lets the user remove it", async () => {
+    installRuntime();
+    useSessionsStore.getState().openPicker(SESSION_ID, {
+      kind: "scoped-models",
+      models: [
+        { provider: "p", id: "m", name: "Model M" },
+        { provider: "q", id: "n", name: "Model N" },
+      ],
+      enabledIds: ["p/m", "gone/retired"],
+    });
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    const intents: IntentEnvelope[] = [];
+    Object.defineProperty(window, "pivis", {
+      configurable: true,
+      value: {
+        invoke: vi.fn(async (_channel: string, payload: unknown) => {
+          const envelope = payload as IntentEnvelope;
+          intents.push(envelope);
+          return { status: "admitted", intentId: envelope.intentId, owner: OWNER };
+        }),
+      },
+    });
+
+    const view = mount(<AppPickerHost sessionId={SESSION_ID} />);
+    const unavailable = [
+      ...view.container.querySelectorAll<HTMLButtonElement>(".picker__item"),
+    ].find((button) => button.textContent?.includes("gone/retired"));
+    expect(unavailable).toBeTruthy();
+    expect(unavailable?.textContent).toContain("Unavailable");
+
+    await act(async () => unavailable!.click());
+    const save = [...view.container.querySelectorAll<HTMLButtonElement>(".picker__btn")].find(
+      (button) => button.textContent === "Save to settings",
+    );
+    await act(async () => save!.click());
+    await settle();
+
+    expect(intents.map((envelope) => envelope.intent)).toEqual([
+      expect.objectContaining({
+        kind: "invokeCommand",
+        text: '/models save --json ["p/m"]',
+      }),
+    ]);
+    expect(useSessionsStore.getState().sessions.get(SESSION_ID)?.pendingPicker).toBeUndefined();
+    view.unmount();
+  });
+
+  it("preserves an unavailable saved model when saving without toggling", async () => {
+    installRuntime();
+    useSessionsStore.getState().openPicker(SESSION_ID, {
+      kind: "scoped-models",
+      models: [
+        { provider: "p", id: "m", name: "Model M" },
+        { provider: "q", id: "n", name: "Model N" },
+      ],
+      enabledIds: ["p/m", "gone/retired"],
+    });
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    const intents: IntentEnvelope[] = [];
+    Object.defineProperty(window, "pivis", {
+      configurable: true,
+      value: {
+        invoke: vi.fn(async (_channel: string, payload: unknown) => {
+          const envelope = payload as IntentEnvelope;
+          intents.push(envelope);
+          return { status: "admitted", intentId: envelope.intentId, owner: OWNER };
+        }),
+      },
+    });
+
+    const view = mount(<AppPickerHost sessionId={SESSION_ID} />);
+    const save = [...view.container.querySelectorAll<HTMLButtonElement>(".picker__btn")].find(
+      (button) => button.textContent === "Save to settings",
+    );
+    await act(async () => save!.click());
+    await settle();
+
+    expect(intents.map((envelope) => envelope.intent)).toEqual([
+      expect.objectContaining({
+        kind: "invokeCommand",
+        text: '/models save --json ["p/m","gone/retired"]',
+      }),
+    ]);
+    view.unmount();
+  });
+
+  it("encodes whitespace and commas in unavailable patterns without changing them", async () => {
+    installRuntime();
+    useSessionsStore.getState().openPicker(SESSION_ID, {
+      kind: "scoped-models",
+      models: [
+        { provider: "p", id: "m", name: "Model M" },
+        { provider: "q", id: "n", name: "Model N" },
+      ],
+      enabledIds: ["p/m", "Old Claude, Model"],
+    });
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        disconnect(): void {}
+      },
+    );
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: vi.fn(),
+    });
+    const intents: IntentEnvelope[] = [];
+    Object.defineProperty(window, "pivis", {
+      configurable: true,
+      value: {
+        invoke: vi.fn(async (_channel: string, payload: unknown) => {
+          const envelope = payload as IntentEnvelope;
+          intents.push(envelope);
+          return { status: "admitted", intentId: envelope.intentId, owner: OWNER };
+        }),
+      },
+    });
+
+    const view = mount(<AppPickerHost sessionId={SESSION_ID} />);
+    const save = [...view.container.querySelectorAll<HTMLButtonElement>(".picker__btn")].find(
+      (button) => button.textContent === "Save to settings",
+    );
+    await act(async () => save!.click());
+    await settle();
+
+    expect(intents.map((envelope) => envelope.intent)).toEqual([
+      expect.objectContaining({
+        kind: "invokeCommand",
+        text: '/models save --json ["p/m","Old Claude, Model"]',
+      }),
+    ]);
+    view.unmount();
+  });
+});

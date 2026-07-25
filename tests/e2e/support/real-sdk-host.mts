@@ -10,7 +10,7 @@ import type { ScriptedOpenAILatency } from "./scripted-openai-provider.mjs";
 const supportDir = dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = join(supportDir, "../../..");
 export const APP_ENTRY = join(PROJECT_ROOT, "out/main/index.js");
-export const PINNED_PI_VERSION = "0.80.10";
+export const PINNED_PI_VERSION = "0.82.1";
 /** Real-SDK journeys retain realistic, reproducible streaming cadence. */
 export const REAL_SDK_PROVIDER_LATENCY: ScriptedOpenAILatency = {
   firstByteMs: [10, 40],
@@ -57,6 +57,8 @@ export function pinnedPiBinary(): string {
 
 export interface RealSdkFixtureOptions {
   providerBaseUrl?: string;
+  /** Configure Pi's built-in llama.cpp provider through the production piEnv path. */
+  llamaServerBaseUrl?: string;
   extensionFiles?: string[];
   workspaceDir?: string;
   /** Per-Electron-process SessionHost fault plan; never inherited globally. */
@@ -196,6 +198,8 @@ function cleanEnvironment(
     "PIVIS_TEST_AUTHORITY_BUFFER_LIMIT",
     "PIVIS_TEST_IPC_INVOCATION_LOG",
     "PIVIS_TEST_REAL_HOST_CONTROL",
+    "LLAMA_BASE_URL",
+    "LLAMA_API_KEY",
   ]) {
     delete env[key];
   }
@@ -259,6 +263,9 @@ export function createRealSdkFixture(options: RealSdkFixtureOptions = {}): RealS
         display: { sizePx: 14 },
         code: { family: "IBM Plex Mono", sizePx: 14 },
       },
+      ...(options.llamaServerBaseUrl
+        ? { piEnv: { LLAMA_BASE_URL: options.llamaServerBaseUrl } }
+        : {}),
     }),
   );
 

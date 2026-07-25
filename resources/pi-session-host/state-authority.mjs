@@ -917,6 +917,9 @@ export function createStateAuthority({
       isBashRunning: s.isBashRunning,
       model: s.model ?? null,
       thinkingLevel: s.thinkingLevel,
+      ...(typeof s.getAvailableThinkingLevels === "function"
+        ? { availableThinkingLevels: s.getAvailableThinkingLevels() }
+        : {}),
       sessionId: s.sessionId,
       sessionFile: presentedSessionFile(),
       sessionName: s.sessionName,
@@ -1129,7 +1132,12 @@ export function createStateAuthority({
           ? {
               navigation: {
                 kind: "navigation",
-                state: navigation.phase === "cancelling" ? "cancelling" : "active",
+                state:
+                  navigation.phase === "cancelling"
+                    ? "cancelling"
+                    : navigation.phase === "retry_wait"
+                      ? "retry_wait"
+                      : "active",
                 ...(navigation.intentId ? { intentId: navigation.intentId } : {}),
                 ...(navigation.targetId ? { targetId: navigation.targetId } : {}),
                 startedAt: navigation.observedAt,
@@ -1181,6 +1189,9 @@ export function createStateAuthority({
       dispatchedIntentTruncated: dispatchedIntentBounds().truncated,
       model: value.model,
       thinkingLevel: value.thinkingLevel,
+      ...(Array.isArray(value.availableThinkingLevels)
+        ? { availableThinkingLevels: value.availableThinkingLevels }
+        : {}),
       sessionName: value.sessionName,
       catalog: value.catalog,
     };
@@ -2728,6 +2739,44 @@ export function createStateAuthority({
         { operationId: agentId, ...(event.errorMessage ? { detail: event.errorMessage } : {}) },
       );
       if (event.willRetry === true) observedOperation("retry", "retry_wait");
+    }
+    if (event?.type === "summarization_retry_scheduled") {
+      const kind = navigationDepth > 0 ? "navigation" : "compaction";
+      const operationId = activeOperationId(kind);
+      if (operationId) {
+        observedOperation(kind, "retry_wait", {
+          operationId,
+          detail: event.errorMessage,
+        });
+      }
+      if (kind === "compaction" && compactionBarrierOpen()) {
+        compaction = { ...compaction, phase: "retry_wait", anomaly: null };
+      }
+    } else if (event?.type === "summarization_retry_attempt_start") {
+      const kind = event.source === "branchSummary" ? "navigation" : "compaction";
+      const operationId = activeOperationId(kind);
+      if (operationId) observedOperation(kind, "active", { operationId });
+      if (kind === "compaction" && compactionBarrierOpen()) {
+        compaction = {
+          ...compaction,
+          phase: "active",
+          attempt: Math.max(1, compaction.attempt + 1),
+          anomaly: null,
+        };
+      }
+    } else if (event?.type === "summarization_retry_finished") {
+      // The source-less terminal retry event only closes the transient retry
+      // indicator. The surrounding compaction/navigation operation remains
+      // active until its own public lifecycle or invocation settles.
+      for (const kind of ["navigation", "compaction"]) {
+        const operation = activeOperation(kind);
+        if (operation?.phase === "retry_wait") {
+          observedOperation(kind, "active", { operationId: operation.operationId });
+        }
+      }
+      if (compaction.phase === "retry_wait") {
+        compaction = { ...compaction, phase: "active", anomaly: null };
+      }
     }
     if (event?.type === "compaction_start") {
       const retrying = compaction.phase === "retry_wait";

@@ -205,6 +205,7 @@ export const AgentSessionSnapshotSchema = z.object({
   isBashRunning: z.boolean(),
   model: RuntimeModelSchema.nullable(),
   thinkingLevel: ThinkingLevelSchema,
+  availableThinkingLevels: z.array(ThinkingLevelSchema).optional(),
   sessionId: z.string(),
   sessionFile: z.string().optional(),
   sessionName: z.string().optional(),
@@ -472,7 +473,7 @@ export type BashActivity = z.infer<typeof BashActivitySchema>;
 export const NavigationActivitySchema = z
   .object({
     kind: z.literal("navigation"),
-    state: z.enum(["active", "cancelling"]),
+    state: z.enum(["active", "cancelling", "retry_wait"]),
     intentId: NonEmptyIdSchema.optional(),
     targetId: NonEmptyIdSchema.optional(),
     startedAt: z.number().optional(),
@@ -1212,6 +1213,7 @@ export const SemanticSnapshotSchema = z
     dispatchedIntentTruncated: z.boolean().optional(),
     model: RuntimeModelSchema.nullable(),
     thinkingLevel: ThinkingLevelSchema,
+    availableThinkingLevels: z.array(ThinkingLevelSchema).optional(),
     sessionName: z.string().optional(),
     catalog: RuntimeCatalogSchema,
   })

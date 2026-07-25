@@ -1,13 +1,17 @@
 // @vitest-environment jsdom
 import type { SessionId } from "@shared/ids.js";
-import type { RendererPublication } from "@shared/pi-protocol/runtime-state.js";
+import type { IntentOutcome, RendererPublication } from "@shared/pi-protocol/runtime-state.js";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { act } from "react-dom/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useDiffStore } from "../../stores/diff-store.js";
 import { useSessionsStore } from "../../stores/sessions-store.js";
-import { ChangesButton, shouldRefreshSessionStats } from "./SessionHeader.js";
+import {
+  ChangesButton,
+  latestSummarizedNavigationKey,
+  shouldRefreshSessionStats,
+} from "./SessionHeader.js";
 
 const SID = "session-a" as SessionId;
 const WORKSPACE = "/tmp/ws";
@@ -17,6 +21,30 @@ describe("session stats refresh boundaries", () => {
     expect(shouldRefreshSessionStats([{ type: "compaction_end" }])).toBe(true);
     expect(shouldRefreshSessionStats([{ type: "agent_end" }])).toBe(true);
     expect(shouldRefreshSessionStats([{ type: "message_end" }])).toBe(false);
+  });
+
+  it("identifies the latest completed navigation that added a branch summary", () => {
+    const owner = {
+      hostInstanceId: "11111111-1111-4111-8111-111111111111",
+      sessionEpoch: 2,
+    };
+    const outcomes: IntentOutcome[] = [
+      {
+        intentId: "plain",
+        owner,
+        kind: "navigate",
+        state: "completed",
+        result: { targetId: "entry-1" },
+      },
+      {
+        intentId: "summarized",
+        owner,
+        kind: "navigate",
+        state: "completed",
+        result: { targetId: "entry-2", summarized: true },
+      },
+    ];
+    expect(latestSummarizedNavigationKey(outcomes)).toBe(`${owner.hostInstanceId}:2:summarized`);
   });
 });
 

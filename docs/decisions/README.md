@@ -39,3 +39,4 @@ Link new ADRs from the relevant `docs/architecture/*.md` file and from `docs/age
 - [0003: Authority frames and per-plane synchronization](0003-authority-frames-and-plane-synchronization.md) — deployed session-runtime, IPC, command, and authority-reducer architecture; amended by 0004 and 0005.
 - [0004: Silent reconciliation replaces user review](0004-silent-reconciliation-replaces-user-review.md) — conservative automatic draft recovery and silent tab disposal.
 - [0005: Retain presentation labels across authority fences](0005-retain-presentation-labels-across-authority-fences.md) — stale presentation remains visible while semantic controls are fenced.
+- [0006: Pinned llama.cpp private-extension exception](0006-pinned-llama-private-extension-exception.md) — one exact-version private registry lookup restores Pi's built-in llama.cpp manager while all runtime injection remains public.

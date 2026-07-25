@@ -83,6 +83,7 @@ export async function entriesToTranscript(
             firstKeptEntryId: entry.firstKeptEntryId,
             ...(entry.details !== undefined ? { details: entry.details } : {}),
             ...(entry.fromHook !== undefined ? { fromHook: entry.fromHook } : {}),
+            ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
           },
         });
         break;
@@ -98,6 +99,7 @@ export async function entriesToTranscript(
             ...(entry.fromId !== undefined ? { fromId: entry.fromId } : {}),
             ...(entry.details !== undefined ? { details: entry.details } : {}),
             ...(entry.fromHook !== undefined ? { fromHook: entry.fromHook } : {}),
+            ...(entry.usage !== undefined ? { usage: entry.usage } : {}),
           },
         });
         break;
@@ -121,6 +123,7 @@ export async function entriesToTranscript(
             if (result.hasContent) data["resultContent"] = result.content;
             data["resultDetails"] = result.details;
             data["resultMetadata"] = result.metadata;
+            data["usage"] = result.usage;
             data["diff"] = result.diff;
             data["patch"] = result.patch;
             data["isError"] = msg.isError ?? false;
@@ -139,6 +142,7 @@ export async function entriesToTranscript(
                 ...(result.hasContent ? { resultContent: result.content } : {}),
                 resultDetails: result.details,
                 resultMetadata: result.metadata,
+                usage: result.usage,
                 diff: result.diff,
                 patch: result.patch,
                 isError: msg.isError ?? false,

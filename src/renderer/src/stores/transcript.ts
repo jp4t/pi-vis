@@ -2,6 +2,7 @@ import type { TranscriptBlock } from "@shared/ipc-contract.js";
 import type { KnownPiEvent } from "@shared/pi-protocol/events.js";
 import { extractTextAndImages, extractToolResult } from "@shared/pi-protocol/tool-result.js";
 import { detectTurnError } from "@shared/pi-protocol/turn-error.js";
+import type { PiUsage } from "@shared/pi-protocol/usage.js";
 import { assertNever } from "@shared/result.js";
 
 // All TranscriptBlock data shapes
@@ -55,6 +56,7 @@ export interface ToolCallBlockData {
   patch?: string | undefined;
   resultDetails?: unknown;
   resultMetadata?: Record<string, unknown> | undefined;
+  usage?: PiUsage | undefined;
   isError: boolean;
   isStreaming: boolean;
   interrupted?: boolean | undefined;
@@ -84,6 +86,7 @@ export interface CompactionBlockData {
   errorMessage?: string | undefined;
   details?: unknown;
   fromHook?: boolean | undefined;
+  usage?: PiUsage | undefined;
 }
 
 export interface BranchSummaryBlockData {
@@ -91,6 +94,7 @@ export interface BranchSummaryBlockData {
   fromId?: string | undefined;
   details?: unknown;
   fromHook?: boolean | undefined;
+  usage?: PiUsage | undefined;
 }
 
 export interface CustomMessageBlockData {
@@ -201,6 +205,8 @@ export interface TranscriptState {
   activeAssistantId: string | null;
   activeToolCallIds: Map<string, string>; // toolCallId → blockId
   activeBashId: string | null;
+  /** Pi 0.82 direct-bash event ID owning activeBashId. */
+  activeBashExecutionId: string | null;
   /** Error block created by the current failed assistant turn, awaiting the
    * following agent_end to tell us whether it will be retried. This scopes
    * retryable marking to the current turn and prevents relabeling older final
@@ -229,6 +235,7 @@ export function createTranscriptState(): TranscriptState {
     activeAssistantId: null,
     activeToolCallIds: new Map(),
     activeBashId: null,
+    activeBashExecutionId: null,
     pendingRetryErrorBlockId: null,
     pendingEchoes: [],
     userMessageSequence: 0,
@@ -351,6 +358,7 @@ export function finalizeActiveBlocks(
     activeAssistantId: null,
     activeToolCallIds: new Map(),
     activeBashId: null,
+    activeBashExecutionId: null,
   };
 }
 
@@ -430,6 +438,7 @@ export function mapHistoryBlocks(history: TranscriptBlock[]): TypedTranscriptBlo
             patch: d.patch as string | undefined,
             resultDetails: d.resultDetails,
             resultMetadata: isUnknownRecord(d.resultMetadata) ? d.resultMetadata : undefined,
+            usage: d.usage as PiUsage | undefined,
             isError: (d.isError as boolean) ?? false,
             // History is an idle baseline, so a persisted streaming claim is
             // an interrupted operation rather than a live tool call.
@@ -473,6 +482,7 @@ export function mapHistoryBlocks(history: TranscriptBlock[]): TypedTranscriptBlo
             errorMessage: d.errorMessage as string | undefined,
             details: d.details,
             fromHook: d.fromHook as boolean | undefined,
+            usage: d.usage as PiUsage | undefined,
           },
         };
       }
@@ -485,6 +495,7 @@ export function mapHistoryBlocks(history: TranscriptBlock[]): TypedTranscriptBlo
             fromId: d.fromId as string | undefined,
             details: d.details,
             fromHook: d.fromHook as boolean | undefined,
+            usage: d.usage as PiUsage | undefined,
           },
         };
       }
@@ -547,6 +558,7 @@ export function seedFromHistory(
     activeAssistantId: null,
     activeToolCallIds: new Map(),
     activeBashId: null,
+    activeBashExecutionId: null,
     pendingRetryErrorBlockId: null,
     pendingEchoes: [],
     authoritativeUserEchoes: [],
@@ -695,6 +707,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
     activeAssistantId,
     activeToolCallIds,
     activeBashId,
+    activeBashExecutionId,
     pendingRetryErrorBlockId,
     pendingEchoes,
   } = state;
@@ -775,8 +788,110 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
     case "queue_update":
     case "auto_retry_start":
     case "auto_retry_end":
+    case "summarization_retry_scheduled":
+    case "summarization_retry_attempt_start":
+    case "summarization_retry_finished":
     case "extension_error":
       return state;
+
+    case "bash_execution_start": {
+      if (activeBashExecutionId === event.id) return state;
+      const started = addBashBlock(state, event.command);
+      const blockId = started.activeBashId;
+      return {
+        ...started,
+        activeBashExecutionId: event.id,
+        blocks: blockId
+          ? started.blocks.map((block) =>
+              block.id === blockId && block.type === "bash"
+                ? {
+                    ...block,
+                    data: {
+                      ...block.data,
+                      excludeFromContext: event.excludeFromContext,
+                    },
+                  }
+                : block,
+            )
+          : started.blocks,
+      };
+    }
+
+    case "bash_execution_update": {
+      if (
+        !activeBashId ||
+        (event.id !== undefined &&
+          activeBashExecutionId !== null &&
+          event.id !== activeBashExecutionId)
+      ) {
+        return state;
+      }
+      return {
+        ...state,
+        blocks: patchBlock(activeBashId, (block) =>
+          block.type === "bash"
+            ? {
+                ...block,
+                data: {
+                  ...block.data,
+                  outputText: block.data.outputText + event.delta,
+                },
+              }
+            : block,
+        ),
+      };
+    }
+
+    case "bash_execution_end": {
+      if (activeBashExecutionId !== event.id) return state;
+      const finalText = event.output || event.errorMessage || "";
+      if (!activeBashId) {
+        return {
+          ...state,
+          blocks: [
+            ...blocks,
+            {
+              id: newBlockId(),
+              type: "bash",
+              data: {
+                command: event.command,
+                outputText: finalText,
+                isStreaming: false,
+                exitCode: event.exitCode,
+                cancelled: event.cancelled,
+                truncated: event.truncated,
+                fullOutputPath: event.fullOutputPath,
+                excludeFromContext: event.excludeFromContext,
+              },
+            },
+          ],
+          activeBashExecutionId: null,
+        };
+      }
+      return {
+        ...state,
+        blocks: updateBlock(activeBashId, (block) =>
+          block.type === "bash"
+            ? {
+                ...block,
+                data: {
+                  ...block.data,
+                  command: event.command,
+                  outputText: finalText || block.data.outputText,
+                  isStreaming: false,
+                  exitCode: event.exitCode,
+                  cancelled: event.cancelled,
+                  truncated: event.truncated,
+                  fullOutputPath: event.fullOutputPath,
+                  excludeFromContext: event.excludeFromContext,
+                },
+              }
+            : block,
+        ),
+        activeBashId: null,
+        activeBashExecutionId: null,
+      };
+    }
 
     case "cache_miss_notice": {
       if (transcriptHasBlockId(state, event.noticeId)) return state;
@@ -981,6 +1096,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                         block.data.resultMetadata,
                         result.metadata,
                       ),
+                      usage: result.usage ?? block.data.usage,
                       isError:
                         typeof message.isError === "boolean" ? message.isError : block.data.isError,
                     },
@@ -1007,6 +1123,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                 patch: result.patch,
                 resultDetails: result.details,
                 resultMetadata: result.metadata,
+                usage: result.usage,
                 isError: message.isError === true,
                 isStreaming: false,
               },
@@ -1324,6 +1441,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                 partial.hasDetails,
               ),
               resultMetadata: mergeResultMetadata(b.data.resultMetadata, partial.metadata),
+              usage: partial.usage ?? b.data.usage,
             },
           };
         }),
@@ -1361,6 +1479,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                 result.hasDetails,
               ),
               resultMetadata: mergeResultMetadata(b.data.resultMetadata, result.metadata),
+              usage: result.usage ?? b.data.usage,
             },
           };
         }),
@@ -1387,6 +1506,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
           errorMessage: event.errorMessage,
           details: event.result?.details,
           fromHook: typeof event.result?.fromHook === "boolean" ? event.result.fromHook : undefined,
+          usage: event.result?.usage,
         },
       };
       // A successful compaction is an immutable archive boundary: preserve
@@ -1556,6 +1676,7 @@ export function addBashBlock(state: TranscriptState, command: string): Transcrip
       { id: blockId, type: "bash", data: { command, outputText: "", isStreaming: true } },
     ],
     activeBashId: blockId,
+    activeBashExecutionId: null,
   };
 }
 
@@ -1586,5 +1707,6 @@ export function finishBashBlock(
         : b,
     ),
     activeBashId: null,
+    activeBashExecutionId: null,
   };
 }

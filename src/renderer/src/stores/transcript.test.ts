@@ -26,6 +26,14 @@ const ASST_MSG = {
   stopReason: "stop",
   timestamp: 0,
 };
+const PI_USAGE = {
+  input: 100,
+  output: 20,
+  cacheRead: 5,
+  cacheWrite: 2,
+  totalTokens: 127,
+  cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2, total: 3.3 },
+};
 
 describe("transcript reducer", () => {
   it("starts empty", () => {
@@ -507,6 +515,76 @@ describe("transcript reducer", () => {
       expect(state.blocks[0].data.summary).toBe("Compacted 500 tokens");
       expect(state.blocks[0].data.estimatedTokensAfter).toBe(1_250);
     }
+  });
+
+  it("streams direct bash updates into one execution block", () => {
+    let state = applyPiEvent(
+      createTranscriptState(),
+      e({
+        type: "bash_execution_start",
+        id: "bash-1",
+        command: "printf hello",
+        excludeFromContext: true,
+      }),
+    );
+    state = applyPiEvent(state, e({ type: "bash_execution_update", id: "bash-1", delta: "hel" }));
+    state = applyPiEvent(state, e({ type: "bash_execution_update", id: "bash-1", delta: "lo" }));
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_end",
+        id: "bash-1",
+        command: "printf hello",
+        output: "hello",
+        exitCode: 0,
+        cancelled: false,
+        excludeFromContext: true,
+      }),
+    );
+
+    expect(state.activeBashExecutionId).toBeNull();
+    expect(state.blocks).toMatchObject([
+      {
+        type: "bash",
+        data: {
+          command: "printf hello",
+          outputText: "hello",
+          exitCode: 0,
+          excludeFromContext: true,
+          isStreaming: false,
+        },
+      },
+    ]);
+  });
+
+  it("preserves usage on live tool results and compaction summaries", () => {
+    let state = applyPiEvent(
+      createTranscriptState(),
+      e({
+        type: "tool_execution_start",
+        toolCallId: "usage-tool",
+        toolName: "search",
+        args: {},
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({
+        type: "tool_execution_end",
+        toolCallId: "usage-tool",
+        toolName: "search",
+        result: { content: [{ type: "text", text: "done" }], usage: PI_USAGE },
+        isError: false,
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({ type: "compaction_end", result: { summary: "summary", usage: PI_USAGE } }),
+    );
+
+    const blocks = allTranscriptBlocks(state);
+    expect(blocks[0]).toMatchObject({ type: "tool_call", data: { usage: PI_USAGE } });
+    expect(blocks[1]).toMatchObject({ type: "compaction", data: { usage: PI_USAGE } });
   });
 });
 

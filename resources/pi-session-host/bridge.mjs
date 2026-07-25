@@ -101,7 +101,7 @@ function hasNativeProviderLogin(session) {
  * during initialization. Keep this list in sync with the methods/getters used
  * below and in host.mjs.
  */
-export function assertHostCapabilities(session, runtime) {
+export function assertHostCapabilities(session, runtime, pi) {
   const missing = [];
   const fn = (obj, name, label) => {
     if (!obj || typeof obj[name] !== "function") missing.push(label);
@@ -156,6 +156,7 @@ export function assertHostCapabilities(session, runtime) {
   fn(session?.resourceLoader, "getSkills", "session.resourceLoader.getSkills");
   fn(session?.sessionManager, "getLeafId", "session.sessionManager.getLeafId");
   fn(session?.sessionManager, "getBranch", "session.sessionManager.getBranch");
+  fn(pi, "resolveModelScopeWithDiagnostics", "pi.resolveModelScopeWithDiagnostics");
 
   for (const m of [
     "newSession",
@@ -261,6 +262,16 @@ export function setupCommandBridge({
   const admissionContext = new AsyncLocalStorage();
   const lifecycleBlockers = new Map();
   let nextLifecycleId = 0;
+  const resolveModelScope = async (patterns, targetSession = _session) => {
+    if (typeof pi?.resolveModelScopeWithDiagnostics !== "function") {
+      throw new Error("Pi is missing public resolveModelScopeWithDiagnostics()");
+    }
+    // Pi 0.80.8+ exposes ModelRuntime directly. Earlier supported releases
+    // expose the public ModelRegistry shape accepted by their resolver.
+    const modelSurface = targetSession?.modelRuntime ?? targetSession?.modelRegistry;
+    if (!modelSurface) throw new Error("Pi session is missing its public model surface");
+    return pi.resolveModelScopeWithDiagnostics(patterns, modelSurface);
+  };
   lifecycleUiTracker.track = (promise) => {
     const lifecycleId = lifecycleContext.getStore();
     if (lifecycleId === undefined) return promise;
@@ -347,6 +358,52 @@ export function setupCommandBridge({
   }
 
   if (initialBinding) authority.beginTransition(authority.sessionEpoch, false);
+
+  function executeStreamingBash(executionId, command, excludeFromContext) {
+    authority.observeEvent({
+      type: "bash_execution_start",
+      id: executionId,
+      command,
+      ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+    });
+    const finish = (result, errorMessage) => {
+      authority.observeEvent({
+        type: "bash_execution_end",
+        id: executionId,
+        command,
+        output: typeof result?.output === "string" ? result.output : "",
+        ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
+        ...(typeof result?.cancelled === "boolean" ? { cancelled: result.cancelled } : {}),
+        ...(typeof result?.truncated === "boolean" ? { truncated: result.truncated } : {}),
+        ...(typeof result?.fullOutputPath === "string"
+          ? { fullOutputPath: result.fullOutputPath }
+          : {}),
+        ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        ...(errorMessage ? { errorMessage } : {}),
+      });
+    };
+
+    let operation;
+    try {
+      operation = _session.executeBash(command, undefined, {
+        id: executionId,
+        ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+      });
+    } catch (error) {
+      finish(undefined, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+    return Promise.resolve(operation).then(
+      (result) => {
+        finish(result);
+        return result;
+      },
+      (error) => {
+        finish(undefined, error instanceof Error ? error.message : String(error));
+        throw error;
+      },
+    );
+  }
 
   function trackInterruptibleOperation(kind, interrupt, run) {
     const id = nextInterruptId++;
@@ -574,10 +631,10 @@ export function setupCommandBridge({
   }
 
   /** Render and dispose one public extension pi-tui component in the SDK host. */
-  function renderExtensionComponent(renderer, value, customType, cols, expanded) {
+  function renderExtensionComponent(renderer, value, customType, cols, expanded, options = {}) {
     let component;
     try {
-      component = renderer(value, { expanded: expanded === true }, uiContext?.theme);
+      component = renderer(value, { expanded: expanded === true, ...options }, uiContext?.theme);
       if (!component || typeof component.render !== "function") return { rendered: false };
       const lines = component.render(Math.max(20, Math.min(240, Math.floor(cols))));
       if (!Array.isArray(lines)) return { rendered: false };
@@ -646,7 +703,9 @@ export function setupCommandBridge({
 
     const renderer = runner.getMessageRenderer(customType);
     if (typeof renderer !== "function") return { rendered: false };
-    return renderExtensionComponent(renderer, match, customType, cols, expanded);
+    return renderExtensionComponent(renderer, match, customType, cols, expanded, {
+      outputPad: _session.settingsManager?.getOutputPad?.() ?? 0,
+    });
   }
 
   // ─── Command handler ───────────────────────────────────────────────────
@@ -971,19 +1030,40 @@ export function setupCommandBridge({
           const models = await modelAccess(_session).getAvailable();
           return {
             handled: true,
-            result: { response: { models, enabledIds: resolveEnabledModelIds(_session, models) } },
+            result: {
+              response: {
+                models,
+                enabledIds: await resolveEnabledModelIds(_session, resolveModelScope),
+              },
+            },
           };
         }
-        const [verb, csv = ""] = args.split(/\s+/, 2);
-        if (verb !== "apply" && verb !== "save")
-          throw new Error("Usage: /models [apply|save] [provider/model,...]");
+        const scopeCommand = /^(apply|save)(?:\s+([\s\S]*))?$/.exec(args);
+        if (!scopeCommand) throw new Error("Usage: /models [apply|save] [provider/model,...]");
+        const [, verb, payload = ""] = scopeCommand;
         const models = await modelAccess(_session).getAvailable();
-        const enabledIds = csv ? csv.split(",").filter(Boolean) : null;
-        const scoped = buildScopedModels(_session, models, enabledIds);
+        let enabledIds = null;
+        if (payload.startsWith("--json ")) {
+          let decoded;
+          try {
+            decoded = JSON.parse(payload.slice("--json ".length));
+          } catch {
+            throw new Error("Invalid /models JSON payload");
+          }
+          if (!Array.isArray(decoded) || !decoded.every((value) => typeof value === "string")) {
+            throw new Error("Invalid /models JSON payload");
+          }
+          enabledIds = decoded;
+        } else if (payload) {
+          // Preserve the user-facing legacy CSV form. Pi-Vis-owned picker
+          // submissions use the JSON form so saved partial/name patterns may
+          // contain whitespace or commas without being split or truncated.
+          enabledIds = payload.split(",").filter(Boolean);
+        }
+        const scoped = await buildScopedModels(models, enabledIds, resolveModelScope);
         _session.setScopedModels(scoped);
         if (verb === "save") {
-          const isAll =
-            enabledIds === null || enabledIds.length === 0 || enabledIds.length >= models.length;
+          const isAll = selectsEveryAvailableModel(models, enabledIds);
           _session.settingsManager.setEnabledModels(isAll ? undefined : enabledIds);
         }
         return { handled: true, result: { response: { enabledIds } } };
@@ -1209,41 +1289,16 @@ export function setupCommandBridge({
         }
         case "runBash":
           // Bash can run arbitrarily long; settle it off-scheduler too.
-          //
-          // AgentSession.executeBash() persists a public bashExecution message
-          // but (unlike agent messages) emits no AgentSession event for it.
-          // Adapt the returned public BashResult into the same authoritative
-          // transcript presentation record so a live renderer sees the command
-          // it just ran without waiting for a later history re-hydration.
+          // Pi 0.82 emits correlated bash_execution_update chunks. Bracket
+          // those public updates with host start/end records so the native
+          // transcript streams output and still has a terminal result.
           return {
             deferredOutcome: trackInterruptibleOperation(
               "bash",
               () => _session.abortBash(),
               () =>
-                _session.executeBash(intent.command, undefined, {
-                  ...(intent.excludeFromContext !== undefined
-                    ? { excludeFromContext: intent.excludeFromContext }
-                    : {}),
-                }),
+                executeStreamingBash(envelope.intentId, intent.command, intent.excludeFromContext),
             ).then((result) => {
-              authority.observeEvent({
-                type: "message_start",
-                message: {
-                  role: "bashExecution",
-                  command: intent.command,
-                  output: typeof result?.output === "string" ? result.output : "",
-                  ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
-                  cancelled: result?.cancelled === true,
-                  truncated: result?.truncated === true,
-                  ...(typeof result?.fullOutputPath === "string"
-                    ? { fullOutputPath: result.fullOutputPath }
-                    : {}),
-                  ...(intent.excludeFromContext !== undefined
-                    ? { excludeFromContext: intent.excludeFromContext }
-                    : {}),
-                  timestamp: Date.now(),
-                },
-              });
               return {
                 started: true,
                 ...(typeof result?.output === "string" ? { output: result.output } : {}),
@@ -1578,10 +1633,8 @@ export function setupCommandBridge({
           //      NEVER resolves these saved patterns into session.scopedModels,
           //      so without this fallback a persisted scope would be invisible
           //      to the dropdown on a fresh session / after relaunch. We
-          //      resolve the patterns with the same best-effort matcher
-          //      (resolveModelScopePatterns) the scoped-models picker uses for
-          //      its initial checkboxes; it is advisory — the authoritative
-          //      scope lives in pi's settingsManager.
+          //      resolve the patterns with Pi's public diagnostic resolver,
+          //      exactly like its own TUI.
           const scoped = _session.scopedModels;
           if (Array.isArray(scoped) && scoped.length > 0) {
             const scopedModels = scoped
@@ -1594,14 +1647,13 @@ export function setupCommandBridge({
           let effective = models;
           const settingsPatterns = _session.settingsManager?.getEnabledModels?.();
           if (Array.isArray(settingsPatterns) && settingsPatterns.length > 0) {
-            const enabledIds = new Set(resolveModelScopePatterns(settingsPatterns, models));
+            const configuredScope = await resolveModelScope(settingsPatterns);
+            const resolvedModels = configuredScope.scopedModels.map((entry) => entry.model);
             // Only filter when it actually narrows the list: an empty or
             // full match means "no scope" (mirrors resolveEnabledModelIds →
             // null), so fall through to the unfiltered registry list.
-            if (enabledIds.size > 0 && enabledIds.size < models.length) {
-              effective = models.filter((m) =>
-                enabledIds.has(`${m.provider}/${m.id}`.toLowerCase()),
-              );
+            if (resolvedModels.length > 0 && resolvedModels.length < models.length) {
+              effective = resolvedModels;
             }
           }
           send({ type: "response", id, success: true, data: { models: effective } });
@@ -1618,14 +1670,14 @@ export function setupCommandBridge({
           const modelsApi = modelAccess(_session);
           await modelsApi.refresh();
           const models = await modelsApi.getAvailable();
-          const enabledIds = resolveEnabledModelIds(_session, models);
+          const enabledIds = await resolveEnabledModelIds(_session, resolveModelScope);
           send({ type: "response", id, success: true, data: { models, enabledIds } });
           break;
         }
 
         case "set_scoped_models": {
           const models = await modelAccess(_session).getAvailable();
-          const scoped = buildScopedModels(_session, models, command.enabledIds);
+          const scoped = await buildScopedModels(models, command.enabledIds, resolveModelScope);
           _session.setScopedModels(scoped);
           send({ type: "response", id, success: true });
           break;
@@ -1640,14 +1692,11 @@ export function setupCommandBridge({
         // clears the settings filter (all enabled / empty / == all).
         case "save_scoped_models": {
           const models = await modelAccess(_session).getAvailable();
-          const isAll =
-            command.enabledIds === null ||
-            command.enabledIds.length === 0 ||
-            command.enabledIds.length >= models.length;
+          const isAll = selectsEveryAvailableModel(models, command.enabledIds);
           const patterns = isAll ? undefined : [...command.enabledIds];
           _session.settingsManager.setEnabledModels(patterns);
           // Apply to the current session so it takes effect immediately.
-          const scoped = buildScopedModels(_session, models, command.enabledIds);
+          const scoped = await buildScopedModels(models, command.enabledIds, resolveModelScope);
           _session.setScopedModels(scoped);
           send({ type: "response", id, success: true });
           break;
@@ -1673,12 +1722,7 @@ export function setupCommandBridge({
           const result = await trackInterruptibleOperation(
             "bash",
             () => _session.abortBash(),
-            () =>
-              _session.executeBash(command.command, undefined, {
-                ...(command.excludeFromContext !== undefined
-                  ? { excludeFromContext: command.excludeFromContext }
-                  : {}),
-              }),
+            () => executeStreamingBash(id, command.command, command.excludeFromContext),
           );
           send({ type: "response", id, success: true, data: result });
           break;
@@ -2260,15 +2304,18 @@ function buildHistoricalCacheMissNotices(session) {
  * mirroring pi's showModelsSelector initial-state derivation (interactive-mode):
  *   1. session.scopedModels (non-empty) → those ids directly.
  *   2. else settingsManager.getEnabledModels() patterns → resolve patterns
- *      locally (we cannot import pi's private resolveModelScope).
- *   3. else → null (all models checked = no scope).
+ *      with Pi's public resolveModelScopeWithDiagnostics().
+ *   3. append saved patterns with `no-match` diagnostics even when a
+ *      session-only scope is active.
+ *   4. else → null (all models checked = no scope).
  *
  * Returns `null` when nothing is scoped (the picker checks everything).
  */
-function resolveEnabledModelIds(session, models) {
+async function resolveEnabledModelIds(session, resolveModelScope) {
   const scoped = session.scopedModels;
+  let enabledIds = null;
   if (Array.isArray(scoped) && scoped.length > 0) {
-    return scoped
+    enabledIds = scoped
       .map((entry) => {
         const m = entry?.model;
         return m ? `${m.provider}/${m.id}` : null;
@@ -2277,119 +2324,60 @@ function resolveEnabledModelIds(session, models) {
   }
   const settingsPatterns = session.settingsManager?.getEnabledModels?.();
   if (Array.isArray(settingsPatterns) && settingsPatterns.length > 0) {
-    return resolveModelScopePatterns(settingsPatterns, models);
-  }
-  return null;
-}
-
-/**
- * Minimal local replacement for pi's (private) resolveModelScope.
- *
- * For each pattern, match against the available models where a match is:
- *   - exact `provider/id` equality (case-insensitive), OR
- *   - exact `id` equality (case-insensitive), OR
- *   - if the pattern contains glob chars (* ? [), a minimatch-style match
- *     against both `provider/id` and bare `id`.
- *
- * An optional `:thinkingLevel` suffix is stripped before matching
- * (valid levels: off, minimal, low, medium, high, xhigh, max).
- *
- * This is best-effort for the *initial checkbox state*; the authoritative
- * scope is what the user submits (set_scoped_models).
- */
-function resolveModelScopePatterns(patterns, models) {
-  const VALID_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-  const matched = new Set();
-  for (const raw of patterns) {
-    if (typeof raw !== "string") continue;
-    let pattern = raw.trim();
-    if (!pattern) continue;
-    // Strip optional ":thinkingLevel" suffix.
-    const colon = pattern.lastIndexOf(":");
-    if (colon !== -1) {
-      const suffix = pattern.slice(colon + 1).toLowerCase();
-      if (VALID_LEVELS.has(suffix)) pattern = pattern.slice(0, colon);
-    }
-    const lower = pattern.toLowerCase();
-    const hasGlob = /[\*\?\[]/.test(pattern);
-    for (const m of models) {
-      const providerId = `${m.provider}/${m.id}`.toLowerCase();
-      const id = String(m.id).toLowerCase();
-      let isMatch = providerId === lower || id === lower;
-      if (!isMatch && hasGlob) {
-        // Match against both the canonical "provider/id" and the bare id
-        // (so "*sonnet*" matches without requiring "anthropic/*sonnet*").
-        isMatch = minimatchSimple(pattern, providerId) || minimatchSimple(pattern, id);
+    const configuredScope = await resolveModelScope(settingsPatterns, session);
+    enabledIds ??= configuredScope.scopedModels.map(
+      (entry) => `${entry.model.provider}/${entry.model.id}`,
+    );
+    // Pi 0.81.0 keeps configured patterns that no longer resolve visible in
+    // the picker. Mirror its TUI by retaining only diagnostics that represent
+    // a no-match pattern; invalid thinking-level warnings still resolve to a
+    // concrete model and must not create a second "Unavailable" row.
+    for (const diagnostic of configuredScope.diagnostics) {
+      if (
+        diagnostic.code === "no-match" &&
+        typeof diagnostic.pattern === "string" &&
+        !enabledIds.includes(diagnostic.pattern)
+      ) {
+        enabledIds.push(diagnostic.pattern);
       }
-      if (isMatch) matched.add(providerId);
     }
   }
-  return [...matched];
+  return enabledIds;
 }
 
 /**
- * Minimal glob: supports `*` (any chars), `?` (one char), `[...]` (char class).
- * Faithful enough for the enabled-models pattern list; not a full minimatch.
- */
-function minimatchSimple(pattern, str) {
-  // Case-insensitive, like the exact-match branches above.
-  const re = globToRegExp(pattern.toLowerCase());
-  return re.test(str.toLowerCase());
-}
-
-function globToRegExp(glob) {
-  let out = "^";
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === "*") out += ".*";
-    else if (c === "?") out += ".";
-    else if (c === "[") {
-      // Pass through a char class (closing ] is the next ] after a leading !
-      const end = glob.indexOf("]", i + 1);
-      if (end === -1) {
-        out += "\\[";
-      } else {
-        out += glob.slice(i, end + 1);
-        i = end;
-      }
-    } else if (".+^$(){}|\\".includes(c)) {
-      out += `\\${c}`;
-    } else {
-      out += c;
-    }
-  }
-  out += "$";
-  return new RegExp(out);
-}
-
-/**
- * Build the scoped-models array for setScopedModels().
+ * Build the scoped-models array for setScopedModels() with Pi's public
+ * resolver, matching interactive-mode's live selector update.
  * - enabledIds null / empty / == all available → [] (no scope).
- * - otherwise → [{ model, thinkingLevel? }], preserving an existing
- *   scoped entry's thinkingLevel for a model that was already scoped.
+ * - an unavailable-only selection → [] (no usable live scope).
+ * - otherwise → Pi's resolved [{ model, thinkingLevel? }] entries.
  */
-function buildScopedModels(session, models, enabledIds) {
-  const prevScoped = new Map();
-  if (Array.isArray(session.scopedModels)) {
-    for (const entry of session.scopedModels) {
-      const m = entry?.model;
-      if (m) prevScoped.set(`${m.provider}/${m.id}`, entry.thinkingLevel);
-    }
-  }
-  if (enabledIds === null || enabledIds.length === 0 || enabledIds.length >= models.length) {
+async function buildScopedModels(models, enabledIds, resolveModelScope) {
+  if (enabledIds === null || enabledIds.length === 0) {
     return [];
   }
-  const wanted = new Set(enabledIds);
-  const scoped = [];
-  for (const m of models) {
-    const providerId = `${m.provider}/${m.id}`;
-    if (!wanted.has(providerId)) continue;
-    const entry = { model: m };
-    const prev = prevScoped.get(providerId);
-    if (prev !== undefined) entry.thinkingLevel = prev;
-    scoped.push(entry);
+  const enabled = enabledIds.map((id) => String(id));
+  const wanted = new Set(enabled.map((id) => id.toLowerCase()));
+  const availableIds = new Set(models.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
+  const hasEnabledAvailableModel = [...wanted].some((id) => availableIds.has(id));
+  const allAvailableModelsEnabled = [...availableIds].every((id) => wanted.has(id));
+  if (!hasEnabledAvailableModel || allAvailableModelsEnabled) {
+    return [];
   }
-  return scoped;
+  const { scopedModels } = await resolveModelScope(enabled);
+  return scopedModels.map((entry) => ({
+    model: entry.model,
+    ...(entry.thinkingLevel !== undefined ? { thinkingLevel: entry.thinkingLevel } : {}),
+  }));
+}
+
+function selectsEveryAvailableModel(models, enabledIds) {
+  if (enabledIds === null || enabledIds.length === 0) return true;
+  const availableIds = new Set(models.map((m) => `${m.provider}/${m.id}`.toLowerCase()));
+  const selectedIds = new Set(enabledIds.map((id) => String(id).toLowerCase()));
+  return (
+    selectedIds.size === availableIds.size && [...availableIds].every((id) => selectedIds.has(id))
+  );
 }
 
 /**

@@ -1,3 +1,5 @@
+import { type PiUsage, PiUsageSchema } from "./usage.js";
+
 /**
  * Separator used when adjacent `content: [{ type: "text" }]` parts form one
  * tool result. This matches the live transcript reducer's display behavior.
@@ -32,6 +34,8 @@ export interface ToolResultData {
   patch: string | undefined;
   /** Non-payload result fields, including addedToolNames/terminate and future fields. */
   metadata: Record<string, unknown> | undefined;
+  /** Usage attributed to the tool execution itself, when reported by Pi 0.81+. */
+  usage: PiUsage | undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -95,7 +99,8 @@ function extractResultMetadata(
       key === "role" ||
       key === "toolCallId" ||
       key === "toolName" ||
-      key === "isError"
+      key === "isError" ||
+      key === "usage"
     ) {
       continue;
     }
@@ -125,6 +130,7 @@ export function extractToolResult(value: unknown): ToolResultData {
       diff: undefined,
       patch: undefined,
       metadata: undefined,
+      usage: undefined,
     };
   }
   if (!isRecord(value)) {
@@ -138,6 +144,7 @@ export function extractToolResult(value: unknown): ToolResultData {
       diff: undefined,
       patch: undefined,
       metadata: undefined,
+      usage: undefined,
     };
   }
 
@@ -158,6 +165,7 @@ export function extractToolResult(value: unknown): ToolResultData {
         ? value.patch
         : undefined;
   const content = extractTextAndImages(rawContent);
+  const parsedUsage = PiUsageSchema.safeParse(value.usage);
 
   return {
     text: content.hasTextParts
@@ -173,5 +181,6 @@ export function extractToolResult(value: unknown): ToolResultData {
     diff,
     patch,
     metadata: extractResultMetadata(value),
+    usage: parsedUsage.success ? parsedUsage.data : undefined,
   };
 }

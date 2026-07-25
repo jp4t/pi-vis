@@ -134,6 +134,20 @@ test.describe("unified tool card disclosure", () => {
             terminate: true,
             output: "LEGACY OUTPUT FINAL SENTINEL",
           },
+          usage: {
+            input: 100,
+            output: 20,
+            cacheRead: 5,
+            cacheWrite: 2,
+            totalTokens: 127,
+            cost: {
+              input: 0.1,
+              output: 0.2,
+              cacheRead: 0.01,
+              cacheWrite: 0.02,
+              total: 0.33,
+            },
+          },
           isError: false,
           isStreaming: false,
         },
@@ -204,6 +218,9 @@ test.describe("unified tool card disclosure", () => {
     await expect(resultFields).toContainText("audit-tool");
     await expect(resultFields).toContainText('"terminate": true');
     await expect(resultFields).toContainText("LEGACY OUTPUT FINAL SENTINEL");
+    const usage = section(card, "Usage");
+    await expect(usage).toContainText('"totalTokens": 127');
+    await expect(usage).toContainText('"total": 0.33');
     await expect(card.locator("details")).toHaveCount(0);
 
     await output.getByRole("button", { name: "Copy all" }).click();

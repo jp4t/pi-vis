@@ -26,7 +26,7 @@ This table documents the deployed policy/settlement compatibility contract. Unde
 | `setTrust` intent | mutation | trust picker | exact child-revalidated option; bounded persisted outcome, then fresh-cursor reload |
 | `set_label` | idempotent | tree viewer | terminal response followed by same-runtime tree refresh |
 | `abort`, `abort_bash`, `abort_retry` | effectful + intent | ESC/host controls and integrations | explicit completion or unknown-effect review; bridge/state-authority tests |
-| `bash` / `runBash` intent | effectful + intent | `!` / `!!` | exit code/output outcome plus child-adapted authoritative `bashExecution` transcript record; transport ambiguity is review custody |
+| `bash` / `runBash` intent | effectful + intent | `!` / `!!` | correlated start/update/end transcript lifecycle plus exit code/output outcome; transport ambiguity is review custody |
 | `cycle_model`, `cycle_thinking_level` | effectful + intent | extension/unified controls | correlated host response; never rebound or replayed |
 | `compact` | effectful + intent | `/compact`, extensions | `compaction_end` and persisted compaction prove success; domain and unknown paths are separate |
 | `export_html` | effectful + intent | `/export`, `/share` | returned path/file is success evidence; `/share` uses the same custody path |
@@ -41,6 +41,6 @@ This table documents the deployed policy/settlement compatibility contract. Unde
 - Renderer tests prove all direct command call sites construct the mandatory request and stale continuations do not write state.
 - Bridge tests prove each command reaches the intended public SDK operation or an explicit structured capability/domain failure.
 - Electron fake-host tests cover first-use, picker, command, delayed-history, unified-claim, and ESC cancellation/queue-restoration behavior without model/network nondeterminism.
-- The Pi 0.80.10 localhost-provider smoke proves a real successful model-backed compaction by asserting the HTTP summarization request, `Context compacted`, a persisted `compaction` JSONL entry, Composer clearing, and continued host liveness.
+- The Pi 0.82.1 localhost-provider smoke proves a real successful model-backed compaction by asserting the HTTP summarization request, `Context compacted`, a persisted `compaction` JSONL entry, Composer clearing, and continued host liveness.
 
 External provider aliases, credentials, and backend availability remain integration dependencies. A dispatch, cleared editor, or surfaced provider failure is never recorded as successful operation evidence.

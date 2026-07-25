@@ -18,6 +18,14 @@ function e<T extends KnownPiEvent>(event: T): T {
 }
 
 const ASSISTANT = { role: "assistant" as const };
+const PI_USAGE = {
+  input: 100,
+  output: 20,
+  cacheRead: 5,
+  cacheWrite: 2,
+  totalTokens: 127,
+  cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2, total: 3.3 },
+};
 
 function liveStreams(): TranscriptState {
   let state = createTranscriptState();
@@ -68,6 +76,7 @@ describe("transcript lifecycle invariants", () => {
           resultContent: [{ type: "text", text: "done", textSignature: "signed" }],
           resultDetails: null,
           resultMetadata: { terminate: true },
+          usage: PI_USAGE,
           isError: false,
           isStreaming: false,
         },
@@ -95,12 +104,19 @@ describe("transcript lifecycle invariants", () => {
           estimatedTokensAfter: 125,
           details: ["opaque"],
           fromHook: true,
+          usage: PI_USAGE,
         },
       },
       {
         id: "branch",
         type: "branch_summary",
-        data: { summary: "recap", fromId: "old-leaf", details: null, fromHook: false },
+        data: {
+          summary: "recap",
+          fromId: "old-leaf",
+          details: null,
+          fromHook: false,
+          usage: PI_USAGE,
+        },
       },
       {
         id: "custom-message",
@@ -127,6 +143,7 @@ describe("transcript lifecycle invariants", () => {
         resultContent: [{ type: "text", text: "done", textSignature: "signed" }],
         resultDetails: null,
         resultMetadata: { terminate: true },
+        usage: PI_USAGE,
       },
       {
         cancelled: true,
@@ -135,8 +152,8 @@ describe("transcript lifecycle invariants", () => {
         excludeFromContext: true,
         timestamp: 12,
       },
-      { estimatedTokensAfter: 125, details: ["opaque"], fromHook: true },
-      { fromId: "old-leaf", details: null, fromHook: false },
+      { estimatedTokensAfter: 125, details: ["opaque"], fromHook: true, usage: PI_USAGE },
+      { fromId: "old-leaf", details: null, fromHook: false, usage: PI_USAGE },
       {
         images: ["data:image/webp;base64,eQ=="],
         rawContent: [{ type: "text", text: "preview", textSignature: "signed-preview" }],

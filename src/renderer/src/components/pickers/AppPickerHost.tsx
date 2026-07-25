@@ -192,11 +192,12 @@ export function AppPickerHost({ sessionId }: PickerHostProps): React.ReactElemen
           onApply={async (enabledIds, persist) => {
             const observation = requirePickerObservation();
             const command = persist ? "/models save" : "/models apply";
+            const encodedIds = enabledIds === null ? "" : ` --json ${JSON.stringify(enabledIds)}`;
             const receipt = await dispatchSessionIntent(
               sessionId,
               {
                 kind: "invokeCommand",
-                text: enabledIds ? `${command} ${enabledIds.join(",")}` : command,
+                text: `${command}${encodedIds}`,
                 editorRevision:
                   useSessionsStore.getState().sessions.get(sessionId)?.editorRevision ?? 0,
               },
@@ -679,9 +680,23 @@ function ScopedModelsPicker({
   onApply: (enabledIds: string[] | null, persist: boolean) => void;
 }): React.ReactElement {
   const allIds = useMemo(() => models.map((m) => `${m.provider ?? ""}/${m.id}`), [models]);
+  const rows = useMemo(() => {
+    const availableById = new Map(
+      models.map((model) => [`${model.provider ?? ""}/${model.id}`.toLowerCase(), model]),
+    );
+    const availableRows = models.map((model) => ({
+      id: `${model.provider ?? ""}/${model.id}`,
+      model,
+    }));
+    const unavailableRows = (enabledIds ?? [])
+      .filter((id) => !availableById.has(id.toLowerCase()))
+      .map((id) => ({ id, model: undefined }));
+    return [...availableRows, ...unavailableRows];
+  }, [enabledIds, models]);
   const [checked, setChecked] = useState<Set<string>>(() => {
     if (enabledIds === null) return new Set(allIds);
-    return new Set(enabledIds);
+    const canonicalAvailableIds = new Map(allIds.map((id) => [id.toLowerCase(), id]));
+    return new Set(enabledIds.map((id) => canonicalAvailableIds.get(id.toLowerCase()) ?? id));
   });
   const [query, setQuery] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -694,16 +709,16 @@ function ScopedModelsPicker({
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return models;
-    return models.filter((m) => {
-      const label = m.name ?? m.id;
+    if (!q) return rows;
+    return rows.filter(({ id, model }) => {
+      const label = model ? (model.name ?? model.id) : id;
       return (
         label.toLowerCase().includes(q) ||
-        m.id.toLowerCase().includes(q) ||
-        (m.provider ?? "").toLowerCase().includes(q)
+        id.toLowerCase().includes(q) ||
+        (model?.provider ?? "").toLowerCase().includes(q)
       );
     });
-  }, [models, query]);
+  }, [query, rows]);
 
   // Reset highlight when the filter changes.
   // biome-ignore lint/correctness/useExhaustiveDependencies: depends on the filter value, not on identity
@@ -738,7 +753,7 @@ function ScopedModelsPicker({
     });
   };
 
-  const allChecked = checked.size === allIds.length;
+  const allChecked = checked.size === allIds.length && allIds.every((id) => checked.has(id));
   const noneChecked = checked.size === 0;
   const selectedCount = checked.size;
 
@@ -772,8 +787,8 @@ function ScopedModelsPicker({
               setHighlightedIndex((i) => Math.max(i - 1, 0));
             } else if (e.key === "Enter") {
               e.preventDefault();
-              const m = filtered[highlightedIndex];
-              if (m) toggle(`${m.provider ?? ""}/${m.id}`);
+              const row = filtered[highlightedIndex];
+              if (row) toggle(row.id);
             } else if (e.key === "Escape") {
               e.preventDefault();
               onClose();
@@ -797,16 +812,16 @@ function ScopedModelsPicker({
               style={{ transform: `translateY(${virtualList.offsetY}px)` }}
             >
               {virtualList.rows.map(({ index: idx }) => {
-                const m = filtered[idx];
-                if (!m) return null;
-                const id = `${m.provider ?? ""}/${m.id}`;
+                const row = filtered[idx];
+                if (!row) return null;
+                const { id, model } = row;
                 const isChecked = checked.has(id);
-                const label = modelDisplayName(m);
+                const label = model ? modelDisplayName(model) : id;
                 return (
                   <button
                     type="button"
                     key={id}
-                    className={`picker__item picker__item--check ${idx === highlightedIndex ? "picker__item--highlighted" : ""}`}
+                    className={`picker__item picker__item--check ${model ? "" : "picker__item--unavailable"} ${idx === highlightedIndex ? "picker__item--highlighted" : ""}`}
                     onClick={() => toggle(id)}
                     onMouseEnter={() => {
                       highlightSourceRef.current = "pointer";
@@ -822,7 +837,7 @@ function ScopedModelsPicker({
                     <span className="picker__item-name" title={label}>
                       {label}
                     </span>
-                    <span className="picker__item-meta">{m.id}</span>
+                    <span className="picker__item-meta">{model?.id ?? "Unavailable"}</span>
                   </button>
                 );
               })}
@@ -832,7 +847,8 @@ function ScopedModelsPicker({
       </ScrollFadeFrame>
       <div className="picker__footer">
         <span className="picker__count">
-          {selectedCount} of {models.length} selected
+          {selectedCount} selected
+          {rows.length > models.length ? ` · ${rows.length - models.length} unavailable` : ""}
         </span>
         <button
           type="button"

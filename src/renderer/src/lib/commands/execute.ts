@@ -519,7 +519,7 @@ async function executeScopedModels(sessionId: SessionId, deps: ExecuteDeps): Pro
       await deps.query!(sessionId, { type: "get_scoped_models" }),
     );
     const models = data.models ?? [];
-    models.length
+    models.length || (data.enabledIds?.length ?? 0) > 0
       ? deps.openPicker(sessionId, {
           kind: "scoped-models",
           models,

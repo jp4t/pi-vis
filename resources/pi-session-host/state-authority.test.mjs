@@ -30,6 +30,7 @@ function makeSession(overrides = {}) {
     isBashRunning: false,
     model: { provider: "anthropic", id: "claude" },
     thinkingLevel: "medium",
+    getAvailableThinkingLevels: vi.fn(() => ["off", "low", "medium", "high"]),
     sessionId: "session-1",
     sessionFile: "/tmp/session.jsonl",
     sessionName: "Session",
@@ -3304,6 +3305,61 @@ describe("state authority", () => {
       barrierOpen: true,
     });
     expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("projects summarization retry lifecycle without releasing compaction custody", async () => {
+    const { authority } = setup({ isCompacting: true });
+    authority.observeEvent({ type: "compaction_start", reason: "manual" });
+    authority.observeEvent({
+      type: "summarization_retry_scheduled",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 100,
+      errorMessage: "temporary failure",
+    });
+
+    expect(authority.semanticSnapshot().activity.compaction).toMatchObject({
+      state: "retry_wait",
+      attempt: 1,
+    });
+    await expect(authority.submit(makeRequest("summarization-retry-held"))).resolves.toMatchObject({
+      disposition: "in_custody",
+    });
+
+    authority.observeEvent({
+      type: "summarization_retry_attempt_start",
+      source: "compaction",
+      reason: "manual",
+    });
+    expect(authority.semanticSnapshot().activity.compaction).toMatchObject({
+      state: "active",
+      attempt: 2,
+    });
+    authority.observeEvent({ type: "summarization_retry_finished" });
+    expect(authority.semanticSnapshot().activity.compaction?.state).toBe("active");
+  });
+
+  it("projects branch-summary retry_wait on the active navigation operation", async () => {
+    const gate = deferred();
+    const { authority } = setup();
+    const navigating = authority.runNavigation(() => gate.promise);
+
+    authority.observeEvent({
+      type: "summarization_retry_scheduled",
+      attempt: 1,
+      maxAttempts: 3,
+      delayMs: 100,
+      errorMessage: "temporary failure",
+    });
+    expect(authority.semanticSnapshot().activity.navigation?.state).toBe("retry_wait");
+
+    authority.observeEvent({
+      type: "summarization_retry_attempt_start",
+      source: "branchSummary",
+    });
+    expect(authority.semanticSnapshot().activity.navigation?.state).toBe("active");
+    gate.resolve({ cancelled: false });
+    await navigating;
   });
 
   it("keeps custody fenced and reports an anomaly when getter and event disagree", async () => {

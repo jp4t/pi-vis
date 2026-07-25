@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SessionEntrySchema } from "./entries.js";
 
-describe("SessionEntrySchema Pi 0.80.10 public payloads", () => {
+describe("SessionEntrySchema Pi 0.82.1 public payloads", () => {
   it.each([
     {
       role: "bashExecution",
@@ -68,5 +68,22 @@ describe("SessionEntrySchema Pi 0.80.10 public payloads", () => {
     },
   ])("preserves arbitrary public payload fields for $type", (entry) => {
     expect(SessionEntrySchema.parse(entry)).toMatchObject(entry);
+  });
+
+  it.each(["compaction", "branch_summary"])("preserves %s summarization usage", (type) => {
+    const usage = {
+      input: 100,
+      output: 20,
+      cacheRead: 5,
+      cacheWrite: 2,
+      totalTokens: 127,
+      cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2, total: 3.3 },
+    };
+    const entry =
+      type === "compaction"
+        ? { type, id: "summary", summary: "summary", usage }
+        : { type, id: "summary", summary: "summary", fromId: "old-leaf", usage };
+
+    expect(SessionEntrySchema.parse(entry)).toMatchObject({ usage });
   });
 });

@@ -817,6 +817,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
       {data.resultMetadata !== undefined && (
         <StructuredPayload label="Result fields" value={data.resultMetadata} />
       )}
+      {data.usage !== undefined && <StructuredPayload label="Usage" value={data.usage} />}
     </ToolCardShell>
   );
 });
@@ -1046,6 +1047,7 @@ const CompactionBlock = memo(function CompactionBlock({
     willRetry: data.willRetry ?? false,
     fromHook: data.fromHook ?? false,
     ...(data.details !== undefined ? { details: data.details } : {}),
+    ...(data.usage !== undefined ? { usage: data.usage } : {}),
   };
 
   return (
@@ -1078,6 +1080,7 @@ const BranchSummaryBlock = memo(function BranchSummaryBlock({
         fromId: data.fromId ?? null,
         fromHook: data.fromHook ?? false,
         ...(data.details !== undefined ? { details: data.details } : {}),
+        ...(data.usage !== undefined ? { usage: data.usage } : {}),
       }}
       preserveScroll={preserveScroll}
     />

@@ -251,7 +251,7 @@ export const RenderEntryCommandSchema = BaseCommand.extend({
   expanded: z.boolean().optional(),
 });
 
-// Pi 0.80.10 SDK-host-only rendering for visible custom messages paired with
+// Pi >= 0.80.10 SDK-host-only rendering for visible custom messages paired with
 // registerMessageRenderer(). Messages have no stable public ID, so the bridge
 // resolves the unique public AgentSession.messages item at this key.
 export const RenderMessageCommandSchema = BaseCommand.extend({

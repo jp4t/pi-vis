@@ -251,6 +251,10 @@
   gap: 0.571rem;
 }
 
+.picker__item--unavailable .picker__item-meta {
+  color: var(--warning);
+}
+
 .picker__checkbox {
   flex: 0 0 auto;
   width: 1rem;

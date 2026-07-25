@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { resolveModelScopeWithDiagnostics } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { PI_COMMAND_POLICY } from "../../src/shared/pi-protocol/commands.ts";
 import {
@@ -6,6 +7,8 @@ import {
   TransitionBatchSchema,
 } from "../../src/shared/pi-protocol/runtime-state.ts";
 import { assertHostCapabilities, setupCommandBridge } from "./bridge.mjs";
+
+const MODEL_SCOPE_PI = { resolveModelScopeWithDiagnostics };
 
 function deferred() {
   let resolve;
@@ -140,6 +143,7 @@ function setup(sessionOverrides, bridgeOverrides = {}) {
     uiContext: {},
     send,
     panelBridge,
+    pi: MODEL_SCOPE_PI,
     ...bridgeOverrides,
   });
   const {
@@ -1038,6 +1042,7 @@ describe("setupCommandBridge — target intent dispatch", () => {
 
     expect(session.compact).toHaveBeenCalledWith("brief");
     expect(session.executeBash).toHaveBeenCalledWith("pwd", undefined, {
+      id: "intent-runBash",
       excludeFromContext: true,
     });
     expect(session.navigateTree).toHaveBeenCalledWith("leaf-9", { summarize: true });
@@ -1058,17 +1063,25 @@ describe("setupCommandBridge — target intent dispatch", () => {
     expect(runtime.newSession).not.toHaveBeenCalled();
   });
 
-  it("publishes the public bash result on the live transcript plane", async () => {
+  it("publishes the direct bash streaming lifecycle on the live transcript plane", async () => {
     const sendPresentation = vi.fn();
+    let listener;
     const { session, dispatchIntent } = setup(
       {
-        executeBash: vi.fn(async () => ({
-          output: "hello\n",
-          exitCode: 0,
-          cancelled: false,
-          truncated: true,
-          fullOutputPath: "/tmp/full-bash.log",
-        })),
+        subscribe: vi.fn((nextListener) => {
+          listener = nextListener;
+          return vi.fn();
+        }),
+        executeBash: vi.fn(async (_command, _onChunk, options) => {
+          listener?.({ type: "bash_execution_update", id: options.id, delta: "hello\n" });
+          return {
+            output: "hello\n",
+            exitCode: 0,
+            cancelled: false,
+            truncated: true,
+            fullOutputPath: "/tmp/full-bash.log",
+          };
+        }),
       },
       { sendPresentation },
     );
@@ -1082,31 +1095,59 @@ describe("setupCommandBridge — target intent dispatch", () => {
         }),
       ),
     ).resolves.toMatchObject({ status: "admitted" });
-    await vi.waitFor(() =>
+    await vi.waitFor(() => {
       expect(sendPresentation).toHaveBeenCalledWith(
         expect.objectContaining({
           plane: "transcript",
           payload: expect.objectContaining({
             entries: [
               expect.objectContaining({
-                type: "message_start",
-                message: expect.objectContaining({
-                  role: "bashExecution",
-                  command: "printf hello",
-                  output: "hello\n",
-                  exitCode: 0,
-                  cancelled: false,
-                  truncated: true,
-                  fullOutputPath: "/tmp/full-bash.log",
-                  excludeFromContext: true,
-                }),
+                type: "bash_execution_start",
+                id: "visible-bash",
+                command: "printf hello",
+                excludeFromContext: true,
               }),
             ],
           }),
         }),
-      ),
-    );
+      );
+      expect(sendPresentation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          plane: "transcript",
+          payload: expect.objectContaining({
+            entries: [
+              expect.objectContaining({
+                type: "bash_execution_update",
+                id: "visible-bash",
+                delta: "hello\n",
+              }),
+            ],
+          }),
+        }),
+      );
+      expect(sendPresentation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          plane: "transcript",
+          payload: expect.objectContaining({
+            entries: [
+              expect.objectContaining({
+                type: "bash_execution_end",
+                id: "visible-bash",
+                command: "printf hello",
+                output: "hello\n",
+                exitCode: 0,
+                cancelled: false,
+                truncated: true,
+                fullOutputPath: "/tmp/full-bash.log",
+                excludeFromContext: true,
+              }),
+            ],
+          }),
+        }),
+      );
+    });
     expect(session.executeBash).toHaveBeenCalledWith("printf hello", undefined, {
+      id: "visible-bash",
       excludeFromContext: true,
     });
   });
@@ -1599,6 +1640,30 @@ describe("setupCommandBridge — target intent dispatch", () => {
     expect(session.prompt).not.toHaveBeenCalled();
   });
 
+  it("round-trips model-scope patterns containing whitespace and commas", async () => {
+    const enabledIds = ["anthropic/claude-x", "Old Claude, Model"];
+    const { session, dispatchIntent } = setup({
+      modelRuntime: {
+        getAvailable: vi.fn(async () => [{ provider: "anthropic", id: "claude-x" }]),
+      },
+    });
+
+    await expect(
+      dispatchIntent(
+        envelope("encoded-model-scope", {
+          kind: "invokeCommand",
+          text: `/models save --json ${JSON.stringify(enabledIds)}`,
+          editorRevision: 0,
+        }),
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() =>
+      expect(session.settingsManager.setEnabledModels).toHaveBeenCalledWith(enabledIds),
+    );
+    expect(session.setScopedModels).toHaveBeenCalledWith([]);
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
   it("derives default export names from the canonical presented session file", async () => {
     const runtimePin = "/sessions/.pivis-session-42-runtime.runtime-pin";
     const canonicalSessionFile = "/sessions/canonical-source.jsonl";
@@ -1884,6 +1949,119 @@ describe("setupCommandBridge — command mapping", () => {
     expect(res.success).toBe(true);
   });
 
+  it("preserves unavailable saved model patterns for display and removal", async () => {
+    const available = [
+      { provider: "anthropic", id: "claude-x", name: "Claude X" },
+      { provider: "openai", id: "gpt-5", name: "GPT-5" },
+    ];
+    const { run } = setup({
+      modelRuntime: {
+        getAvailable: vi.fn(async () => available),
+        refresh: vi.fn(async () => {}),
+      },
+      settingsManager: {
+        setEnabledModels: vi.fn(),
+        getEnabledModels: vi.fn(() => ["anthropic/claude-x", "retired/model"]),
+      },
+    });
+
+    await expect(run({ type: "get_scoped_models" })).resolves.toMatchObject({
+      success: true,
+      data: {
+        models: available,
+        enabledIds: ["anthropic/claude-x", "retired/model"],
+      },
+    });
+  });
+
+  it("keeps unavailable saved patterns visible behind a session-only scope", async () => {
+    const available = [
+      { provider: "anthropic", id: "claude-x", name: "Claude X" },
+      { provider: "openai", id: "gpt-5", name: "GPT-5" },
+    ];
+    const { session, run } = setup({
+      modelRuntime: {
+        getAvailable: vi.fn(async () => available),
+        refresh: vi.fn(async () => {}),
+      },
+      scopedModels: [{ model: available[1] }],
+      settingsManager: {
+        setEnabledModels: vi.fn(),
+        getEnabledModels: vi.fn(() => ["anthropic/claude-x", "retired/model"]),
+      },
+    });
+
+    await expect(run({ type: "get_scoped_models" })).resolves.toMatchObject({
+      success: true,
+      data: {
+        models: available,
+        enabledIds: ["openai/gpt-5", "retired/model"],
+      },
+    });
+    expect(session.modelRuntime.getAvailable).toHaveBeenCalled();
+  });
+
+  it("uses Pi's public resolver for partial names and only retains genuine no-match patterns", async () => {
+    const available = [
+      { provider: "anthropic", id: "claude-x", name: "Claude X" },
+      { provider: "openai", id: "gpt-5", name: "GPT-5" },
+    ];
+    const { run } = setup({
+      modelRuntime: {
+        getAvailable: vi.fn(async () => available),
+        refresh: vi.fn(async () => {}),
+      },
+      settingsManager: {
+        setEnabledModels: vi.fn(),
+        getEnabledModels: vi.fn(() => ["Claude", "openai/gpt-5:extreme", "retired/model"]),
+      },
+    });
+
+    await expect(run({ type: "get_scoped_models" })).resolves.toMatchObject({
+      success: true,
+      data: {
+        models: available,
+        enabledIds: ["anthropic/claude-x", "openai/gpt-5", "retired/model"],
+      },
+    });
+  });
+
+  it("passes the session's real ModelRuntime to Pi's public scope resolver", async () => {
+    const resolver = vi.fn(resolveModelScopeWithDiagnostics);
+    const { session, run } = setup(
+      {
+        settingsManager: {
+          setEnabledModels: vi.fn(),
+          getEnabledModels: vi.fn(() => ["anthropic/claude-x"]),
+        },
+      },
+      { pi: { resolveModelScopeWithDiagnostics: resolver } },
+    );
+
+    await run({ type: "get_scoped_models" });
+
+    expect(resolver).toHaveBeenCalledWith(["anthropic/claude-x"], session.modelRuntime);
+  });
+
+  it("persists an unavailable selection even when every available model is selected", async () => {
+    const available = [
+      { provider: "anthropic", id: "claude-x", name: "Claude X" },
+      { provider: "openai", id: "gpt-5", name: "GPT-5" },
+    ];
+    const { session, run } = setup({
+      modelRuntime: { getAvailable: vi.fn(async () => available) },
+    });
+    const enabledIds = ["anthropic/claude-x", "openai/gpt-5", "retired/model"];
+
+    await expect(run({ type: "save_scoped_models", enabledIds })).resolves.toMatchObject({
+      success: true,
+    });
+    expect(session.settingsManager.setEnabledModels).toHaveBeenCalledWith(enabledIds);
+    // Unavailable persisted patterns must not make the live session treat
+    // "all available" as a restrictive scope.
+    expect(session.setScopedModels).toHaveBeenCalledWith([]);
+  });
+
   it("get_available_models returns scoped subset when scopedModels is set", async () => {
     const { session, run } = setup();
     // Simulate pi's AgentSession after setScopedModels was applied: the
@@ -1929,6 +2107,32 @@ describe("setupCommandBridge — command mapping", () => {
     expect(res.success).toBe(true);
     expect(session.modelRuntime.getAvailable).toHaveBeenCalled();
     expect(res.data.models).toEqual([{ provider: "anthropic", id: "claude-x", name: "Claude X" }]);
+  });
+
+  it("get_available_models preserves Pi's configured pattern order", async () => {
+    const { run } = setup({
+      modelRuntime: {
+        getAvailable: vi.fn(async () => [
+          { provider: "anthropic", id: "claude-x", name: "Claude X" },
+          { provider: "openai", id: "gpt-5", name: "GPT-5" },
+          { provider: "google", id: "gemini", name: "Gemini" },
+        ]),
+      },
+      settingsManager: {
+        setEnabledModels: vi.fn(),
+        getEnabledModels: vi.fn(() => ["openai/gpt-5", "anthropic/claude-x"]),
+      },
+    });
+
+    await expect(run({ type: "get_available_models" })).resolves.toMatchObject({
+      success: true,
+      data: {
+        models: [
+          { provider: "openai", id: "gpt-5", name: "GPT-5" },
+          { provider: "anthropic", id: "claude-x", name: "Claude X" },
+        ],
+      },
+    });
   });
 
   it("strips Pi 0.80.6's :max suffix from saved model-scope patterns", async () => {
@@ -2046,6 +2250,9 @@ describe("setupCommandBridge — command mapping", () => {
         getRegisteredCommands: vi.fn(() => []),
         getMessageRenderer,
       },
+      settingsManager: {
+        getOutputPad: vi.fn(() => 3),
+      },
     });
 
     const res = await run({
@@ -2061,7 +2268,7 @@ describe("setupCommandBridge — command mapping", () => {
       data: { rendered: true, ansi: "\u001b[32mIndexed files: 17\u001b[0m" },
     });
     expect(getMessageRenderer).toHaveBeenCalledWith("status-card");
-    expect(renderer).toHaveBeenCalledWith(message, { expanded: true }, undefined);
+    expect(renderer).toHaveBeenCalledWith(message, { expanded: true, outputPad: 3 }, undefined);
     expect(render).toHaveBeenCalledWith(96);
     expect(dispose).toHaveBeenCalledTimes(1);
   });
@@ -2216,10 +2423,10 @@ describe("setupCommandBridge — command mapping", () => {
     expect(session.compact).toHaveBeenCalledWith("be brief");
   });
 
-  it("bash calls executeBash(command, undefined, {}) and returns the full result", async () => {
+  it("bash passes its request id for streaming updates and returns the full result", async () => {
     const { session, run } = setup();
     const res = await run({ type: "bash", command: "ls" });
-    expect(session.executeBash).toHaveBeenCalledWith("ls", undefined, {});
+    expect(session.executeBash).toHaveBeenCalledWith("ls", undefined, { id: "cmd-1" });
     expect(res.data).toMatchObject({ output: "ok", exitCode: 0 });
   });
 
@@ -2796,7 +3003,7 @@ describe("assertHostCapabilities", () => {
   it("passes for a complete session + runtime", () => {
     const session = makeSession();
     const runtime = makeRuntime(session);
-    expect(() => assertHostCapabilities(session, runtime)).not.toThrow();
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).not.toThrow();
   });
 
   it("passes with Pi 0.80.6's complete public model registry", () => {
@@ -2814,7 +3021,7 @@ describe("assertHostCapabilities", () => {
       },
     });
     const runtime = makeRuntime(session);
-    expect(() => assertHostCapabilities(session, runtime)).not.toThrow();
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).not.toThrow();
   });
 
   it("throws listing the missing method when pi renames a session method", () => {
@@ -2822,21 +3029,25 @@ describe("assertHostCapabilities", () => {
     // Simulate a future pi that renamed executeBash.
     session.executeBash = undefined;
     const runtime = makeRuntime(session);
-    expect(() => assertHostCapabilities(session, runtime)).toThrow(/session\.executeBash/);
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
+      /session\.executeBash/,
+    );
   });
 
   it("throws when a runtime lifecycle method is missing", () => {
     const session = makeSession();
     const runtime = makeRuntime(session);
     runtime.setRebindSession = undefined;
-    expect(() => assertHostCapabilities(session, runtime)).toThrow(/runtime\.setRebindSession/);
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
+      /runtime\.setRebindSession/,
+    );
   });
 
   it("throws when the state authority command lookup is missing", () => {
     const session = makeSession();
     session.extensionRunner.getCommand = undefined;
     const runtime = makeRuntime(session);
-    expect(() => assertHostCapabilities(session, runtime)).toThrow(
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
       /session\.extensionRunner\.getCommand/,
     );
   });
@@ -2845,6 +3056,16 @@ describe("assertHostCapabilities", () => {
     const session = makeSession();
     delete session.thinkingLevel;
     const runtime = makeRuntime(session);
-    expect(() => assertHostCapabilities(session, runtime)).toThrow(/session\.thinkingLevel/);
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
+      /session\.thinkingLevel/,
+    );
+  });
+
+  it("throws when Pi's public model-scope resolver is missing", () => {
+    const session = makeSession();
+    const runtime = makeRuntime(session);
+    expect(() => assertHostCapabilities(session, runtime, {})).toThrow(
+      /pi\.resolveModelScopeWithDiagnostics/,
+    );
   });
 });

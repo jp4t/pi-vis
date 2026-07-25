@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ThinkingLevelSchema } from "./thinking.js";
+import { PiUsageSchema } from "./usage.js";
 
 // Minimal passthrough schema for wire AgentMessage objects embedded in events.
 // Content arrays contain text/thinking/toolCall blocks — modeled as passthrough
@@ -199,6 +200,7 @@ export const CompactionEndEventSchema = z.object({
       firstKeptEntryId: z.string().optional(),
       tokensBefore: z.number().optional(),
       estimatedTokensAfter: z.number().optional(),
+      usage: PiUsageSchema.optional(),
     })
     .passthrough()
     .optional(),
@@ -220,6 +222,53 @@ export const AutoRetryEndEventSchema = z.object({
   success: z.boolean(),
   attempt: z.number().optional(),
   finalError: z.string().optional(),
+});
+
+export const SummarizationRetryScheduledEventSchema = z.object({
+  type: z.literal("summarization_retry_scheduled"),
+  attempt: z.number(),
+  maxAttempts: z.number(),
+  delayMs: z.number(),
+  errorMessage: z.string(),
+});
+
+export const SummarizationRetryAttemptStartEventSchema = z.object({
+  type: z.literal("summarization_retry_attempt_start"),
+  source: z.enum(["branchSummary", "compaction"]),
+  reason: z.enum(["manual", "threshold", "overflow"]).optional(),
+});
+
+export const SummarizationRetryFinishedEventSchema = z.object({
+  type: z.literal("summarization_retry_finished"),
+});
+
+// Pi 0.82 emits the update variant from AgentSession.executeBash(). Pi-Vis
+// brackets it with start/end records so the native transcript has a complete,
+// correlated streaming lifecycle rather than waiting for final persistence.
+export const BashExecutionStartEventSchema = z.object({
+  type: z.literal("bash_execution_start"),
+  id: z.string(),
+  command: z.string(),
+  excludeFromContext: z.boolean().optional(),
+});
+
+export const BashExecutionUpdateEventSchema = z.object({
+  type: z.literal("bash_execution_update"),
+  id: z.string().optional(),
+  delta: z.string(),
+});
+
+export const BashExecutionEndEventSchema = z.object({
+  type: z.literal("bash_execution_end"),
+  id: z.string(),
+  command: z.string(),
+  output: z.string(),
+  exitCode: z.number().optional(),
+  cancelled: z.boolean().optional(),
+  truncated: z.boolean().optional(),
+  fullOutputPath: z.string().optional(),
+  excludeFromContext: z.boolean().optional(),
+  errorMessage: z.string().optional(),
 });
 
 export const ThinkingLevelChangedEventSchema = z.object({
@@ -288,6 +337,12 @@ const KnownPiEventSchema = z.discriminatedUnion("type", [
   CompactionEndEventSchema,
   AutoRetryStartEventSchema,
   AutoRetryEndEventSchema,
+  SummarizationRetryScheduledEventSchema,
+  SummarizationRetryAttemptStartEventSchema,
+  SummarizationRetryFinishedEventSchema,
+  BashExecutionStartEventSchema,
+  BashExecutionUpdateEventSchema,
+  BashExecutionEndEventSchema,
   ThinkingLevelChangedEventSchema,
   EntryAppendedEventSchema,
   CacheMissNoticeEventSchema,

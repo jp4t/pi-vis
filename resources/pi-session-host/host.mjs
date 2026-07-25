@@ -27,8 +27,9 @@
  *   { type: "panel_clear_all" }
  *   { type: "response", id, success, data?, error? }
  *
- * All imports are from the pinned pi bundled with the app (resolved via piPath), and
- * only its PUBLIC surface — zero non-exported pi imports (enforced by
+ * All imports are from the pinned pi bundled with the app (resolved via
+ * piPath). The host uses Pi's public surface except for the one exact-version,
+ * exact-shape llama.cpp built-in adapter in pinned-pi-private.mjs (enforced by
  * src/main/pi/host-imports.test.ts).
  */
 
@@ -45,6 +46,7 @@ import {
 import { assertHostCapabilities, setupCommandBridge } from "./bridge.mjs";
 import { buildEditorTheme } from "./editor-theme.mjs";
 import { createPanelReconstruction } from "./panel-reconstruction.mjs";
+import { importPinnedLlamaExtension } from "./pinned-pi-private.mjs";
 import {
   canonicalizeConfinedSessionLineage,
   canonicalizeConfinedSessionStartEvent,
@@ -410,7 +412,8 @@ let initialized = false;
 import { compareVersions } from "./version.mjs";
 
 // preflightResult is a public AgentSession.prompt option in Pi 0.80.6.
-// Keep the SDK host on that documented surface; no private pi imports.
+// Keep prompt admission on that documented surface; the isolated llama.cpp
+// adapter is the host's only private Pi dependency.
 const MIN_PI_VERSION = "0.80.6";
 
 function checkMinVersion(pi, piPath) {
@@ -490,6 +493,16 @@ async function handleInit(msg) {
     const baseTheme = initHostTheme(pi, process.env.PIVIS_PI_THEME || undefined);
     let theme = baseTheme;
     const capabilityDiagnostics = [];
+    let pinnedLlamaExtension;
+    try {
+      pinnedLlamaExtension = await importPinnedLlamaExtension(piPath, pi.VERSION);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      const diagnostic =
+        "Local llama.cpp management is unavailable for the pinned Pi runtime; reinstall Pi-Vis or report a compatibility regression.";
+      capabilityDiagnostics.push(diagnostic);
+      console.error(`[pi-session-host] ${diagnostic} ${detail}`);
+    }
     const paletteJson = process.env.PIVIS_PI_THEME_COLORS;
     if (paletteJson) {
       try {
@@ -579,6 +592,9 @@ async function handleInit(msg) {
       const services = await pi.createAgentSessionServices({
         cwd: sc,
         agentDir: ad,
+        ...(pinnedLlamaExtension
+          ? { resourceLoaderOptions: { extensionFactories: [pinnedLlamaExtension] } }
+          : {}),
         resourceLoaderReloadOptions: { resolveProjectTrust: resolveTrust },
       });
       // Preserve explicit model/thinking metadata even when the active branch
@@ -616,7 +632,7 @@ async function handleInit(msg) {
 
     // Fail fast if this pi version does not expose the SDK surface the bridge
     // relies on, instead of crashing later.
-    assertHostCapabilities(session, runtime);
+    assertHostCapabilities(session, runtime, pi);
 
     // Step 5: Create ExtensionUIContext
     // pi-tui's base Editor needs an EditorTheme ({ borderColor, selectList }),

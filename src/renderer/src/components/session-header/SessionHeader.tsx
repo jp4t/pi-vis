@@ -1,6 +1,7 @@
 import type { SessionId } from "@shared/ids.js";
 import type { ModelInfo, SessionStats } from "@shared/pi-protocol/responses.js";
 import { ModelInfoSchema, SessionStatsSchema } from "@shared/pi-protocol/responses.js";
+import type { IntentOutcome } from "@shared/pi-protocol/runtime-state.js";
 import { THINKING_LEVELS, type ThinkingLevel } from "@shared/pi-protocol/thinking.js";
 import type React from "react";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -83,6 +84,22 @@ export function shouldRefreshSessionStats(events: readonly { type: string }[]): 
   return events.some((event) => event.type === "agent_end" || event.type === "compaction_end");
 }
 
+export function latestSummarizedNavigationKey(
+  outcomes: readonly IntentOutcome[],
+): string | undefined {
+  for (let index = outcomes.length - 1; index >= 0; index--) {
+    const outcome = outcomes[index];
+    if (
+      outcome?.kind === "navigate" &&
+      outcome.state === "completed" &&
+      outcome.result?.summarized === true
+    ) {
+      return `${outcome.owner.hostInstanceId}:${outcome.owner.sessionEpoch}:${outcome.intentId}`;
+    }
+  }
+  return undefined;
+}
+
 /** Mirror pi-ai's getSupportedThinkingLevels without importing pi internals. */
 export function thinkingLevelsForModel(model?: ModelInfo): readonly ThinkingLevel[] {
   if (model?.reasoning === false) return ["off"];
@@ -135,6 +152,10 @@ export function SessionHeader({ sessionId }: SessionHeaderProps): React.ReactEle
         : undefined,
     [readHostInstanceId, readSessionEpoch],
   );
+  const summarizedNavigationKey = latestSummarizedNavigationKey(
+    authorityProjection?.authoritativeSnapshot?.recentIntentOutcomes ?? [],
+  );
+  const lastSummarizedNavigationKey = useRef(summarizedNavigationKey);
 
   useEffect(() => {
     if (!live || !readObservation) return;
@@ -192,6 +213,19 @@ export function SessionHeader({ sessionId }: SessionHeaderProps): React.ReactEle
     const interval = setInterval(() => fetchStats(readObservation), 60_000);
     return () => clearInterval(interval);
   }, [fetchStats, live, readObservation]);
+
+  useEffect(() => {
+    if (
+      !live ||
+      !readObservation ||
+      !summarizedNavigationKey ||
+      summarizedNavigationKey === lastSummarizedNavigationKey.current
+    ) {
+      return;
+    }
+    lastSummarizedNavigationKey.current = summarizedNavigationKey;
+    fetchStats(readObservation);
+  }, [fetchStats, live, readObservation, summarizedNavigationKey]);
 
   useEffect(() => {
     return window.pivis.on("session.events", ({ sessionId: sid, events }) => {
@@ -636,8 +670,8 @@ export function SessionControls({
         ? `${currentModel}${currentProvider ? ` [${currentProvider}]` : ""}`
         : "model";
   const thinkingOptions = useMemo(
-    () => thinkingLevelsForModel(currentModelInfo),
-    [currentModelInfo],
+    () => semanticSnapshot?.availableThinkingLevels ?? thinkingLevelsForModel(currentModelInfo),
+    [currentModelInfo, semanticSnapshot?.availableThinkingLevels],
   );
   const thinkingDisabled = thinkingOptions.length <= 1;
   const selectedThinkingIndex = Math.max(0, thinkingOptions.indexOf(currentThinkingLevel ?? "off"));

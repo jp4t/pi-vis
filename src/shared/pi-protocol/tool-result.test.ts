@@ -2,6 +2,15 @@ import { describe, expect, it } from "vitest";
 import { TOOL_RESULT_TEXT_SEPARATOR, extractToolResult } from "./tool-result.js";
 
 describe("extractToolResult", () => {
+  const usage = {
+    input: 100,
+    output: 20,
+    cacheRead: 5,
+    cacheWrite: 2,
+    totalTokens: 127,
+    cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2, total: 3.3 },
+  };
+
   it("keeps live and persisted content snapshots at the same helper boundary", () => {
     const result = {
       content: [
@@ -158,6 +167,14 @@ describe("extractToolResult", () => {
       hasDetails: true,
       diff: undefined,
       patch: undefined,
+      metadata: undefined,
+    });
+  });
+
+  it("keeps Pi 0.81 tool usage out of generic metadata", () => {
+    expect(extractToolResult({ content: [{ type: "text", text: "done" }], usage })).toMatchObject({
+      text: "done",
+      usage,
       metadata: undefined,
     });
   });

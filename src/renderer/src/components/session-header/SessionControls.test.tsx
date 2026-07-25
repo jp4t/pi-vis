@@ -160,6 +160,37 @@ describe("SessionControls dropdown toggles", () => {
     unmount();
   });
 
+  it("uses Pi's public runtime thinking-level constraints when projected", () => {
+    setSession();
+    useSessionsStore.setState((state) => {
+      const sessions = new Map(state.sessions);
+      const session = sessions.get(sessionId)!;
+      sessions.set(sessionId, {
+        ...session,
+        authorityProjection: {
+          ...session.authorityProjection!,
+          authoritativeSnapshot: {
+            ...session.authorityProjection!.authoritativeSnapshot!,
+            availableThinkingLevels: ["off", "max"],
+          },
+        },
+      });
+      return { sessions };
+    });
+
+    const { container, unmount } = mount(<SessionControls sessionId={sessionId} />);
+    const trigger = container.querySelector<HTMLButtonElement>(
+      ".session-header__thinking > .session-header__picker-btn",
+    );
+    pointerClick(trigger!);
+    expect(
+      [
+        ...container.querySelectorAll(".session-header__thinking .session-header__dropdown-item"),
+      ].map((item) => item.textContent),
+    ).toEqual(["off", "max"]);
+    unmount();
+  });
+
   it("shares one thinking highlight across selection, pointer, and DOM focus", () => {
     setSession();
     const { container, unmount } = mount(<SessionControls sessionId={sessionId} />);
