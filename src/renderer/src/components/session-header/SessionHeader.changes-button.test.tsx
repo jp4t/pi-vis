@@ -148,6 +148,46 @@ describe("ChangesButton badge failure presentation", () => {
     vi.useRealTimers();
   });
 
+  it("refreshes after a direct Shell Turn settles on the authority transcript plane", async () => {
+    vi.useFakeTimers();
+    const view = mount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    invoke.mockClear();
+
+    const owner = { hostInstanceId: "host", sessionEpoch: 1 };
+    act(() => {
+      publicationListener?.({
+        sessionId: SID,
+        rendererGeneration: 1,
+        publicationSequence: 1,
+        plane: "transcript",
+        owner,
+        payload: {
+          kind: "delta",
+          cursor: { ...owner, transportSequence: 1, snapshotSequence: 1 },
+          liveTailCursor: "1",
+          entries: [
+            {
+              type: "bash_execution_end",
+              id: "shell",
+              command: "touch changed-by-shell-turn",
+              output: "",
+            },
+          ],
+        },
+      });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(invoke).toHaveBeenCalledWith("git.changesCount", { root: WORKSPACE });
+    view.unmount();
+    vi.useRealTimers();
+  });
+
   it("still hides for a non-repo workspace and while the badge is loading", () => {
     act(() => {
       useDiffStore.setState({ badge: null, badgeKind: "not-a-repo" });

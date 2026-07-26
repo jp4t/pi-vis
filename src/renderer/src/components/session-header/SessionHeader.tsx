@@ -1208,24 +1208,32 @@ export function ChangesButton({ sessionId }: { sessionId: SessionId }): React.Re
   const badgeKind = useDiffStore((s) => s.badgeKind);
   const refreshBadge = useDiffStore((s) => s.refreshBadge);
 
-  // Refresh on session live, agent_end, every tool call, and window
-  // focus. Runtime hosts publish events on the sequenced transcript plane;
-  // retain the legacy listener for compatibility only. Refreshing after each
-  // tool_execution_end keeps the changed-file count live as the agent edits
-  // files; refreshBadge is debounced so a burst collapses into one git scan.
+  // Refresh on session live, agent_end, every completed agent tool or direct
+  // Shell Turn, and window focus. Runtime hosts publish events on the
+  // sequenced transcript plane; retain the legacy listener for compatibility
+  // only. refreshBadge is debounced so a burst collapses into one git scan.
   useEffect(() => {
     if (!live || !root) return;
     void refreshBadge(root);
 
     const shouldRefresh = (events: readonly { type: string }[]): boolean =>
-      events.some((event) => event.type === "agent_end" || event.type === "tool_execution_end");
+      events.some(
+        (event) =>
+          event.type === "agent_end" ||
+          event.type === "tool_execution_end" ||
+          event.type === "bash_execution_end",
+      );
     const unsubEvent = window.pivis.on("session.events", ({ sessionId: sid, events }) => {
       if (sid === sessionId && shouldRefresh(events)) void refreshBadge(root);
     });
     const unsubPublication = window.pivis.on("session.publication", (publication) => {
       if (
         publication.sessionId === sessionId &&
-        transcriptPublicationIncludes(publication, ["agent_end", "tool_execution_end"])
+        transcriptPublicationIncludes(publication, [
+          "agent_end",
+          "tool_execution_end",
+          "bash_execution_end",
+        ])
       ) {
         void refreshBadge(root);
       }
