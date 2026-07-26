@@ -3193,6 +3193,141 @@ export class SessionRegistry {
     record._mutationSequence++;
   }
 
+  async sendShellInput(
+    sessionId: SessionId,
+    expectedHostInstanceId: string,
+    expectedSessionEpoch: number,
+    executionId: string,
+    sequence: number,
+    data: string,
+  ): Promise<{
+    accepted: boolean;
+    acknowledgedThrough: number;
+    gap?: { expected: number; received: number };
+  }> {
+    const record = this.sessions.get(sessionId);
+    if (
+      !record ||
+      record._closing ||
+      record._dead ||
+      record.availability !== "available" ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false, acknowledgedThrough: 0 };
+    }
+    const proc = record.proc;
+    const result = await proc.sendShellInput(executionId, sequence, data);
+    if (
+      this.sessions.get(sessionId) !== record ||
+      record.proc !== proc ||
+      record._closing ||
+      record._dead ||
+      record.availability !== "available" ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false, acknowledgedThrough: 0 };
+    }
+    if (result.accepted) record._mutationSequence++;
+    return result;
+  }
+
+  async resizeShell(
+    sessionId: SessionId,
+    expectedHostInstanceId: string,
+    expectedSessionEpoch: number,
+    executionId: string,
+    revision: number,
+    cols: number,
+    rows: number,
+  ): Promise<{ accepted: boolean }> {
+    const record = this.sessions.get(sessionId);
+    if (
+      !record ||
+      record._closing ||
+      record._dead ||
+      record.availability !== "available" ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false };
+    }
+    const proc = record.proc;
+    const accepted = await proc.sendShellResize(executionId, revision, cols, rows);
+    if (
+      this.sessions.get(sessionId) !== record ||
+      record.proc !== proc ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false };
+    }
+    if (accepted) record._mutationSequence++;
+    return { accepted };
+  }
+
+  async signalShell(
+    sessionId: SessionId,
+    expectedHostInstanceId: string,
+    expectedSessionEpoch: number,
+    executionId: string,
+    signal: "interrupt" | "kill",
+  ): Promise<{ accepted: boolean }> {
+    const record = this.sessions.get(sessionId);
+    if (
+      !record ||
+      record._closing ||
+      record._dead ||
+      record.availability !== "available" ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false };
+    }
+    const proc = record.proc;
+    const accepted = await proc.sendShellSignal(executionId, signal);
+    if (
+      this.sessions.get(sessionId) !== record ||
+      record.proc !== proc ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false };
+    }
+    if (accepted) record._mutationSequence++;
+    return { accepted };
+  }
+
+  async acknowledgeShellReconstruction(
+    sessionId: SessionId,
+    expectedHostInstanceId: string,
+    expectedSessionEpoch: number,
+    executionId: string,
+    reconstructionFenceToken: number,
+    outputThroughSequence: number,
+  ): Promise<{ accepted: boolean }> {
+    const record = this.sessions.get(sessionId);
+    if (
+      !record ||
+      record._closing ||
+      record._dead ||
+      record.availability !== "available" ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false };
+    }
+    const proc = record.proc;
+    const accepted = await proc.acknowledgeShellReconstruction(
+      executionId,
+      reconstructionFenceToken,
+      outputThroughSequence,
+    );
+    if (
+      this.sessions.get(sessionId) !== record ||
+      record.proc !== proc ||
+      !this.matchesExpectedRuntime(record, expectedHostInstanceId, expectedSessionEpoch)
+    ) {
+      return { accepted: false };
+    }
+    if (accepted) record._mutationSequence++;
+    return { accepted };
+  }
+
   async executeReload(
     sessionId: SessionId,
     requestInput: ReloadRequest,

@@ -201,7 +201,11 @@ describe("Composer intent execution — prompts and effects", () => {
       })) as NonNullable<ExecuteDeps["dispatch"]>,
     });
     await expect(
-      executeAction(SID, { kind: "bash", command: "pwd", excludeFromContext: false }, deps),
+      executeAction(
+        SID,
+        { kind: "bash", command: "pwd", excludeFromContext: false, editorText: "!pwd" },
+        deps,
+      ),
     ).rejects.toBeInstanceOf(InputNotConsumedError);
     expect(deps.dispatch).toHaveBeenCalledTimes(1);
     expect(deps.awaitIntentOutcome).not.toHaveBeenCalled();
@@ -235,12 +239,122 @@ describe("Composer intent execution — prompts and effects", () => {
     expect(deps.addUserMessage).not.toHaveBeenCalled();
   });
 
-  it("runs bash through runBash and does not fabricate transcript output from admission", async () => {
+  it("explains a foreground Shell Turn busy refusal without awaiting or fabricating work", async () => {
+    const { deps } = depsFor({
+      dispatch: vi.fn(async (_sid, _intent, intentId) => ({
+        status: "not_admitted" as const,
+        intentId: intentId!,
+        reason: "busy" as const,
+      })) as NonNullable<ExecuteDeps["dispatch"]>,
+    });
+    await expect(
+      executeAction(
+        SID,
+        {
+          kind: "bash",
+          command: "npm init",
+          excludeFromContext: false,
+          editorText: "!npm init",
+        },
+        deps,
+      ),
+    ).rejects.toThrow("shell command was not started");
+    expect(deps.addToast).toHaveBeenCalledWith(
+      SID,
+      "Another session operation is already running; the shell command was not started.",
+      "warning",
+    );
+    expect(deps.awaitIntentOutcome).not.toHaveBeenCalled();
+  });
+
+  it("preserves and explains a Shell Turn rejected after its editor source becomes stale", async () => {
+    const { deps } = depsFor({
+      dispatch: vi.fn(async (_sid, _intent, intentId) => ({
+        status: "not_admitted" as const,
+        intentId: intentId!,
+        reason: "stale_editor" as const,
+      })) as NonNullable<ExecuteDeps["dispatch"]>,
+    });
+    await expect(
+      executeAction(
+        SID,
+        { kind: "bash", command: "pwd", excludeFromContext: false, editorText: "!pwd" },
+        deps,
+      ),
+    ).rejects.toThrow("current draft was preserved");
+    expect(deps.addToast).toHaveBeenCalledWith(
+      SID,
+      "The shell draft changed before it could start; the current draft was preserved.",
+      "warning",
+    );
+    expect(deps.awaitIntentOutcome).not.toHaveBeenCalled();
+  });
+
+  it("preflights the 64 KiB UTF-8 shell command limit without dispatching", async () => {
+    const { deps } = depsFor();
+    const command = "é".repeat(32_769);
+    await expect(
+      executeAction(
+        SID,
+        {
+          kind: "bash",
+          command,
+          excludeFromContext: false,
+          editorText: `!${command}`,
+        },
+        deps,
+      ),
+    ).rejects.toThrow("Shell commands are limited to 64 KiB; the draft was preserved.");
+    expect(deps.addToast).toHaveBeenCalledWith(
+      SID,
+      "Shell commands are limited to 64 KiB; the draft was preserved.",
+      "warning",
+    );
+    expect(deps.dispatch).not.toHaveBeenCalled();
+    expect(deps.awaitIntentOutcome).not.toHaveBeenCalled();
+  });
+
+  it("admits a shell command at exactly 64 KiB UTF-8", async () => {
     const { deps, dispatch } = depsFor();
-    await executeAction(SID, { kind: "bash", command: "ls", excludeFromContext: true }, deps);
+    const command = "é".repeat(32_768);
+    await executeAction(
+      SID,
+      {
+        kind: "bash",
+        command,
+        excludeFromContext: false,
+        editorText: `!${command}`,
+      },
+      deps,
+    );
     expect(dispatch).toHaveBeenCalledWith(
       SID,
-      { kind: "runBash", command: "ls", excludeFromContext: true },
+      expect.objectContaining({
+        kind: "runBash",
+        command,
+        editorRevision: 2,
+        editorText: `!${command}`,
+      }),
+      expect.any(String),
+    );
+  });
+
+  it("runs bash through runBash and does not fabricate transcript output from admission", async () => {
+    const { deps, dispatch } = depsFor();
+    await executeAction(
+      SID,
+      { kind: "bash", command: "ls", excludeFromContext: true, editorText: "!!ls" },
+      deps,
+    );
+    expect(dispatch).toHaveBeenCalledWith(
+      SID,
+      {
+        kind: "runBash",
+        command: "ls",
+        excludeFromContext: true,
+        editorRevision: 2,
+        editorText: "!!ls",
+      },
       expect.any(String),
     );
     expect(deps.addCustomMessage).not.toHaveBeenCalled();

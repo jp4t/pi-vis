@@ -30,6 +30,7 @@
 
 import type { SlashCommandInfo } from "@shared/pi-protocol/responses.js";
 import { BUILTIN_BY_NAME, UNSUPPORTED_TUI_COMMANDS } from "./builtins.js";
+import { classifyShellDraft } from "./shell-draft.js";
 import type { ComposerAction } from "./types.js";
 
 export interface ParseContext {
@@ -44,11 +45,15 @@ export function parseComposerInput(rawText: string, ctx: ParseContext): Composer
   const text = rawText;
 
   // ── 1. Bash ─────────────────────────────────────────────────────────
-  if (text.startsWith("!")) {
-    const isExcluded = text.startsWith("!!");
-    const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
-    if (command) {
-      return { kind: "bash", command, excludeFromContext: isExcluded };
+  const shellDraft = classifyShellDraft(text);
+  if (shellDraft.kind === "shell") {
+    if (shellDraft.runnable) {
+      return {
+        kind: "bash",
+        command: shellDraft.commandText.trim(),
+        excludeFromContext: shellDraft.excludeFromContext,
+        editorText: rawText,
+      };
     }
     // "! " with no command is meaningless; fall through to plain text.
   }

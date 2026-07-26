@@ -516,6 +516,42 @@ export function createUIContext({
     return true;
   }
 
+  /**
+   * Atomically consume an admitted direct Shell Turn from editor authority.
+   * Unlike an ordinary prompt, a Shell Turn owns only its exact `!`/`!!`
+   * command text: attachments and every conflict candidate remain staged for
+   * the next ordinary prompt.
+   */
+  function acceptShellEditorSubmission(request) {
+    if (request.editorRevision !== editorRevision || typeof request.editorText !== "string") {
+      return false;
+    }
+    const pendingAtRevision = [...pendingSubmits.values()].filter(
+      (item) => item.accepted !== true && item.revision === request.editorRevision,
+    );
+    let pending;
+    if (typeof request.intentId === "string") {
+      pending = pendingAtRevision.find((item) => item.submissionIntentId === request.intentId);
+      if (pendingAtRevision.length > 0 && pending === undefined) return false;
+    } else if (pendingAtRevision.length > 0) {
+      const exactTextMatches = pendingAtRevision.filter((item) => item.text === request.editorText);
+      if (exactTextMatches.length === 1) pending = exactTextMatches[0];
+      else return false;
+    }
+    const authoritativeEditorText = pending?.text ?? editorText;
+    if (authoritativeEditorText !== request.editorText) return false;
+
+    editorRevision++;
+    editorText = "";
+    if (unifiedTuiState) {
+      unifiedTuiState.editor.setText("");
+      unifiedTuiState.tui.requestRender();
+      maybeDisposeUnifiedTui();
+    }
+    if (pending) pending.accepted = true;
+    return true;
+  }
+
   function applyEditorPatch({
     baseRevision,
     revision,
@@ -1793,6 +1829,7 @@ export function createUIContext({
       addCapabilityDiagnostic,
       editorSnapshot,
       acceptEditorSubmission,
+      acceptShellEditorSubmission,
       applyEditorPatch,
       pendingUnifiedSubmissions: () =>
         [...pendingSubmits].map(([id, value]) => ({

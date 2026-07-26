@@ -14,6 +14,7 @@ import {
   BUILTIN_COMMANDS,
   InputNotConsumedError,
   type PickerRequest,
+  classifyShellDraft,
   executeAction,
   parseComposerInput,
 } from "../../lib/commands/index.js";
@@ -55,6 +56,9 @@ import "./Composer.css";
 
 interface ComposerProps {
   sessionId: SessionId;
+  /** Keep the Composer-sized slot stable while an admitted Shell Turn is in
+   * its brief viewport reveal grace period. */
+  suspended?: boolean;
 }
 
 type FileWithLegacyPath = File & { path?: string };
@@ -62,6 +66,7 @@ type FileWithLegacyPath = File & { path?: string };
 const IMAGE_FILE_EXTENSION = /\.(?:avif|bmp|gif|heic|heif|jpe?g|png|svg|webp)$/i;
 const MAX_IMAGE_ATTACHMENTS = 8;
 const SUCCESSOR_AUTHORITY_TIMEOUT_MS = 15_000;
+const EMPTY_SHELL_VALIDATION_MS = 1_600;
 type QueueDeliveryMode = "steer" | "followUp";
 
 function runtimeIdentityMatches(left: RuntimeIdentity, right: RuntimeIdentity): boolean {
@@ -170,6 +175,152 @@ function fileAttachmentsFromEditorText(text: string): FileAttachment[] | null {
   return lines.map((path) => ({ path, name: nameFromPath(path) }));
 }
 
+interface ShellPointerMirror {
+  text: string;
+  prefixLength: number;
+  textarea: HTMLTextAreaElement;
+  element: HTMLDivElement;
+  lineHeight: number;
+}
+
+interface ShellPrefixPointerDrag {
+  pointerId: number;
+  anchor: number;
+  mirror: ShellPointerMirror;
+  prefixElement: HTMLSpanElement;
+  clientX: number;
+  clientY: number;
+  animationFrame?: number | undefined;
+}
+
+function createShellPointerMirror(
+  textarea: HTMLTextAreaElement,
+  text: string,
+  prefixLength: number,
+): ShellPointerMirror {
+  const style = getComputedStyle(textarea);
+  const bounds = textarea.getBoundingClientRect();
+  const fontSize = Number.parseFloat(style.fontSize) || 14;
+  const lineHeight = Number.parseFloat(style.lineHeight) || fontSize * 1.5;
+  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+  const paddingRight = Number.parseFloat(style.paddingRight) || 0;
+  const paddingTop = Number.parseFloat(style.paddingTop) || 0;
+  const borderLeft = Number.parseFloat(style.borderLeftWidth) || 0;
+  const borderTop = Number.parseFloat(style.borderTopWidth) || 0;
+  const contentWidth = Math.max(1, textarea.clientWidth - paddingLeft - paddingRight);
+  const mirror = document.createElement("div");
+  mirror.setAttribute("aria-hidden", "true");
+  mirror.textContent = `${text}\u200b`;
+  Object.assign(mirror.style, {
+    position: "fixed",
+    zIndex: "2147483647",
+    opacity: "0",
+    pointerEvents: "auto",
+    userSelect: "text",
+    margin: "0",
+    padding: "0",
+    border: "0",
+    whiteSpace: "pre-wrap",
+    overflowWrap: style.overflowWrap,
+    wordBreak: style.wordBreak,
+    fontFamily: style.fontFamily,
+    fontSize: style.fontSize,
+    fontStyle: style.fontStyle,
+    fontWeight: style.fontWeight,
+    letterSpacing: style.letterSpacing,
+    lineHeight: style.lineHeight,
+    textAlign: style.textAlign,
+    textIndent: style.textIndent,
+    textTransform: style.textTransform,
+    direction: style.direction,
+    tabSize: style.tabSize,
+    width: `${contentWidth}px`,
+    minHeight: `${lineHeight}px`,
+    left: `${bounds.left + borderLeft + paddingLeft - textarea.scrollLeft}px`,
+    top: `${bounds.top + borderTop + paddingTop - textarea.scrollTop}px`,
+  });
+  document.body.append(mirror);
+  return { text, prefixLength, textarea, element: mirror, lineHeight };
+}
+
+function shellMirrorOffset(
+  mirror: HTMLElement,
+  textLength: number,
+  clientX: number,
+  clientY: number,
+): number | undefined {
+  const documentWithCaretRange = document as Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null;
+  };
+  const caretPosition = document.caretPositionFromPoint?.(clientX, clientY);
+  const node = caretPosition?.offsetNode;
+  const offset = caretPosition?.offset;
+  const caretRange = node
+    ? undefined
+    : (documentWithCaretRange.caretRangeFromPoint?.(clientX, clientY) ?? undefined);
+  const targetNode = node ?? caretRange?.startContainer;
+  const targetOffset = offset ?? caretRange?.startOffset;
+  if (
+    !targetNode ||
+    targetOffset === undefined ||
+    (targetNode !== mirror && !mirror.contains(targetNode))
+  ) {
+    return undefined;
+  }
+  const range = document.createRange();
+  range.selectNodeContents(mirror);
+  range.setEnd(targetNode, targetOffset);
+  return Math.min(textLength, range.toString().length);
+}
+
+function shellTextareaPositionAtPoint(
+  mirror: ShellPointerMirror,
+  clientX: number,
+  clientY: number,
+): number {
+  const { textarea } = mirror;
+  const style = getComputedStyle(textarea);
+  const bounds = textarea.getBoundingClientRect();
+  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+  const paddingRight = Number.parseFloat(style.paddingRight) || 0;
+  const paddingTop = Number.parseFloat(style.paddingTop) || 0;
+  const paddingBottom = Number.parseFloat(style.paddingBottom) || 0;
+  const borderLeft = Number.parseFloat(style.borderLeftWidth) || 0;
+  const borderRight = Number.parseFloat(style.borderRightWidth) || 0;
+  const borderTop = Number.parseFloat(style.borderTopWidth) || 0;
+  const borderBottom = Number.parseFloat(style.borderBottomWidth) || 0;
+
+  // Match native textarea autoscroll for a drag that started on the overlaid
+  // prefix. Scroll before hit-testing so a stationary pointer just beyond an
+  // edge continues selecting through previously hidden wrapped lines as move
+  // events arrive.
+  if (clientY < bounds.top) {
+    textarea.scrollTop = Math.max(
+      0,
+      textarea.scrollTop - Math.max(mirror.lineHeight, bounds.top - clientY),
+    );
+  } else if (clientY > bounds.bottom) {
+    textarea.scrollTop = Math.min(
+      textarea.scrollHeight - textarea.clientHeight,
+      textarea.scrollTop + Math.max(mirror.lineHeight, clientY - bounds.bottom),
+    );
+  }
+
+  const contentLeft = bounds.left + borderLeft + paddingLeft;
+  const contentRight = bounds.right - borderRight - paddingRight;
+  const contentTop = bounds.top + borderTop + paddingTop;
+  const contentBottom = bounds.bottom - borderBottom - paddingBottom;
+  mirror.element.style.left = `${contentLeft - textarea.scrollLeft}px`;
+  mirror.element.style.top = `${contentTop - textarea.scrollTop}px`;
+  const queryX = Math.min(Math.max(clientX, contentLeft + 0.5), contentRight - 0.5);
+  const queryY = Math.min(Math.max(clientY, contentTop + 0.5), contentBottom - 0.5);
+  const position = shellMirrorOffset(mirror.element, mirror.text.length, queryX, queryY);
+  if (position !== undefined) return position;
+  if (clientY < contentTop) return 0;
+  if (clientY > contentBottom) return mirror.text.length;
+  return clientX <= contentLeft ? mirror.prefixLength : mirror.text.length;
+}
+
 interface SuggestionEntry {
   name: string;
   badge: "built-in" | "extension" | "prompt" | "skill";
@@ -195,7 +346,7 @@ interface SuggestionEntry {
  * bash work without a model selected, because they're not asking the
  * LLM for anything.
  */
-export function Composer({ sessionId }: ComposerProps): React.ReactElement {
+export function Composer({ sessionId, suspended = false }: ComposerProps): React.ReactElement {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const renderedSessionIdRef = useRef(sessionId);
@@ -209,6 +360,11 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
   }, []);
   const [text, setText] = useState("");
   const textRef = useRef("");
+  const [textareaSelection, setTextareaSelection] = useState({
+    start: 0,
+    end: 0,
+    focused: false,
+  });
   useEffect(() => {
     textRef.current = text;
   }, [text]);
@@ -261,6 +417,42 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
   useEffect(
     () => () => {
       if (submitDenyTimerRef.current) clearTimeout(submitDenyTimerRef.current);
+    },
+    [],
+  );
+  // Empty shell drafts are a valid editor state but never a valid submission.
+  // Keep only the transient feedback in component state; shell interpretation
+  // itself remains derived entirely from the raw textarea value.
+  const [emptyShellValidationFor, setEmptyShellValidationFor] = useState<{
+    sessionId: SessionId;
+    content: string;
+  } | null>(null);
+  const [composerAnnouncement, setComposerAnnouncement] = useState("");
+  const emptyShellValidationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashEmptyShellValidation = useCallback(
+    (content: string) => {
+      setEmptyShellValidationFor({ sessionId, content });
+      setComposerAnnouncement("Shell command required.");
+      if (emptyShellValidationTimerRef.current) {
+        clearTimeout(emptyShellValidationTimerRef.current);
+      }
+      emptyShellValidationTimerRef.current = setTimeout(() => {
+        emptyShellValidationTimerRef.current = null;
+        setEmptyShellValidationFor(null);
+        // Clearing a validation announcement must not re-announce an
+        // unchanged shell mode. The next actual mode transition repopulates
+        // this live region.
+        setComposerAnnouncement("");
+      }, EMPTY_SHELL_VALIDATION_MS);
+      textareaRef.current?.focus({ preventScroll: true });
+    },
+    [sessionId],
+  );
+  useEffect(
+    () => () => {
+      if (emptyShellValidationTimerRef.current) {
+        clearTimeout(emptyShellValidationTimerRef.current);
+      }
     },
     [],
   );
@@ -1058,6 +1250,11 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       if (!carriesFiles(e.dataTransfer)) return;
       e.preventDefault();
       e.stopPropagation();
+      if (classifyShellDraft(textRef.current).kind === "shell") {
+        fileDragDepthRef.current = 0;
+        setFileDragActive(false);
+        return;
+      }
       fileDragDepthRef.current += 1;
       if (live && !submitPending) setFileDragActive(true);
     },
@@ -1069,7 +1266,10 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       if (!carriesFiles(e.dataTransfer)) return;
       e.preventDefault();
       e.stopPropagation();
-      e.dataTransfer.dropEffect = live && !submitPending ? "copy" : "none";
+      e.dataTransfer.dropEffect =
+        classifyShellDraft(textRef.current).kind !== "shell" && live && !submitPending
+          ? "copy"
+          : "none";
     },
     [live, submitPending],
   );
@@ -1089,6 +1289,7 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       e.stopPropagation();
       fileDragDepthRef.current = 0;
       setFileDragActive(false);
+      if (classifyShellDraft(textRef.current).kind === "shell") return;
       const files = Array.from(e.dataTransfer.files);
       if (files.length === 0) return;
       if (!live || submitPending) {
@@ -1283,6 +1484,11 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
         pendingDiffComments.length === 0
       )
         return;
+      const submittedShellDraft = classifyShellDraft(content);
+      if (submittedShellDraft.kind === "shell" && !submittedShellDraft.runnable) {
+        flashEmptyShellValidation(content);
+        return;
+      }
       const parsed = parseComposerInput(content, { discovered });
       const parsedAction = parsed.kind === "send-prompt" ? { ...parsed, deliveryMode } : parsed;
 
@@ -1349,16 +1555,12 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       const isSlashCommand = content.startsWith("/");
       const isRealPrompt = parsedAction.kind === "send-prompt" && !isSlashCommand;
       // Comments and attachments are staged prompt context. Slash commands may
-      // use the prompt transport for extension/template dispatch, but they must
-      // receive only their command text and leave that context for a later
-      // ordinary prompt.
+      // use the prompt transport for extension/template dispatch, while shell
+      // commands use their dedicated intent. Both receive only command text and
+      // leave staged context for a later ordinary prompt.
       const effectiveImages = isRealPrompt ? attachments : [];
       const attachedFilePaths = fileAttachments.map((attachment) => attachment.path);
       let effectivePromptText = parsedAction.kind === "send-prompt" ? parsedAction.text : content;
-      if (parsedAction.kind !== "send-prompt" && !isSlashCommand && attachedFilePaths.length > 0) {
-        addToast(sessionId, "File attachments can only be sent with prompts", "error");
-        return;
-      }
       if (isRealPrompt && attachedFilePaths.length > 0) {
         effectivePromptText = textWithPrependedFilePaths(parsedAction.text, attachedFilePaths);
       }
@@ -1661,7 +1863,13 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
           ) {
             return;
           }
-          synchronizeEditorText("", replicatedAttachmentsRef.current);
+          // runBash admission already consumed this exact text in SDK-host
+          // editor authority while preserving staged attachments. Sending a
+          // second empty patch from the renderer would target the advanced
+          // revision and manufacture an empty conflict candidate.
+          if (intent.kind !== "runBash") {
+            synchronizeEditorText("", replicatedAttachmentsRef.current);
+          }
           textRef.current = "";
           setText("");
           setSlashIndex(0);
@@ -1880,6 +2088,7 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       synchronizeEditorText,
       markSubmitPending,
       flashSubmitDenial,
+      flashEmptyShellValidation,
     ],
   );
 
@@ -2000,6 +2209,12 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       const v = e.target.value;
       textRef.current = v;
       setText(v);
+      setTextareaSelection({
+        start: e.target.selectionStart,
+        end: e.target.selectionEnd,
+        focused: document.activeElement === e.target,
+      });
+      setEmptyShellValidationFor(null);
       synchronizeEditorText(v);
       setDismissed(false); // A3 reset on text change
       if (pending && workspacePath) setNewSessionDraft(workspacePath, v);
@@ -2021,6 +2236,18 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
       clearEditorInjection,
       synchronizeEditorText,
     ],
+  );
+
+  const handleTextareaSelection = useCallback(
+    (event: React.SyntheticEvent<HTMLTextAreaElement>) => {
+      const textarea = event.currentTarget;
+      setTextareaSelection({
+        start: textarea.selectionStart,
+        end: textarea.selectionEnd,
+        focused: document.activeElement === textarea,
+      });
+    },
+    [],
   );
 
   // ── Click to pick a suggestion ─────────────────────────────────────
@@ -2053,33 +2280,217 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
     ],
   );
 
-  const isBashMode = text.startsWith("!");
+  const shellDraft = classifyShellDraft(text);
+  const isShellMode = shellDraft.kind === "shell";
   const isSlashMode = text.startsWith("/");
-
+  const composerMode =
+    shellDraft.kind === "shell"
+      ? shellDraft.excludeFromContext
+        ? "shell-excluded"
+        : "shell-included"
+      : "message";
+  const announcedComposerModeRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (announcedComposerModeRef.current === composerMode) return;
+    announcedComposerModeRef.current = composerMode;
+    setComposerAnnouncement(
+      composerMode === "shell-excluded"
+        ? "Shell input. Context excluded."
+        : composerMode === "shell-included"
+          ? "Shell input. Context included."
+          : "Message input.",
+    );
+  }, [composerMode]);
+  const shellPrefixPointerRef = useRef<ShellPrefixPointerDrag | undefined>(undefined);
+  const disposeShellPrefixPointer = useCallback(() => {
+    const pointer = shellPrefixPointerRef.current;
+    if (pointer?.animationFrame !== undefined) {
+      window.cancelAnimationFrame(pointer.animationFrame);
+    }
+    pointer?.mirror.element.remove();
+    shellPrefixPointerRef.current = undefined;
+  }, []);
+  useEffect(() => disposeShellPrefixPointer, [disposeShellPrefixPointer]);
+  const shellPrefixPosition = useCallback(
+    (element: HTMLSpanElement, clientX: number, length: number): number => {
+      const textElement = element.querySelector<HTMLElement>(".composer__shell-prefix-text");
+      const bounds = (textElement ?? element).getBoundingClientRect();
+      if (bounds.width <= 0) return 0;
+      return Math.max(
+        0,
+        Math.min(length, Math.round(((clientX - bounds.left) / bounds.width) * length)),
+      );
+    },
+    [],
+  );
+  const applyShellPrefixSelection = useCallback(
+    (textarea: HTMLTextAreaElement, anchor: number, position: number) => {
+      const start = Math.min(anchor, position);
+      const end = Math.max(anchor, position);
+      textarea.setSelectionRange(start, end, position < anchor ? "backward" : "forward");
+      setTextareaSelection({ start, end, focused: true });
+    },
+    [],
+  );
+  const updateShellPrefixPointer = useCallback(
+    (pointer: ShellPrefixPointerDrag, clientX: number, clientY: number): boolean => {
+      const { textarea } = pointer.mirror;
+      const currentDraft = classifyShellDraft(textRef.current);
+      if (
+        shellPrefixPointerRef.current !== pointer ||
+        !pointer.prefixElement.isConnected ||
+        currentDraft.kind !== "shell"
+      ) {
+        return false;
+      }
+      const prefixText = pointer.prefixElement.querySelector<HTMLElement>(
+        ".composer__shell-prefix-text",
+      );
+      const prefixBounds = (prefixText ?? pointer.prefixElement).getBoundingClientRect();
+      const withinPrefixRow = clientY >= prefixBounds.top && clientY <= prefixBounds.bottom;
+      const position =
+        withinPrefixRow && clientX <= prefixBounds.right
+          ? shellPrefixPosition(pointer.prefixElement, clientX, currentDraft.prefix.length)
+          : shellTextareaPositionAtPoint(pointer.mirror, clientX, clientY);
+      applyShellPrefixSelection(textarea, pointer.anchor, position);
+      return true;
+    },
+    [applyShellPrefixSelection, shellPrefixPosition],
+  );
+  const reconcileShellPrefixAutoscroll = useCallback(
+    (pointer: ShellPrefixPointerDrag) => {
+      const bounds = pointer.mirror.textarea.getBoundingClientRect();
+      const outsideVertically = pointer.clientY < bounds.top || pointer.clientY > bounds.bottom;
+      if (!outsideVertically) {
+        if (pointer.animationFrame !== undefined) {
+          window.cancelAnimationFrame(pointer.animationFrame);
+          pointer.animationFrame = undefined;
+        }
+        return;
+      }
+      if (pointer.animationFrame !== undefined) return;
+      const tick = (): void => {
+        pointer.animationFrame = undefined;
+        if (
+          shellPrefixPointerRef.current !== pointer ||
+          !updateShellPrefixPointer(pointer, pointer.clientX, pointer.clientY)
+        ) {
+          return;
+        }
+        const currentBounds = pointer.mirror.textarea.getBoundingClientRect();
+        if (pointer.clientY < currentBounds.top || pointer.clientY > currentBounds.bottom) {
+          pointer.animationFrame = window.requestAnimationFrame(tick);
+        }
+      };
+      pointer.animationFrame = window.requestAnimationFrame(tick);
+    },
+    [updateShellPrefixPointer],
+  );
+  const handleShellPrefixPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLSpanElement>) => {
+      if (event.button !== 0) return;
+      const textarea = textareaRef.current;
+      const currentDraft = classifyShellDraft(textRef.current);
+      if (!textarea || currentDraft.kind !== "shell") return;
+      event.preventDefault();
+      const position = shellPrefixPosition(
+        event.currentTarget,
+        event.clientX,
+        currentDraft.prefix.length,
+      );
+      const anchor = event.shiftKey
+        ? textarea.selectionDirection === "backward"
+          ? textarea.selectionEnd
+          : textarea.selectionStart
+        : position;
+      textarea.focus({ preventScroll: true });
+      applyShellPrefixSelection(textarea, anchor, position);
+      disposeShellPrefixPointer();
+      const pointer: ShellPrefixPointerDrag = {
+        pointerId: event.pointerId,
+        anchor,
+        mirror: createShellPointerMirror(textarea, textRef.current, currentDraft.prefix.length),
+        prefixElement: event.currentTarget,
+        clientX: event.clientX,
+        clientY: event.clientY,
+      };
+      shellPrefixPointerRef.current = pointer;
+      event.currentTarget.setPointerCapture(event.pointerId);
+    },
+    [applyShellPrefixSelection, disposeShellPrefixPointer, shellPrefixPosition],
+  );
+  const handleShellPrefixPointerMove = useCallback(
+    (event: React.PointerEvent<HTMLSpanElement>) => {
+      const pointer = shellPrefixPointerRef.current;
+      if (!pointer || pointer.pointerId !== event.pointerId) {
+        return;
+      }
+      event.preventDefault();
+      pointer.clientX = event.clientX;
+      pointer.clientY = event.clientY;
+      if (!updateShellPrefixPointer(pointer, event.clientX, event.clientY)) {
+        disposeShellPrefixPointer();
+        return;
+      }
+      reconcileShellPrefixAutoscroll(pointer);
+    },
+    [disposeShellPrefixPointer, reconcileShellPrefixAutoscroll, updateShellPrefixPointer],
+  );
+  const handleShellPrefixPointerEnd = useCallback(
+    (event: React.PointerEvent<HTMLSpanElement>) => {
+      if (shellPrefixPointerRef.current?.pointerId !== event.pointerId) return;
+      handleShellPrefixPointerMove(event);
+      disposeShellPrefixPointer();
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    },
+    [disposeShellPrefixPointer, handleShellPrefixPointerMove],
+  );
+  const handleShellPrefixPointerCancel = useCallback(
+    (event: React.PointerEvent<HTMLSpanElement>) => {
+      if (shellPrefixPointerRef.current?.pointerId !== event.pointerId) return;
+      disposeShellPrefixPointer();
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    },
+    [disposeShellPrefixPointer],
+  );
+  const showEmptyShellValidation =
+    shellDraft.kind === "shell" &&
+    !shellDraft.runnable &&
+    emptyShellValidationFor?.sessionId === sessionId &&
+    emptyShellValidationFor.content === text;
   return (
     <div
-      className="composer"
-      onDragEnter={handleFileDragEnter}
-      onDragOver={handleFileDragOver}
-      onDragLeave={handleFileDragLeave}
-      onDrop={handleFileDrop}
+      className={`composer${suspended ? " composer--suspended" : ""}`}
+      aria-busy={suspended || undefined}
+      onDragEnter={suspended ? undefined : handleFileDragEnter}
+      onDragOver={suspended ? undefined : handleFileDragOver}
+      onDragLeave={suspended ? undefined : handleFileDragLeave}
+      onDrop={suspended ? undefined : handleFileDrop}
     >
+      <span className="composer__mode-announcer" aria-live="polite" aria-atomic="true">
+        {composerAnnouncement}
+      </span>
       <input
         ref={fileInputRef}
         type="file"
         multiple
         className="composer__file-input"
         onChange={handleFilesSelected}
+        disabled={suspended}
       />
       <div
-        className={`composer__input-row ${isBashMode ? "composer__input-row--bash" : ""} ${isSlashMode ? "composer__input-row--slash" : ""}`}
+        className={`composer__input-row ${isShellMode ? "composer__input-row--shell" : ""} ${isSlashMode ? "composer__input-row--slash" : ""}`}
       >
         {/* Slash suggestions — a detached floating popover anchored above
             the input box. Mirrors the app's picker card language
             (.picker / .picker__list in AppPickerHost.css): a padded card
             wrapping an inner scrolling list of rounded rows. See
             .composer__suggestions in Composer.css. */}
-        {showSuggestions && (
+        {!suspended && showSuggestions && (
           <div className="composer__suggestions">
             <ScrollFadeFrame
               frameClassName="composer__suggestion-list-frame"
@@ -2113,9 +2524,9 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
           </div>
         )}
         <div
-          className={`composer__input-box${submitPending ? " composer__input-box--pending" : ""}${submitDenied ? " composer__input-box--denied" : ""}${fileDragActive ? " composer__input-box--file-drag" : ""}`}
+          className={`composer__input-box${submitPending ? " composer__input-box--pending" : ""}${submitDenied ? " composer__input-box--denied" : ""}${showEmptyShellValidation ? " composer__input-box--invalid" : ""}${fileDragActive && !isShellMode ? " composer__input-box--file-drag" : ""}`}
         >
-          {fileDragActive && (
+          {!suspended && fileDragActive && !isShellMode && (
             <div className="composer__file-drop" role="status">
               <IconFile size="1.25em" />
               <span>Drop files to attach</span>
@@ -2124,77 +2535,83 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
           {/* Image previews live inside the input card, above the typed text,
               so attachments read as part of the pending message rather than a
               separate horizontal tray. */}
-          {(attachments.length > 0 || fileAttachments.length > 0 || diffCommentCount > 0) && (
-            <div className="composer__attachments">
-              {diffCommentCount > 0 && (
-                <div className="composer__attachment-item composer__attachment-item--comments">
+          {!suspended &&
+            !isShellMode &&
+            (attachments.length > 0 || fileAttachments.length > 0 || diffCommentCount > 0) && (
+              <div className="composer__attachments">
+                {diffCommentCount > 0 && (
+                  <div className="composer__attachment-item composer__attachment-item--comments">
+                    <div
+                      className="composer__file-attachment composer__comment-attachment"
+                      title={`${diffCommentCount} code ${diffCommentCount === 1 ? "comment" : "comments"} will be prepended to your next prompt`}
+                    >
+                      <span className="composer__comment-attachment-icon-wrap" aria-hidden>
+                        <IconComment className="composer__file-attachment-icon" size="1.55em" />
+                      </span>
+                      <span className="composer__comment-attachment-count" aria-hidden>
+                        {diffCommentCount}
+                      </span>
+                      <span className="composer__file-attachment-name">
+                        {diffCommentCount === 1 ? "comment" : "comments"}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="composer__attachment-remove"
+                      onClick={() => clearDiffComments(sessionId)}
+                      aria-label="Clear code comments"
+                    >
+                      <IconClose size="0.714em" />
+                    </button>
+                  </div>
+                )}
+                {fileAttachments.map((att, i) => (
                   <div
-                    className="composer__file-attachment composer__comment-attachment"
-                    title={`${diffCommentCount} code ${diffCommentCount === 1 ? "comment" : "comments"} will be prepended to your next prompt`}
+                    key={`${att.path}-${i}`}
+                    className="composer__attachment-item composer__attachment-item--file"
                   >
-                    <span className="composer__comment-attachment-icon-wrap" aria-hidden>
-                      <IconComment className="composer__file-attachment-icon" size="1.55em" />
-                    </span>
-                    <span className="composer__comment-attachment-count" aria-hidden>
-                      {diffCommentCount}
-                    </span>
-                    <span className="composer__file-attachment-name">
-                      {diffCommentCount === 1 ? "comment" : "comments"}
-                    </span>
+                    <div className="composer__file-attachment" title={att.path}>
+                      <IconFile className="composer__file-attachment-icon" size="1.6em" />
+                      <FadeText className="composer__file-attachment-name">{att.name}</FadeText>
+                    </div>
+                    <button
+                      type="button"
+                      className="composer__attachment-remove"
+                      onClick={() => removeFileAttachment(i)}
+                      aria-label={`Remove ${att.name}`}
+                    >
+                      <IconClose size="0.714em" />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="composer__attachment-remove"
-                    onClick={() => clearDiffComments(sessionId)}
-                    aria-label="Clear code comments"
-                  >
-                    <IconClose size="0.714em" />
-                  </button>
-                </div>
-              )}
-              {fileAttachments.map((att, i) => (
-                <div
-                  key={`${att.path}-${i}`}
-                  className="composer__attachment-item composer__attachment-item--file"
-                >
-                  <div className="composer__file-attachment" title={att.path}>
-                    <IconFile className="composer__file-attachment-icon" size="1.6em" />
-                    <FadeText className="composer__file-attachment-name">{att.name}</FadeText>
+                ))}
+                {attachments.map((att, i) => (
+                  <div key={`${att.name}-${i}`} className="composer__attachment-item">
+                    <button
+                      type="button"
+                      className="composer__attachment-preview"
+                      onClick={() => viewAttachment(i)}
+                      aria-label={`Open ${att.name} larger`}
+                      title="Open image preview"
+                    >
+                      <img
+                        src={att.dataUrl}
+                        alt={att.name}
+                        className="composer__attachment-thumb"
+                      />
+                    </button>
+                    <button
+                      type="button"
+                      className="composer__attachment-remove"
+                      onClick={() => removeAttachment(i)}
+                      aria-label={`Remove ${att.name}`}
+                    >
+                      <IconClose size="0.714em" />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="composer__attachment-remove"
-                    onClick={() => removeFileAttachment(i)}
-                    aria-label={`Remove ${att.name}`}
-                  >
-                    <IconClose size="0.714em" />
-                  </button>
-                </div>
-              ))}
-              {attachments.map((att, i) => (
-                <div key={`${att.name}-${i}`} className="composer__attachment-item">
-                  <button
-                    type="button"
-                    className="composer__attachment-preview"
-                    onClick={() => viewAttachment(i)}
-                    aria-label={`Open ${att.name} larger`}
-                    title="Open image preview"
-                  >
-                    <img src={att.dataUrl} alt={att.name} className="composer__attachment-thumb" />
-                  </button>
-                  <button
-                    type="button"
-                    className="composer__attachment-remove"
-                    onClick={() => removeAttachment(i)}
-                    aria-label={`Remove ${att.name}`}
-                  >
-                    <IconClose size="0.714em" />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          {editorConflict && (
+                ))}
+              </div>
+            )}
+          {!suspended && editorConflict && (
             <div className="composer__editor-conflict" role="status">
               <span>An extension and your local edit changed the composer.</span>
               <button type="button" onClick={() => resolveEditorConflict("local")}>
@@ -2220,35 +2637,89 @@ export function Composer({ sessionId }: ComposerProps): React.ReactElement {
             </div>
           )}
           <div className="composer__entry-row">
-            <button
-              type="button"
-              className="composer__attach-btn"
-              onClick={handleAttachClick}
-              aria-label="Attach files"
-              title="Attach files"
-              disabled={!live || submitPending}
-            >
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <path
-                  d="M8 3.25v9.5M3.25 8h9.5"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                />
-              </svg>
-            </button>
+            {shellDraft.kind === "shell" ? (
+              <span
+                className="composer__shell-prefix"
+                aria-hidden="true"
+                onPointerDown={handleShellPrefixPointerDown}
+                onPointerMove={handleShellPrefixPointerMove}
+                onPointerUp={handleShellPrefixPointerEnd}
+                onPointerCancel={handleShellPrefixPointerCancel}
+                onLostPointerCapture={handleShellPrefixPointerCancel}
+              >
+                <span className="composer__shell-prefix-text">
+                  {Array.from(shellDraft.prefix).map((character, index) => {
+                    const selected =
+                      textareaSelection.focused &&
+                      textareaSelection.start <= index &&
+                      textareaSelection.end > index;
+                    const showCaret =
+                      textareaSelection.focused &&
+                      textareaSelection.start === textareaSelection.end &&
+                      textareaSelection.start === index;
+                    return (
+                      <span
+                        // The prefix is at most two fixed punctuation marks;
+                        // its index is the stable visual position.
+                        // biome-ignore lint/suspicious/noArrayIndexKey: fixed-position shell prefix
+                        key={index}
+                        className={`composer__shell-prefix-char${
+                          selected ? " composer__shell-prefix-char--selected" : ""
+                        }`}
+                      >
+                        {showCaret && <span className="composer__shell-prefix-caret" />}
+                        {character}
+                      </span>
+                    );
+                  })}
+                </span>
+              </span>
+            ) : !suspended ? (
+              <button
+                type="button"
+                className="composer__attach-btn"
+                onClick={handleAttachClick}
+                aria-label="Attach files"
+                title="Attach files"
+                disabled={!live || submitPending}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M8 3.25v9.5M3.25 8h9.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
+            ) : (
+              <span
+                className="composer__attach-btn composer__attach-btn--placeholder"
+                aria-hidden
+              />
+            )}
             <div className="composer__textarea-wrap">
               <textarea
                 ref={textareaRef}
-                className="composer__textarea"
+                className={`composer__textarea${
+                  shellDraft.kind === "shell"
+                    ? ` composer__textarea--shell-prefix-${shellDraft.prefix.length}`
+                    : ""
+                }`}
                 value={text}
                 onChange={handleChange}
                 onKeyDown={handleKeyDown}
-                aria-label="Message pi"
-                disabled={submitPending}
+                onSelect={handleTextareaSelection}
+                onFocus={handleTextareaSelection}
+                onBlur={() =>
+                  setTextareaSelection((selection) => ({ ...selection, focused: false }))
+                }
+                aria-label={isShellMode ? "Shell command" : "Message pi"}
+                aria-invalid={showEmptyShellValidation || undefined}
+                disabled={submitPending || suspended}
               />
-              {showSubmitSpinner && (
+              {!suspended && showSubmitSpinner && (
                 <Spinner
                   className="composer__pending-spinner"
                   role="status"

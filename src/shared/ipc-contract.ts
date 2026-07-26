@@ -427,6 +427,58 @@ export interface IpcInvokeContract {
     };
     res: { acknowledged: boolean };
   };
+  /** Send terminal input to the active, owner-fenced user Shell Turn. */
+  "session.shellInput": {
+    req: {
+      sessionId: SessionId;
+      expectedHostInstanceId: string;
+      expectedSessionEpoch: number;
+      executionId: string;
+      sequence: number;
+      data: string;
+    };
+    res: {
+      accepted: boolean;
+      acknowledgedThrough: number;
+      gap?: { expected: number; received: number };
+    };
+  };
+  /** Resize the active Shell Turn PTY. */
+  "session.shellResize": {
+    req: {
+      sessionId: SessionId;
+      expectedHostInstanceId: string;
+      expectedSessionEpoch: number;
+      executionId: string;
+      revision: number;
+      cols: number;
+      rows: number;
+    };
+    res: { accepted: boolean };
+  };
+  /** Acknowledge that the retained live-shell keyframe is installed in xterm. */
+  "session.shellReconstructionAck": {
+    req: {
+      sessionId: SessionId;
+      expectedHostInstanceId: string;
+      expectedSessionEpoch: number;
+      executionId: string;
+      reconstructionFenceToken: number;
+      outputThroughSequence: number;
+    };
+    res: { accepted: boolean };
+  };
+  /** Interrupt or forcibly terminate the active Shell Turn. */
+  "session.shellSignal": {
+    req: {
+      sessionId: SessionId;
+      expectedHostInstanceId: string;
+      expectedSessionEpoch: number;
+      executionId: string;
+      signal: "interrupt" | "kill";
+    };
+    res: { accepted: boolean };
+  };
   /** Silently dispose the live host and remove this renderer tab's session. */
   "session.close": { req: { sessionId: SessionId }; res: { closed: true } };
   /** Respond to a unified-TUI editor submit (host→renderer round-trip).

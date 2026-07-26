@@ -45,12 +45,14 @@ import {
 } from "./bootstrap.mjs";
 import { assertHostCapabilities, setupCommandBridge } from "./bridge.mjs";
 import { buildEditorTheme } from "./editor-theme.mjs";
+import { createIpcSendQueue } from "./ipc-send-queue.mjs";
 import { createPanelReconstruction } from "./panel-reconstruction.mjs";
 import { importPinnedLlamaExtension } from "./pinned-pi-private.mjs";
 import {
   canonicalizeConfinedSessionLineage,
   canonicalizeConfinedSessionStartEvent,
 } from "./session-lineage.mjs";
+import { createShellPtyController } from "./shell-pty.mjs";
 import { createDialogResolver, createUIContext } from "./ui-context.mjs";
 
 // --- State ---
@@ -68,6 +70,13 @@ let requestLifecyclePermit = null;
 let applyEditorPatch = null;
 let runtimeAuthority = null;
 let interruptActiveOperation = null;
+let sendShellInput = null;
+let resizeShell = null;
+let acknowledgeShellReconstruction = null;
+let fenceShellReconstruction = null;
+let signalShell = null;
+let disposeShell = null;
+let setShellTransportBackpressure = null;
 let dialogResolver = null;
 // Unified-TUI controller { dispose, resolveSubmit, resolveClipboardImage } —
 // assigned in handleInit (createUIContext returns it as the `unified` bundle)
@@ -83,6 +92,19 @@ let transportSequence = 0;
 const activeEpoch = 0;
 const transitionPermitWaiters = new Map();
 let initialSessionFilePermit = null;
+
+const ipcSendQueue = createIpcSendQueue({
+  sendNow: (message, callback) => process.send(message, callback),
+  isConnected: () => Boolean(process.send && process.connected),
+  onPressureChange: (backpressured) => {
+    setShellTransportBackpressure?.(backpressured);
+  },
+  onFatalError: () => {
+    console.error("[pi-session-host] Fatal IPC transport backpressure failure");
+    disposeShell?.();
+    queueMicrotask(() => process.exit(1));
+  },
+});
 
 function requestInitialSessionFilePermit(sessionFile) {
   if (initialSessionFilePermit) return initialSessionFilePermit.promise;
@@ -138,13 +160,14 @@ function send(msg) {
   // that crashes the host mid-teardown. `process.connected` is false once the
   // channel is gone, so this is a no-op in exactly that window.
   if (process.send && process.connected) {
-    process.send({
+    return ipcSendQueue.send({
       ...outbound,
       hostInstanceId,
       sessionEpoch: runtimeAuthority?.transportSessionEpoch ?? activeEpoch,
       transportSequence: ++transportSequence,
     });
   }
+  return false;
 }
 
 function sendControl(payload) {
@@ -680,6 +703,13 @@ async function handleInit(msg) {
       authority,
       bindExtensions: bindExt,
       interruptActiveOperation: interrupt,
+      sendShellInput: inputShell,
+      resizeShell: resizeShellPty,
+      acknowledgeShellReconstruction: acknowledgeShellPty,
+      fenceShellReconstruction: fenceShellPty,
+      signalShell: signalShellPty,
+      disposeShell: disposeShellPty,
+      setShellTransportBackpressure: applyShellTransportBackpressure,
     } = setupCommandBridge({
       runtime,
       session,
@@ -700,6 +730,11 @@ async function handleInit(msg) {
       // without re-emitting its records/snapshot on compatibility channels.
       sendFrame: (frame) => send({ type: "authority_frame", frame }),
       sendPresentation: (publication) => send({ type: "authority_publication", publication }),
+      createShellController: (options) => {
+        const controller = createShellPtyController(options);
+        controller.setTransportBackpressured(ipcSendQueue.backpressured);
+        return controller;
+      },
       authorityPresentation: {
         dialogs: (rendererGeneration) =>
           dialogResolver?.pendingSnapshot?.(rendererGeneration) ?? [],
@@ -737,6 +772,13 @@ async function handleInit(msg) {
     requestLifecyclePermit = lifecyclePermit;
     applyEditorPatch = patchEditor;
     interruptActiveOperation = interrupt;
+    sendShellInput = inputShell;
+    resizeShell = resizeShellPty;
+    acknowledgeShellReconstruction = acknowledgeShellPty;
+    fenceShellReconstruction = fenceShellPty;
+    signalShell = signalShellPty;
+    disposeShell = disposeShellPty;
+    setShellTransportBackpressure = applyShellTransportBackpressure;
     const initialBatch = authority.commitInitialBinding();
     sendControl({
       type: "ready",
@@ -942,6 +984,7 @@ process.on("message", async (msg) => {
         // Keep host-side public pi-tui instances alive across renderer reload.
         // Their terminals are fenced and must force-repaint before new input.
         panelBridge.fenceAll();
+        fenceShellReconstruction?.();
         send({ type: "renderer_cancelled", rendererGeneration: msg.rendererGeneration });
         publishSnapshot?.();
         break;
@@ -1011,6 +1054,42 @@ process.on("message", async (msg) => {
         send({ type: "ui_ack", operationId: msg.operationId });
         break;
 
+      case "shell_input": {
+        const result = sendShellInput?.(msg.executionId, msg.sequence, msg.data) ?? {
+          accepted: false,
+          acknowledgedThrough: 0,
+        };
+        if (result.accepted) runtimeAuthority?.noteMutation();
+        send({ type: "response", id: msg.id, success: true, data: result });
+        break;
+      }
+
+      case "shell_resize": {
+        const accepted = resizeShell?.(msg.executionId, msg.revision, msg.cols, msg.rows) === true;
+        if (accepted) runtimeAuthority?.noteMutation();
+        send({ type: "response", id: msg.id, success: true, data: { accepted } });
+        break;
+      }
+
+      case "shell_reconstruction_ack": {
+        const accepted =
+          acknowledgeShellReconstruction?.(
+            msg.executionId,
+            msg.reconstructionFenceToken,
+            msg.outputThroughSequence,
+          ) === true;
+        if (accepted) runtimeAuthority?.noteMutation();
+        send({ type: "response", id: msg.id, success: true, data: { accepted } });
+        break;
+      }
+
+      case "shell_signal": {
+        const accepted = signalShell?.(msg.executionId, msg.signal) === true;
+        if (accepted) runtimeAuthority?.noteMutation();
+        send({ type: "response", id: msg.id, success: true, data: { accepted } });
+        break;
+      }
+
       // Unified-TUI editor submit: the renderer ran the submit pipeline and
       // reports the outcome so the host can restore the editor text on a bail
       // (e.g. no-model guard). Resolved by ui-context's resolveUnifiedSubmit.
@@ -1060,6 +1139,8 @@ process.on("disconnect", () => {
   // fallback exit (unref'd so it doesn't delay a clean exit on the happy path).
   const forceExit = setTimeout(() => process.exit(0), 2000);
   forceExit.unref?.();
+  ipcSendQueue.close();
+  disposeShell?.();
   runtime
     ?.dispose?.()
     .catch(() => {})

@@ -1,5 +1,7 @@
 import * as crypto from "node:crypto";
 
+const MAX_SHELL_COMMAND_BYTES = 64 * 1024;
+
 function isSlashSubmission(request) {
   if (request?.inputKind === "slash_command") return true;
   if (request?.inputKind === "ordinary") return false;
@@ -37,6 +39,7 @@ export function createStateAuthority({
   getCatalog = () => ({}),
   getEditor = () => ({ revision: 0, text: "", attachments: [] }),
   acceptEditorSubmission = () => false,
+  acceptShellEditorSubmission = () => false,
   onSubmissionResult = () => {},
   onAdmissionStuck = () => {},
   admissionStuckMs = 60_000,
@@ -72,6 +75,7 @@ export function createStateAuthority({
       : null,
     currentStreamingMessage: undefined,
   };
+  let shellTurn = null;
   let stopped = false;
   // `actualCompaction` is the compatibility projection of the observed
   // lifecycle below. It is deliberately not a guess that events are complete.
@@ -458,6 +462,35 @@ export function createStateAuthority({
     return value === undefined || predicate(value);
   }
 
+  function shellDraftPayload(editorText) {
+    if (typeof editorText !== "string" || !editorText.startsWith("!")) return undefined;
+    const excludeFromContext = editorText.startsWith("!!");
+    const prefixLength = excludeFromContext ? 2 : 1;
+    const command = editorText.slice(prefixLength).trim();
+    if (command.length === 0) return undefined;
+    return { command, excludeFromContext };
+  }
+
+  function shellIntentMatchesEditor(intent) {
+    const editor = getEditor() ?? {};
+    return editor.revision === intent.editorRevision && editor.text === intent.editorText;
+  }
+
+  function consumeShellEditor(intent, intentId) {
+    if (!shellIntentMatchesEditor(intent)) return false;
+    try {
+      return (
+        acceptShellEditorSubmission({
+          intentId,
+          editorRevision: intent.editorRevision,
+          editorText: intent.editorText,
+        }) === true
+      );
+    } catch {
+      return false;
+    }
+  }
+
   // Keep this child boundary strict even when a caller bypasses the typed main
   // IPC contract. It intentionally mirrors SessionIntentSchema without loading
   // TypeScript/Zod into the SDK host process.
@@ -565,14 +598,26 @@ export function createStateAuthority({
           typeof intent.text === "string" &&
           nonNegativeInteger(intent.editorRevision)
         );
-      case "runBash":
+      case "runBash": {
+        const source = shellDraftPayload(intent.editorText);
         return (
-          Object.keys(intent).every((key) =>
-            ["kind", "command", "excludeFromContext"].includes(key),
-          ) &&
+          isStrictObject(intent, [
+            "kind",
+            "command",
+            "excludeFromContext",
+            "editorRevision",
+            "editorText",
+          ]) &&
           typeof intent.command === "string" &&
-          isOptional(intent.excludeFromContext, (value) => typeof value === "boolean")
+          intent.command.length > 0 &&
+          intent.command === intent.command.trim() &&
+          Buffer.byteLength(intent.command, "utf8") <= MAX_SHELL_COMMAND_BYTES &&
+          typeof intent.excludeFromContext === "boolean" &&
+          nonNegativeInteger(intent.editorRevision) &&
+          source?.command === intent.command &&
+          source.excludeFromContext === intent.excludeFromContext
         );
+      }
       case "setTrust":
         return (
           isStrictObject(intent, ["kind", "optionLabel"]) &&
@@ -716,12 +761,17 @@ export function createStateAuthority({
   function pruneDispatchedIntents() {
     const capacity = Math.max(1, Number(dispatchedIntentCapacity) || 1);
     const terminal = [...dispatchedIntents.entries()]
-      .filter(([, entry]) => entry.outcome)
-      .sort(([, a], [, b]) => a.recordSequence - b.recordSequence);
+      .filter(([, entry]) => entry.outcome || entry.admissionRejected)
+      .sort(
+        ([, a], [, b]) =>
+          (a.recordSequence ?? Number.POSITIVE_INFINITY) -
+            (b.recordSequence ?? Number.POSITIVE_INFINITY) || a.recordedAt - b.recordedAt,
+      );
     while (dispatchedIntents.size > capacity && terminal.length > 0) {
       const [key] = terminal.shift();
+      const retired = dispatchedIntents.get(key);
       dispatchedIntents.delete(key);
-      dispatchedIntentTruncated = true;
+      if (retired?.recordSequence !== null) dispatchedIntentTruncated = true;
     }
   }
 
@@ -1049,6 +1099,7 @@ export function createStateAuthority({
     const active = [...dispatchedIntents.values()]
       .filter(
         (entry) =>
+          entry.admitted === true &&
           !entry.outcome &&
           entry.owner.hostInstanceId === owner.hostInstanceId &&
           entry.owner.sessionEpoch === owner.sessionEpoch,
@@ -1122,9 +1173,20 @@ export function createStateAuthority({
               bash: {
                 kind: "bash",
                 state: bash.phase === "cancelling" ? "cancelling" : "active",
-                ...(bash.intentId ? { intentId: bash.intentId } : {}),
-                ...(bash.command ? { command: bash.command } : {}),
-                startedAt: bash.observedAt,
+                ...(shellTurn?.id || bash.intentId
+                  ? { intentId: shellTurn?.id ?? bash.intentId }
+                  : {}),
+                ...(shellTurn?.command || bash.command
+                  ? { command: shellTurn?.command ?? bash.command }
+                  : {}),
+                startedAt: shellTurn?.startedAt ?? bash.observedAt,
+                ...(shellTurn?.excludeFromContext !== undefined
+                  ? { excludeFromContext: shellTurn.excludeFromContext }
+                  : {}),
+                ...(shellTurn?.pty === true
+                  ? { pty: true, inputReady: shellTurn.inputReady === true }
+                  : {}),
+                ...(shellTurn?.mode ? { terminalMode: shellTurn.mode } : {}),
               },
             }
           : {}),
@@ -1445,7 +1507,7 @@ export function createStateAuthority({
   function settleDispatchedIntent(intentId, owner, kind, state, result) {
     const key = intentOwnerKey(owner, intentId);
     const entry = dispatchedIntents.get(key);
-    if (!entry || entry.outcome) return entry?.outcome;
+    if (!entry || entry.admitted !== true || entry.outcome) return entry?.outcome;
     const normalizedResult = typedIntentResult(entry.intent, kind, result);
     const error =
       state === "failed" || state === "outcome_unknown" || state === "rejected"
@@ -1520,7 +1582,7 @@ export function createStateAuthority({
       sessionEpoch: transition.priorSemanticSnapshot.owner.sessionEpoch,
     };
     const entry = dispatchedIntents.get(intentOwnerKey(owner, intentId));
-    if (!entry || entry.outcome) return entry?.outcome;
+    if (!entry || entry.admitted !== true || entry.outcome) return entry?.outcome;
     const state =
       result?.cancelled === true || result?.aborted === true ? "cancelled" : "completed";
     return settleDispatchedIntent(intentId, owner, entry.kind, state, result);
@@ -1965,6 +2027,12 @@ export function createStateAuthority({
       }
     }
 
+    if (session.isBashRunning === true) {
+      return resultFor(request, "rejected", {
+        message: "A Shell Turn is already running",
+      });
+    }
+
     if ((compactionBarrierOpen() || navigationDepth > 0) && !fromCustody) {
       const custodyId = crypto.randomUUID();
       custody.push({
@@ -2346,6 +2414,28 @@ export function createStateAuthority({
     }
   }
 
+  function shellAdmissionBusy(ignoredEntry) {
+    return (
+      session.isIdle !== true ||
+      session.isStreaming === true ||
+      session.isCompacting === true ||
+      session.isRetrying === true ||
+      session.isBashRunning === true ||
+      Number(session.pendingMessageCount ?? 0) > 0 ||
+      submitting > 0 ||
+      unresolvedAdmissions > 0 ||
+      activeIntents.size > 0 ||
+      custody.length > 0 ||
+      promptFence !== null ||
+      compactionBarrierOpen() ||
+      navigationDepth > 0 ||
+      activeOperation("command") !== undefined ||
+      [...dispatchedIntents.values()].some(
+        (entry) => entry !== ignoredEntry && !entry.outcome && !entry.admissionRejected,
+      )
+    );
+  }
+
   /**
    * Target SessionIntent ingress. The receipt says only that this child wrote
    * an owner-bound intent record and accepted execution responsibility. The
@@ -2355,6 +2445,10 @@ export function createStateAuthority({
     const intent = envelope?.intent;
     const owner = envelope?.expectedOwner;
     const intentId = envelope?.intentId;
+    const oversizedShellCommand =
+      intent?.kind === "runBash" &&
+      typeof intent.command === "string" &&
+      Buffer.byteLength(intent.command, "utf8") > MAX_SHELL_COMMAND_BYTES;
     // Validate before fingerprinting, retention, journal admission, or any
     // scheduler work. The typed renderer/main contract is not a substitute for
     // this hostile child IPC boundary.
@@ -2372,7 +2466,7 @@ export function createStateAuthority({
         status: "not_admitted",
         intentId: typeof intentId === "string" ? intentId : "",
         reason: "invalid",
-        invalidReason: "malformed",
+        invalidReason: oversizedShellCommand ? "payload_too_large" : "malformed",
       });
     }
     if (owner.hostInstanceId !== hostInstanceId || owner.sessionEpoch !== sessionEpoch) {
@@ -2387,7 +2481,6 @@ export function createStateAuthority({
     if (transition) {
       return Promise.resolve({ status: "not_admitted", intentId, reason: "transitioning" });
     }
-
     const key = intentOwnerKey(owner, intentId);
     const payloadBytes = intentPayloadBytes(intent);
     const payloadLimit = Math.max(1, Number(dispatchedIntentPayloadBytes) || 1);
@@ -2409,22 +2502,46 @@ export function createStateAuthority({
       if (prior.fingerprint !== fingerprint) {
         return Promise.resolve({ status: "not_admitted", intentId, reason: "invalid" });
       }
+      if (prior.admissionPromise) {
+        return prior.admissionPromise.then((receipt) =>
+          receipt.status === "admitted"
+            ? { status: "duplicate", intentId, owner: structuredClone(owner) }
+            : receipt,
+        );
+      }
+      if (prior.admissionReceipt?.status === "not_admitted") {
+        return Promise.resolve(structuredClone(prior.admissionReceipt));
+      }
       return Promise.resolve({ status: "duplicate", intentId, owner: structuredClone(owner) });
     }
+    if (intent.kind === "runBash" && !shellIntentMatchesEditor(intent)) {
+      return Promise.resolve({ status: "not_admitted", intentId, reason: "stale_editor" });
+    }
+    if (intent.kind === "runBash" && shellAdmissionBusy()) {
+      // A Shell Turn is foreground work, never queued. Refusing before the
+      // intent ledger/admission frame lets the Composer retain the exact draft.
+      return Promise.resolve({ status: "not_admitted", intentId, reason: "busy" });
+    }
 
-    // This write happens before scheduling any possible SDK call. The bounded
-    // operation journal therefore has a durable admission boundary even if the
-    // child dies during dispatch. Refuse rather than dropping unsettled work.
+    // Reserve the owner-bound ID before scheduling any possible SDK call.
+    // Ordinary intents publish admission immediately below. A Shell Turn keeps
+    // this reservation non-semantic until its PTY and durable start marker
+    // succeed, so a pre-start child failure cannot clear the editor draft.
     const intentCapacity = Math.max(1, Number(dispatchedIntentCapacity) || 1);
     // Make room only by retiring already-settled receipts; unsettled work is
     // never silently forgotten merely to admit another intent.
     const terminal = [...dispatchedIntents.entries()]
-      .filter(([, entry]) => entry.outcome)
-      .sort(([, a], [, b]) => a.recordSequence - b.recordSequence);
+      .filter(([, entry]) => entry.outcome || entry.admissionRejected)
+      .sort(
+        ([, a], [, b]) =>
+          (a.recordSequence ?? Number.POSITIVE_INFINITY) -
+            (b.recordSequence ?? Number.POSITIVE_INFINITY) || a.recordedAt - b.recordedAt,
+      );
     while (dispatchedIntents.size >= intentCapacity && terminal.length > 0) {
       const [terminalKey] = terminal.shift();
+      const retired = dispatchedIntents.get(terminalKey);
       dispatchedIntents.delete(terminalKey);
-      dispatchedIntentTruncated = true;
+      if (retired?.recordSequence !== null) dispatchedIntentTruncated = true;
     }
     if (dispatchedIntents.size >= intentCapacity) {
       return Promise.resolve({
@@ -2441,11 +2558,17 @@ export function createStateAuthority({
       intent: structuredClone(intent),
       owner: structuredClone(owner),
       recordedAt: Date.now(),
-      recordSequence: ++nextDispatchedIntentSequence,
+      recordSequence: intent.kind === "runBash" ? null : ++nextDispatchedIntentSequence,
+      admitted: intent.kind !== "runBash",
+      admissionRejected: false,
+      admissionPromise: null,
+      admissionReceipt: null,
       outcome: null,
     };
     dispatchedIntents.set(key, entry);
-    commitSemanticFrame([{ type: "intent_admitted", intentId, owner, kind: intent.kind }]);
+    if (entry.admitted) {
+      commitSemanticFrame([{ type: "intent_admitted", intentId, owner, kind: intent.kind }]);
+    }
 
     const settleFromResult = (result) => {
       // submit/invokeCommand settle when their existing child admission
@@ -2500,6 +2623,70 @@ export function createStateAuthority({
         publishSnapshot();
       }
     };
+
+    if (intent.kind === "runBash") {
+      const rejectAdmission = (reason) => {
+        const receipt = { status: "not_admitted", intentId, reason };
+        entry.admissionRejected = true;
+        entry.admissionReceipt = receipt;
+        entry.admissionPromise = null;
+        entry.intent = retainedDispatchedIntent(entry.intent);
+        pruneDispatchedIntents();
+        return receipt;
+      };
+      const admissionPromise = schedule("ingress", async () => {
+        // A Shell Turn receipt transfers draft custody. Recheck every mutable
+        // admission fact in the serialized slot, then return that receipt only
+        // after the executor proves PTY construction and the durable start
+        // marker by handing back its deferred terminal outcome.
+        if (stopped || closePreparation?.confirmed || fatalAdmissionFence) {
+          return rejectAdmission("closing");
+        }
+        if (transition) return rejectAdmission("transitioning");
+        if (owner.hostInstanceId !== hostInstanceId || owner.sessionEpoch !== sessionEpoch) {
+          return rejectAdmission("stale_owner");
+        }
+        if (!shellIntentMatchesEditor(intent)) return rejectAdmission("stale_editor");
+        if (shellAdmissionBusy(entry)) return rejectAdmission("busy");
+
+        let result;
+        try {
+          result = await execute(intent, owner);
+        } catch {
+          return rejectAdmission("transport_unavailable");
+        }
+        if (!result || typeof result.deferredOutcome?.then !== "function") {
+          return rejectAdmission("transport_unavailable");
+        }
+
+        // `execute` returns only after PTY construction and the durable start
+        // marker succeed. Consume the exact authoritative shell draft in this
+        // same serialized slot before publishing admission. A false result is
+        // an internal invariant failure after a process may already exist, so
+        // never lie with `not_admitted`; keep the visible turn admitted and
+        // publish a bounded, non-secret diagnostic instead.
+        if (!consumeShellEditor(intent, intentId)) {
+          appendAnomaly(
+            "shell_editor_custody_lost",
+            "durable_shell_start_without_editor_consumption",
+          );
+        }
+
+        entry.admitted = true;
+        entry.recordSequence = ++nextDispatchedIntentSequence;
+        entry.admissionReceipt = {
+          status: "admitted",
+          intentId,
+          owner: structuredClone(owner),
+        };
+        entry.admissionPromise = null;
+        commitSemanticFrame([{ type: "intent_admitted", intentId, owner, kind: intent.kind }]);
+        void result.deferredOutcome.then(settleFromResult, settleFromError).finally(publishIfOwner);
+        return structuredClone(entry.admissionReceipt);
+      });
+      entry.admissionPromise = admissionPromise;
+      return admissionPromise;
+    }
 
     void schedule("ingress", async () => {
       try {
@@ -2710,6 +2897,36 @@ export function createStateAuthority({
     if (event?.type === "queue_update") {
       observeAttributableAdmissionQueueAppend(initiatingIntentId);
     }
+    if (event?.type === "bash_execution_start") {
+      shellTurn = {
+        id: event.id,
+        command: event.command,
+        startedAt: event.startedAt ?? Date.now(),
+        excludeFromContext: event.excludeFromContext,
+        pty: event.pty === true,
+        // A PTY exists only after the injected BashOperations spawn succeeds.
+        // stdin-transport shells additionally remain fenced until their fixed
+        // bootstrap has been fully parsed and removed from the output plane.
+        inputReady: false,
+        mode: "compact",
+      };
+    } else if (
+      event?.type === "bash_terminal_data" &&
+      shellTurn?.id === event.id &&
+      event.mode !== undefined
+    ) {
+      const modeChanged = shellTurn.mode !== event.mode;
+      shellTurn = { ...shellTurn, mode: event.mode };
+      // PTY bytes are a presentation stream. Avoid emitting a semantic frame
+      // for every terminal chunk; only a compact/fullscreen transition changes
+      // semantic activity.
+      if (typeof sendPresentation === "function" && !modeChanged) {
+        publishTranscript([event]);
+        return undefined;
+      }
+    } else if (event?.type === "bash_execution_end" && shellTurn?.id === event.id) {
+      shellTurn = null;
+    }
     let publishedEvent = event;
     if (event?.type === "message_start" && event.message?.role === "user") {
       const { deliveredQueueIntentIds } = readQueues(true);
@@ -2861,6 +3078,15 @@ export function createStateAuthority({
       return frame;
     }
     return commitSemanticFrame([{ type: "event", event: publishedEvent }]);
+  }
+
+  function setShellInputReady(executionId, inputReady) {
+    if (shellTurn?.id !== executionId || shellTurn.pty !== true) return false;
+    const nextInputReady = inputReady === true;
+    if (shellTurn.inputReady === nextInputReady) return true;
+    shellTurn = { ...shellTurn, inputReady: nextInputReady };
+    publishSnapshot();
+    return true;
   }
 
   function restoreCustody(items, message) {
@@ -3521,7 +3747,7 @@ export function createStateAuthority({
       // admission as review-only unknown work; it is never replayed here or by
       // a successor authority.
       dispatchedIntents: [...dispatchedIntents.values()]
-        .filter((entry) => !entry.outcome)
+        .filter((entry) => entry.admitted === true && !entry.outcome)
         .map((entry) => ({
           intentId: entry.intentId,
           owner: structuredClone(entry.owner),
@@ -3707,7 +3933,7 @@ export function createStateAuthority({
       navigationDepth > 0 ||
       compactionBarrierOpen();
     const pendingOtherIntent = [...dispatchedIntents.values()].some(
-      (entry) => !entry.outcome && entry.kind !== kind,
+      (entry) => !entry.outcome && !entry.admissionRejected && entry.kind !== kind,
     );
     const editorOrUi =
       editor.text !== "" ||
@@ -3822,6 +4048,11 @@ export function createStateAuthority({
             : { kind: "repaint_required", renderRevision },
         };
       });
+      const retainedShell = presentation.shell?.();
+      const currentShellTurn =
+        retainedShell && typeof retainedShell.id === "string"
+          ? { ...structuredClone(retainedShell), owner }
+          : undefined;
       return {
         status: "ready",
         baseline: {
@@ -3848,6 +4079,7 @@ export function createStateAuthority({
                   ),
                 }
               : {}),
+            ...(currentShellTurn ? { currentShellTurn } : {}),
           },
           extensionUi: {
             sync: { state: "following", cursor: extensionUiCursor },
@@ -3979,6 +4211,7 @@ export function createStateAuthority({
     requestAuthorityAttach,
     semanticSnapshot,
     observeEvent,
+    setShellInputReady,
     publishExtensionUi,
     publishPanel,
     submit,

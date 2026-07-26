@@ -1435,6 +1435,98 @@ export function initIpc(win: BrowserWindow): void {
     },
   );
 
+  ipcMain.handle(
+    "session.shellInput",
+    async (
+      _evt,
+      args: {
+        sessionId: SessionId;
+        expectedHostInstanceId: string;
+        expectedSessionEpoch: number;
+        executionId: string;
+        sequence: number;
+        data: string;
+      },
+    ) =>
+      registry?.sendShellInput(
+        args.sessionId,
+        args.expectedHostInstanceId,
+        args.expectedSessionEpoch,
+        args.executionId,
+        args.sequence,
+        args.data,
+      ) ?? { accepted: false, acknowledgedThrough: 0 },
+  );
+
+  ipcMain.handle(
+    "session.shellResize",
+    async (
+      _evt,
+      args: {
+        sessionId: SessionId;
+        expectedHostInstanceId: string;
+        expectedSessionEpoch: number;
+        executionId: string;
+        revision: number;
+        cols: number;
+        rows: number;
+      },
+    ) =>
+      registry?.resizeShell(
+        args.sessionId,
+        args.expectedHostInstanceId,
+        args.expectedSessionEpoch,
+        args.executionId,
+        args.revision,
+        args.cols,
+        args.rows,
+      ) ?? { accepted: false },
+  );
+
+  ipcMain.handle(
+    "session.shellSignal",
+    async (
+      _evt,
+      args: {
+        sessionId: SessionId;
+        expectedHostInstanceId: string;
+        expectedSessionEpoch: number;
+        executionId: string;
+        signal: "interrupt" | "kill";
+      },
+    ) =>
+      registry?.signalShell(
+        args.sessionId,
+        args.expectedHostInstanceId,
+        args.expectedSessionEpoch,
+        args.executionId,
+        args.signal,
+      ) ?? { accepted: false },
+  );
+
+  ipcMain.handle(
+    "session.shellReconstructionAck",
+    async (
+      _evt,
+      args: {
+        sessionId: SessionId;
+        expectedHostInstanceId: string;
+        expectedSessionEpoch: number;
+        executionId: string;
+        reconstructionFenceToken: number;
+        outputThroughSequence: number;
+      },
+    ) =>
+      registry?.acknowledgeShellReconstruction(
+        args.sessionId,
+        args.expectedHostInstanceId,
+        args.expectedSessionEpoch,
+        args.executionId,
+        args.reconstructionFenceToken,
+        args.outputThroughSequence,
+      ) ?? { accepted: false },
+  );
+
   ipcMain.handle("settings.get", async () => {
     return getSettings();
   });

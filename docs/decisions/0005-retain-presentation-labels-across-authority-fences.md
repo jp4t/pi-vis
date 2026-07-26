@@ -10,13 +10,25 @@ A semantic-plane fence makes control state unavailable while a baseline is recov
 
 ## Decision
 
-When the semantic plane is not `following`, retain the last known `sessionName`, `sessionTitle`, `currentModel`, `currentProvider`, and `thinkingLevel` as stale presentation. Clear dispatch identity and other control state, including host identity, running state, queued messages, and editor injection. Only a following successor baseline replaces retained presentation.
+When the semantic plane is not `following`, retain the last known `sessionName`, `sessionTitle`, `currentModel`, `currentProvider`, and `thinkingLevel` as stale presentation. Clear dispatch identity and other authoritative control state, including host identity, running state, queued messages, and editor injection. Only a following successor baseline replaces retained presentation.
+
+A direct Shell Turn has one narrower presentation exception. During a
+recoverable same-owner semantic `synchronizing` fence, the Composer slot may
+keep the prior xterm mounted and frozen only when stale diagnostic Bash
+activity and the independently retained streaming PTY block identify the exact
+same execution. This is not retained semantic running state: input, resize,
+Escape, and signals remain fenced, and an unavailable plane, owner/execution
+mismatch, or settled PTY block removes the surface. A fresh reconstruction
+revision and acknowledgement are required before control resumes.
 
 Interactive controls continue to use the authoritative semantic snapshot and remain fenced until that plane follows.
 
 ## Consequences
 
-Labels and metadata can be stale during recovery, but do not flash to defaults. Retained presentation is diagnostic only and cannot authorize interaction or establish runtime state.
+Labels, metadata, and the exact matching frozen PTY surface can remain visually
+stable during recovery instead of flashing to defaults or Composer. Retained
+presentation is diagnostic only and cannot authorize interaction or establish
+runtime state.
 
 ## References
 

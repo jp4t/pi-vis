@@ -80,6 +80,12 @@ export interface PanelSizerOptions {
   getHeightFraction?: () => number;
   /** Minimum intrinsic grid rows retained while content frames converge. */
   minimumRows?: number;
+  /** Optional terminal-protocol bounds. Omitted for ordinary Pi TUI panels;
+   *  direct Shell Turns pass their PTY limits so xterm and the child never
+   *  disagree about the active grid. */
+  maximumRows?: number;
+  minimumCols?: number;
+  maximumCols?: number;
   /** Font size to fall back to before xterm has measured its cell metrics. */
   fallbackFontSize: number;
   /** Push the current grid size to the host (deduped by the sizer). */
@@ -120,6 +126,19 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
     opts;
   const heightFraction: () => number = opts.getHeightFraction ?? (() => DEFAULT_HEIGHT_FRACTION);
   const minimumRows = Math.max(1, Math.floor(opts.minimumRows ?? 1));
+  const maximumRows = Math.max(
+    minimumRows,
+    Math.floor(opts.maximumRows ?? Number.MAX_SAFE_INTEGER),
+  );
+  const minimumCols = Math.max(1, Math.floor(opts.minimumCols ?? 1));
+  const maximumCols = Math.max(
+    minimumCols,
+    Math.floor(opts.maximumCols ?? Number.MAX_SAFE_INTEGER),
+  );
+  const clampRows = (rows: number): number =>
+    Math.min(maximumRows, Math.max(minimumRows, Math.floor(rows)));
+  const clampCols = (cols: number): number =>
+    Math.min(maximumCols, Math.max(minimumCols, Math.floor(cols)));
 
   let disposed = false;
 
@@ -137,7 +156,7 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
   // The visible cap — a fraction of the transcript column (default ~half,
   // or the user's drag-resized preference). Past this the card scrolls.
   const maxDisplayRows = (): number =>
-    Math.max(1, Math.floor((sessionHeight() * heightFraction()) / cellHeight()));
+    clampRows((sessionHeight() * heightFraction()) / cellHeight());
 
   // Rows occupied by the current frame (last non-blank + 1), and whether it
   // reached the visible grid's bottom row. Scan the complete active buffer, not
@@ -202,9 +221,10 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
   // the rows we give it, so a stable grid yields a stable render) and as the
   // resize-storm circuit breaker. cols still tracks the mount width.
   const applyFixedViewport = (rows: number, cols: number, cell: number): void => {
-    const gridRows = Math.max(1, rows);
-    if (cols !== term.cols || gridRows !== term.rows) term.resize(cols, gridRows);
-    reportSize(cols, gridRows);
+    const gridRows = clampRows(rows);
+    const gridCols = clampCols(cols);
+    if (gridCols !== term.cols || gridRows !== term.rows) term.resize(gridCols, gridRows);
+    reportSize(gridCols, gridRows);
     const displayRows = Math.min(gridRows, maxDisplayRows());
     container.style.height = `${gridRows * cell}px`;
     panelEl.style.height = `${displayRows * cell + cardChrome()}px`;
@@ -273,9 +293,9 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
     const cell = cellHeight();
 
     // Width (cols) tracks the mount; height (rows) tracks the content.
-    let cols = term.cols;
+    let cols = clampCols(term.cols);
     try {
-      cols = fitAddon.proposeDimensions()?.cols ?? cols;
+      cols = clampCols(fitAddon.proposeDimensions()?.cols ?? cols);
     } catch {
       // proposeDimensions throws before the mount has a layout; keep current.
     }

@@ -137,7 +137,7 @@ function queryData<T>(result: SessionQueryResult): T {
 
 async function dispatchAndAwait(
   sessionId: SessionId,
-  intent: SessionIntent,
+  intentOrFactory: SessionIntent | ((observation: IntentObservation) => SessionIntent),
   deps: ExecuteDeps,
 ): Promise<IntentCompletion> {
   const observation = deps.getIntentObservation?.(sessionId);
@@ -146,6 +146,8 @@ async function dispatchAndAwait(
     deps.addToast(sessionId, message, "warning");
     throw new InputNotConsumedError(message);
   }
+  const intent =
+    typeof intentOrFactory === "function" ? intentOrFactory(observation) : intentOrFactory;
   const intentId = deps.createIntentId?.() ?? crypto.randomUUID();
   let receipt: IntentReceipt;
   try {
@@ -159,7 +161,12 @@ async function dispatchAndAwait(
     throw new InputNotConsumedError(message);
   }
   if (receipt.status === "not_admitted") {
-    const message = `Intent was not admitted: ${receipt.reason.replaceAll("_", " ")}`;
+    const message =
+      receipt.reason === "busy" && intent.kind === "runBash"
+        ? "Another session operation is already running; the shell command was not started."
+        : receipt.reason === "stale_editor" && intent.kind === "runBash"
+          ? "The shell draft changed before it could start; the current draft was preserved."
+          : `Intent was not admitted: ${receipt.reason.replaceAll("_", " ")}`;
     deps.addToast(sessionId, message, "warning");
     throw new InputNotConsumedError(message);
   }
@@ -199,12 +206,24 @@ export async function executeAction(
   switch (action.kind) {
     case "send-prompt":
       return executePrompt(sessionId, action, deps);
-    case "bash":
+    case "bash": {
+      if (new TextEncoder().encode(action.command).byteLength > 64 * 1024) {
+        const message = "Shell commands are limited to 64 KiB; the draft was preserved.";
+        deps.addToast(sessionId, message, "warning");
+        throw new InputNotConsumedError(message);
+      }
       return dispatchAndAwait(
         sessionId,
-        { kind: "runBash", command: action.command, excludeFromContext: action.excludeFromContext },
+        (observation) => ({
+          kind: "runBash",
+          command: action.command,
+          excludeFromContext: action.excludeFromContext,
+          editorRevision: observation.editorRevision,
+          editorText: action.editorText,
+        }),
         deps,
       );
+    }
     case "model":
       return executeModel(sessionId, action, deps);
     case "name":

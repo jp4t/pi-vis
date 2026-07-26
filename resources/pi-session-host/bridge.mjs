@@ -1,6 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { constants as osConstants } from "node:os";
 import { basename } from "node:path";
 import { createStateAuthority } from "./state-authority.mjs";
+
+function exitSignalName(value) {
+  if (typeof value === "string" && value.length > 0) return value;
+  if (!Number.isSafeInteger(value) || value <= 0) return undefined;
+  return (
+    Object.entries(osConstants.signals).find(([, number]) => number === value)?.[0] ??
+    `SIGNAL_${value}`
+  );
+}
 
 /**
  * pi-session-host: Command/event bridge between Electron main and pi SDK.
@@ -121,6 +131,7 @@ export function assertHostCapabilities(session, runtime, pi) {
     "setModel",
     "setThinkingLevel",
     "executeBash",
+    "recordBashResult",
     "compact",
     "getSessionStats",
     "getLastAssistantText",
@@ -156,7 +167,10 @@ export function assertHostCapabilities(session, runtime, pi) {
   fn(session?.resourceLoader, "getSkills", "session.resourceLoader.getSkills");
   fn(session?.sessionManager, "getLeafId", "session.sessionManager.getLeafId");
   fn(session?.sessionManager, "getBranch", "session.sessionManager.getBranch");
+  fn(session?.sessionManager, "getCwd", "session.sessionManager.getCwd");
+  fn(session?.sessionManager, "appendCustomEntry", "session.sessionManager.appendCustomEntry");
   fn(pi, "resolveModelScopeWithDiagnostics", "pi.resolveModelScopeWithDiagnostics");
+  fn(pi, "getShellConfig", "pi.getShellConfig");
 
   for (const m of [
     "newSession",
@@ -236,6 +250,7 @@ export function setupCommandBridge({
   // Host-owned presentation reconstruction baselines. The child authority
   // serializes these only after prior ingress commits.
   authorityPresentation = {},
+  createShellController = null,
   sendFrame = null,
   sendPresentation = null,
   // Main owns target validation and advisory locks. The child uses this only
@@ -250,6 +265,7 @@ export function setupCommandBridge({
     catalogSnapshot: () => ({}),
     editorSnapshot: () => ({ revision: 0, text: "" }),
     acceptEditorSubmission: () => false,
+    acceptShellEditorSubmission: () => false,
     applyEditorPatch: () => ({ accepted: false }),
   },
 }) {
@@ -258,6 +274,7 @@ export function setupCommandBridge({
   const activeInterrupts = new Map();
   let activeCommands = 0;
   let nextInterruptId = 1;
+  let activeShell = null;
   const lifecycleContext = new AsyncLocalStorage();
   const admissionContext = new AsyncLocalStorage();
   const lifecycleBlockers = new Map();
@@ -306,6 +323,8 @@ export function setupCommandBridge({
     }),
     getEditor: () => uiState.editorSnapshot(),
     acceptEditorSubmission: (request) => uiState.acceptEditorSubmission?.(request) ?? false,
+    acceptShellEditorSubmission: (request) =>
+      uiState.acceptShellEditorSubmission?.(request) ?? false,
     onAdmissionStuck: ({ intentId }) => {
       send({
         type: "fatal_transition_error",
@@ -359,39 +378,387 @@ export function setupCommandBridge({
 
   if (initialBinding) authority.beginTransition(authority.sessionEpoch, false);
 
+  function presentShellSnapshot(
+    shell,
+    snapshot,
+    keyframe,
+    reconstructionFenceToken = shell.reconstructionFenceToken,
+  ) {
+    const replay = snapshot.replay;
+    const hasKeyframe = typeof keyframe?.ansi === "string";
+    const omitted = hasKeyframe
+      ? keyframe.truncated === true || replay.gap
+      : replay.gap || replay.truncated;
+    if (
+      activeShell === shell &&
+      shell.inputFenced &&
+      shell.reconstructionFenceToken === reconstructionFenceToken
+    ) {
+      shell.inputFenceThrough = snapshot.outputSequence;
+    }
+    const ansi = hasKeyframe
+      ? `${keyframe.ansi}${replay.chunks.map((chunk) => chunk.data).join("")}`
+      : `${omitted ? "\r\n[Earlier live terminal output omitted]\r\n" : ""}${replay.chunks
+          .map((chunk) => chunk.data)
+          .join("")}`;
+    return {
+      id: shell.executionId,
+      command: shell.command,
+      startedAt: shell.startedAt,
+      cwd: shell.cwd,
+      ...(shell.excludeFromContext !== undefined
+        ? { excludeFromContext: shell.excludeFromContext }
+        : {}),
+      cols: snapshot.cols,
+      rows: snapshot.rows,
+      mode: shell.mode,
+      ansi,
+      reconstructionFenceToken,
+      outputThroughSequence: snapshot.outputSequence,
+      inputAcknowledgedThrough: snapshot.inputAcknowledgedThrough,
+      resizeRevision: snapshot.resizeRevision,
+      ...(shell.interruptRequestedAt !== undefined
+        ? { interruptRequestedAt: shell.interruptRequestedAt }
+        : {}),
+      ...(omitted ? { replayTruncated: true } : {}),
+    };
+  }
+
+  function retainedShellSnapshot() {
+    if (!activeShell) return undefined;
+    return presentShellSnapshot(activeShell, activeShell.controller.snapshot());
+  }
+
+  async function prepareRetainedShellSnapshot(reconstructionFence) {
+    const shell = reconstructionFence?.shell ?? activeShell;
+    if (!shell) return undefined;
+    const reconstructionFenceToken = reconstructionFence?.token ?? shell.reconstructionFenceToken;
+    if (typeof shell.controller.reconstructionSnapshot !== "function") {
+      return presentShellSnapshot(
+        shell,
+        shell.controller.snapshot(),
+        undefined,
+        reconstructionFenceToken,
+      );
+    }
+
+    const reconstruction = await shell.controller.reconstructionSnapshot();
+    if (activeShell !== shell) return undefined;
+    return presentShellSnapshot(
+      shell,
+      reconstruction.snapshot,
+      reconstruction.keyframe,
+      reconstructionFenceToken,
+    );
+  }
+
+  function sendShellInput(executionId, sequence, data) {
+    if (!activeShell || activeShell.executionId !== executionId) {
+      return { accepted: false, acknowledgedThrough: 0 };
+    }
+    if (activeShell.inputFenced) {
+      return {
+        accepted: false,
+        acknowledgedThrough: activeShell.controller.snapshot().inputAcknowledgedThrough,
+      };
+    }
+    const result = activeShell.controller.writeInput({ sequence, data });
+    return {
+      accepted: result.accepted === true,
+      acknowledgedThrough: result.acknowledgedThrough,
+      ...(result.gap
+        ? {
+            gap: {
+              expected: result.expectedSequence,
+              received: sequence,
+            },
+          }
+        : {}),
+    };
+  }
+
+  function resizeShell(executionId, revision, cols, rows) {
+    if (!activeShell || activeShell.executionId !== executionId) return false;
+    if (activeShell.inputFenced) return false;
+    return activeShell.controller.resize({ revision, cols, rows }).accepted === true;
+  }
+
+  function fenceShellReconstruction() {
+    if (!activeShell) return undefined;
+    if (
+      !Number.isSafeInteger(activeShell.reconstructionFenceToken) ||
+      activeShell.reconstructionFenceToken < 0 ||
+      activeShell.reconstructionFenceToken === Number.MAX_SAFE_INTEGER
+    ) {
+      throw new Error("Shell reconstruction fence token exhausted");
+    }
+    activeShell.reconstructionFenceToken += 1;
+    activeShell.inputFenced = true;
+    activeShell.inputFenceThrough = activeShell.controller.snapshot().outputSequence;
+    authority.setShellInputReady(activeShell.executionId, false);
+    return { shell: activeShell, token: activeShell.reconstructionFenceToken };
+  }
+
+  function acknowledgeShellReconstruction(
+    executionId,
+    reconstructionFenceToken,
+    outputThroughSequence,
+  ) {
+    if (!activeShell || activeShell.executionId !== executionId) return false;
+    if (
+      !Number.isSafeInteger(reconstructionFenceToken) ||
+      reconstructionFenceToken !== activeShell.reconstructionFenceToken ||
+      !Number.isSafeInteger(outputThroughSequence) ||
+      outputThroughSequence !== activeShell.inputFenceThrough
+    ) {
+      return false;
+    }
+    // The renderer retries acknowledgements while reconstruction is fenced.
+    // Keep that fence in place until stdin-transport bootstrap output has been
+    // removed and the controller can actually accept input.
+    if (activeShell.controller.snapshot().inputReady !== true) return false;
+    activeShell.inputFenced = false;
+    authority.setShellInputReady(executionId, true);
+    return true;
+  }
+
+  function signalShell(executionId, signal) {
+    if (!activeShell || activeShell.executionId !== executionId) return false;
+    if (activeShell.inputFenced) return false;
+    if (signal === "interrupt") {
+      const result = activeShell.controller.interrupt();
+      if (result.requested === true) {
+        activeShell.interruptRequestedAt = Date.now();
+        _session.abortBash();
+      }
+      return result.requested === true || result.alreadyRequested === true;
+    }
+    if (signal === "kill") {
+      const result = activeShell.controller.forceKill();
+      // Mark Pi's public bash operation cancelled as well as terminating the
+      // PTY, so its canonical persisted BashExecutionMessage is truthful.
+      if (result.requested === true) _session.abortBash();
+      return result.requested === true || result.alreadyRequested === true;
+    }
+    return false;
+  }
+
+  function disposeShell() {
+    if (!activeShell) return;
+    activeShell.controller.forceKill();
+    _session.abortBash();
+  }
+
+  function setShellTransportBackpressure(backpressured) {
+    activeShell?.controller.setTransportBackpressured?.(backpressured === true);
+  }
+
   function executeStreamingBash(executionId, command, excludeFromContext) {
-    authority.observeEvent({
-      type: "bash_execution_start",
-      id: executionId,
-      command,
-      ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+    if (typeof createShellController !== "function") {
+      throw new Error("Shell PTY capability is unavailable");
+    }
+    if (activeShell) throw new Error("A Shell Turn is already running");
+    if (typeof pi?.getShellConfig !== "function") {
+      throw new Error("Pi is missing public getShellConfig()");
+    }
+    const startedAt = Date.now();
+    const shellCwd =
+      typeof _session.sessionManager?.getCwd === "function"
+        ? _session.sessionManager.getCwd()
+        : cwd;
+    let terminalMode = "compact";
+    let controller;
+    controller = createShellController({
+      executionId,
+      shellConfig: pi.getShellConfig(_session.settingsManager?.getShellPath?.()),
+      baseEnv: process.env,
+      onRawData: ({ sequence, data }) => {
+        authority.observeEvent({
+          type: "bash_terminal_data",
+          id: executionId,
+          data,
+          sequence,
+          mode: terminalMode,
+        });
+      },
+      onStateChange: (snapshot) => {
+        if (activeShell?.executionId === executionId) {
+          authority.setShellInputReady(
+            executionId,
+            snapshot.inputReady === true && activeShell.inputFenced !== true,
+          );
+        }
+        const nextMode = snapshot.terminal?.activeBuffer === "alternate" ? "fullscreen" : "compact";
+        if (nextMode === terminalMode) return;
+        terminalMode = nextMode;
+        if (activeShell?.executionId === executionId) activeShell.mode = terminalMode;
+        authority.observeEvent({
+          type: "bash_terminal_data",
+          id: executionId,
+          data: "",
+          mode: terminalMode,
+        });
+      },
+      onCallbackError: (error) => {
+        console.error(
+          "[pi-session-host] Shell PTY presentation error:",
+          error instanceof Error ? error.message : error,
+        );
+      },
     });
+    activeShell = {
+      executionId,
+      command,
+      startedAt,
+      cwd: shellCwd,
+      excludeFromContext,
+      mode: terminalMode,
+      controller,
+      inputFenced: false,
+      inputFenceThrough: 0,
+      reconstructionFenceToken: 0,
+    };
+    try {
+      _session.sessionManager.appendCustomEntry("pivis.shell_turn_start", {
+        version: 1,
+        executionId,
+        command,
+        excludeFromContext: excludeFromContext === true,
+        startedAt,
+        cwd: shellCwd,
+        pty: true,
+      });
+    } catch (error) {
+      activeShell = null;
+      controller.dispose();
+      throw error;
+    }
     const finish = (result, errorMessage) => {
+      const endedAt = Date.now();
+      let snapshot;
+      try {
+        snapshot = controller.snapshot();
+      } catch {
+        snapshot = {
+          interruptRequested: false,
+          forceKillRequested: false,
+          terminal: { alternateScreenSeen: false },
+        };
+      }
+      const interrupted = snapshot.interruptRequested === true;
+      const forceKilled = snapshot.forceKillRequested === true;
+      const normalization = snapshot.terminal.alternateScreenSeen
+        ? "alternate_screen_final"
+        : "terminal_buffer";
+      const processSignal = exitSignalName(snapshot.exitSignal);
+      const signal = processSignal
+        ? processSignal
+        : forceKilled
+          ? "SIGKILL"
+          : interrupted
+            ? "SIGINT"
+            : undefined;
+      const cancelled = result?.cancelled === true || interrupted || forceKilled;
+      const reportsCancellation =
+        typeof result?.cancelled === "boolean" || interrupted || forceKilled;
       authority.observeEvent({
         type: "bash_execution_end",
         id: executionId,
         command,
         output: typeof result?.output === "string" ? result.output : "",
         ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
-        ...(typeof result?.cancelled === "boolean" ? { cancelled: result.cancelled } : {}),
+        ...(reportsCancellation ? { cancelled } : {}),
         ...(typeof result?.truncated === "boolean" ? { truncated: result.truncated } : {}),
         ...(typeof result?.fullOutputPath === "string"
           ? { fullOutputPath: result.fullOutputPath }
           : {}),
         ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
         ...(errorMessage ? { errorMessage } : {}),
+        pty: true,
+        durationMs: Math.max(0, endedAt - startedAt),
+        ...(signal ? { signal } : {}),
+        normalization,
       });
+      try {
+        _session.sessionManager.appendCustomEntry("pivis.shell_turn_complete", {
+          version: 1,
+          executionId,
+          endedAt,
+          durationMs: Math.max(0, endedAt - startedAt),
+          ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
+          ...(reportsCancellation ? { cancelled } : {}),
+          ...(typeof result?.truncated === "boolean" ? { truncated: result.truncated } : {}),
+          ...(errorMessage ? { errorMessage } : {}),
+          ...(signal ? { signal } : {}),
+          normalization,
+        });
+      } catch (error) {
+        console.error(
+          "[pi-session-host] Failed to persist Shell Turn metadata:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+      if (activeShell?.executionId === executionId) activeShell = null;
+      controller.dispose();
+    };
+
+    const recordFailedShell = (error) => {
+      const detail = (error instanceof Error ? error.message : String(error))
+        .replaceAll("\u0000", "")
+        .replaceAll("\u001b", "")
+        .slice(0, 4_096);
+      const output = `[Shell execution failed: ${detail || "unknown error"}]`;
+      const result = {
+        output,
+        cancelled: false,
+        truncated: false,
+      };
+      try {
+        _session.recordBashResult(command, result, {
+          id: executionId,
+          ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        });
+      } catch (recordError) {
+        console.error(
+          "[pi-session-host] Failed to persist Shell Turn failure:",
+          recordError instanceof Error ? recordError.message : recordError,
+        );
+      }
+      return { result, detail: detail || "unknown error" };
     };
 
     let operation;
     try {
+      const startedSnapshot = controller.snapshot();
+      authority.observeEvent({
+        type: "bash_execution_start",
+        id: executionId,
+        command,
+        ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        pty: true,
+        startedAt,
+        cwd: shellCwd,
+        cols: startedSnapshot.cols,
+        rows: startedSnapshot.rows,
+      });
       operation = _session.executeBash(command, undefined, {
         id: executionId,
         ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        operations: controller.operations,
       });
     } catch (error) {
-      finish(undefined, error instanceof Error ? error.message : String(error));
-      throw error;
+      const failure = recordFailedShell(error);
+      try {
+        finish(failure.result, failure.detail);
+      } catch (finishError) {
+        if (activeShell?.executionId === executionId) activeShell = null;
+        controller.dispose();
+        console.error(
+          "[pi-session-host] Failed to settle Shell Turn startup error:",
+          finishError instanceof Error ? finishError.message : finishError,
+        );
+      }
+      return Promise.reject(error);
     }
     return Promise.resolve(operation).then(
       (result) => {
@@ -399,7 +766,8 @@ export function setupCommandBridge({
         return result;
       },
       (error) => {
-        finish(undefined, error instanceof Error ? error.message : String(error));
+        const failure = recordFailedShell(error);
+        finish(failure.result, failure.detail);
         throw error;
       },
     );
@@ -1287,17 +1655,24 @@ export function setupCommandBridge({
           );
           return { deferredOutcome: operation };
         }
-        case "runBash":
-          // Bash can run arbitrarily long; settle it off-scheduler too.
-          // Pi 0.82 emits correlated bash_execution_update chunks. Bracket
-          // those public updates with host start/end records so the native
-          // transcript streams output and still has a terminal result.
+        case "runBash": {
+          // Bash can run arbitrarily long; settle it off-scheduler too. Pi
+          // emits correlated bash_execution_update chunks, bracketed by the
+          // host so the native transcript streams and still settles once.
+          // Construct the PTY and persist the start marker before registering
+          // the deferred operation. A throw here is therefore a truthful
+          // pre-admission rejection; synchronous executeBash failures after
+          // that marker are converted to a rejected promise by the helper.
+          const shellOperation = executeStreamingBash(
+            envelope.intentId,
+            intent.command,
+            intent.excludeFromContext,
+          );
           return {
             deferredOutcome: trackInterruptibleOperation(
               "bash",
               () => _session.abortBash(),
-              () =>
-                executeStreamingBash(envelope.intentId, intent.command, intent.excludeFromContext),
+              () => shellOperation,
             ).then((result) => {
               return {
                 started: true,
@@ -1308,6 +1683,7 @@ export function setupCommandBridge({
               };
             }),
           };
+        }
         case "setTrust": {
           const { buildProjectTrustOptions } = await import("./bootstrap.mjs");
           const liveCwd = _session.sessionManager?.getCwd?.() ?? cwd;
@@ -2149,11 +2525,25 @@ export function setupCommandBridge({
     requestLifecyclePermit: (kind) => authority.requestLifecyclePermit(kind),
     dispatchIntent,
     publishSnapshot: (full = true) => authority.publishSnapshot(full),
-    requestAuthorityAttach: (rendererGeneration) =>
-      authority.requestAuthorityAttach(rendererGeneration, authorityPresentation),
+    requestAuthorityAttach: async (rendererGeneration) => {
+      const reconstructionFence = fenceShellReconstruction();
+      const retainedShell = await prepareRetainedShellSnapshot(reconstructionFence);
+      return authority.requestAuthorityAttach(rendererGeneration, {
+        ...authorityPresentation,
+        shell: () => retainedShell,
+      });
+    },
     applyEditorPatch: (patch) => uiState.applyEditorPatch(patch),
     bindExtensions: bindInitialExtensions,
     interruptActiveOperation,
+    sendShellInput,
+    resizeShell,
+    acknowledgeShellReconstruction,
+    fenceShellReconstruction,
+    signalShell,
+    disposeShell,
+    setShellTransportBackpressure,
+    retainedShellSnapshot,
     authority,
   };
 }

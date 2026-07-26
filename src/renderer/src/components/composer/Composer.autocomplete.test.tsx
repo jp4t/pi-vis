@@ -370,6 +370,7 @@ describe("Composer autocomplete and authority intents", () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await vi.waitFor(() => {
       for (const session of useSessionsStore.getState().sessions.values()) {
         expect(session.editorPatchPending).toBe(0);
@@ -378,6 +379,136 @@ describe("Composer autocomplete and authority intents", () => {
     // @ts-expect-error test cleanup
     delete window.pivis;
     document.body.innerHTML = "";
+  });
+
+  it("replaces the attachment affordance with the editable shell prefix", () => {
+    const composer = mount();
+    const textarea = composer.textarea();
+    act(() => textarea.focus());
+
+    type(textarea, "!ls");
+    expect(
+      composer.container
+        .querySelector(".composer__input-row")
+        ?.classList.contains("composer__input-row--shell"),
+    ).toBe(true);
+    expect(textarea.getAttribute("aria-label")).toBe("Shell command");
+    expect(composer.container.querySelector(".composer__shell-prefix")?.textContent).toBe("!");
+    expect(composer.container.querySelector(".composer__attach-btn")).toBeNull();
+    expect(textarea.classList.contains("composer__textarea--shell-prefix-1")).toBe(true);
+    expect(textarea.hasAttribute("aria-describedby")).toBe(false);
+    expect(composer.container.querySelector(".composer__shell-guidance")).toBeNull();
+    expect(composer.container.querySelector(".composer__mode-announcer")?.textContent).toBe(
+      "Shell input. Context included.",
+    );
+
+    type(textarea, "!!ls");
+    expect(composer.container.querySelector(".composer__shell-prefix")?.textContent).toBe("!!");
+    expect(textarea.classList.contains("composer__textarea--shell-prefix-2")).toBe(true);
+    expect(composer.container.querySelector(".composer__mode-announcer")?.textContent).toBe(
+      "Shell input. Context excluded.",
+    );
+
+    type(textarea, "x!!ls");
+    expect(
+      composer.container
+        .querySelector(".composer__input-row")
+        ?.classList.contains("composer__input-row--shell"),
+    ).toBe(false);
+    expect(composer.container.querySelector(".composer__shell-guidance")).toBeNull();
+    expect(composer.container.querySelector(".composer__shell-prefix")).toBeNull();
+    expect(composer.container.querySelector(".composer__attach-btn")).not.toBeNull();
+    expect(textarea.getAttribute("aria-label")).toBe("Message pi");
+    expect(textarea.hasAttribute("aria-describedby")).toBe(false);
+    expect(composer.container.querySelector(".composer__mode-announcer")?.textContent).toBe(
+      "Message input.",
+    );
+    expect(document.activeElement).toBe(textarea);
+    composer.unmount();
+  });
+
+  it("rejects incomplete shell drafts without adding guidance or changing editor custody", () => {
+    vi.useFakeTimers();
+    const composer = mount();
+    const textarea = composer.textarea();
+    act(() => textarea.focus());
+
+    type(textarea, "!");
+    expect(composer.container.querySelector(".composer__shell-guidance")).toBeNull();
+    expect(textarea.getAttribute("aria-invalid")).toBeNull();
+    key(textarea, "Enter");
+    expect(intentCalls(invoke)).toHaveLength(0);
+    expect(textarea.value).toBe("!");
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.getAttribute("aria-invalid")).toBe("true");
+    expect(composer.container.querySelector(".composer__input-box--invalid")).not.toBeNull();
+    expect(composer.container.querySelector(".composer__shell-validation")).toBeNull();
+    expect(composer.container.querySelector(".composer__mode-announcer")?.textContent).toBe(
+      "Shell command required.",
+    );
+    act(() => vi.advanceTimersByTime(2_000));
+    expect(composer.container.querySelector(".composer__mode-announcer")?.textContent).toBe("");
+
+    type(textarea, "!!");
+    expect(textarea.getAttribute("aria-invalid")).toBeNull();
+    key(textarea, "Enter");
+    expect(intentCalls(invoke)).toHaveLength(0);
+    expect(textarea.value).toBe("!!");
+    expect(document.activeElement).toBe(textarea);
+    expect(textarea.getAttribute("aria-invalid")).toBe("true");
+    expect(composer.container.querySelector(".composer__shell-guidance")).toBeNull();
+    composer.unmount();
+  });
+
+  it("runs shell commands while preserving staged file and image attachments", async () => {
+    setAuthorityAttachments([
+      { kind: "file", name: "notes.txt", path: "/tmp/notes.txt" },
+      {
+        kind: "image",
+        name: "diagram.png",
+        path: "/tmp/diagram.png",
+        dataUrl: "data:image/png;base64,eA==",
+      },
+    ]);
+    const composer = mount();
+    await vi.waitFor(() =>
+      expect(composer.container.querySelectorAll(".composer__attachment-item")).toHaveLength(2),
+    );
+
+    type(composer.textarea(), "!pwd");
+    expect(composer.container.querySelectorAll(".composer__attachment-item")).toHaveLength(0);
+    expect(composer.container.querySelector(".composer__attach-btn")).toBeNull();
+    expect(composer.container.querySelector(".composer__shell-prefix")?.textContent).toBe("!");
+    await vi.waitFor(() =>
+      expect(useSessionsStore.getState().sessions.get(SID)?.editorPatchPending).toBe(0),
+    );
+    const editorPatchesBeforeAdmission = invoke.mock.calls.filter(
+      ([channel]) => channel === "session.editorPatch",
+    ).length;
+    key(composer.textarea(), "Enter");
+
+    await vi.waitFor(() => expect(intentCalls(invoke)).toHaveLength(1));
+    expect(intentCalls(invoke)[0]!.intent).toEqual({
+      kind: "runBash",
+      command: "pwd",
+      excludeFromContext: false,
+      editorRevision: expect.any(Number),
+      editorText: "!pwd",
+    });
+    await vi.waitFor(() => expect(composer.textarea().value).toBe(""));
+    expect(invoke.mock.calls.filter(([channel]) => channel === "session.editorPatch")).toHaveLength(
+      editorPatchesBeforeAdmission,
+    );
+    expect(composer.container.querySelectorAll(".composer__attachment-item")).toHaveLength(2);
+    expect(composer.container.querySelector(".composer__attach-btn")).not.toBeNull();
+    expect(useSessionsStore.getState().sessions.get(SID)?.editorAttachments).toHaveLength(2);
+    expect(
+      useSessionsStore
+        .getState()
+        .sessions.get(SID)
+        ?.toasts.some((toast) => toast.message.includes("File attachments can only")),
+    ).toBe(false);
+    composer.unmount();
   });
 
   it("keeps /tree invokable before initial authority attachment", async () => {
@@ -1875,6 +2006,23 @@ describe("Composer attachments under authority outcomes", () => {
     expect(
       composer.container.querySelector(".composer__file-attachment")?.getAttribute("title"),
     ).toBe("/tmp/notes.txt");
+    composer.unmount();
+  });
+
+  it("consumes file drops without staging hidden attachments while shell mode is active", () => {
+    const composer = mount();
+    const dropTarget = composer.container.querySelector<HTMLElement>(".composer")!;
+    const file = pickedFile("notes.txt", "text/plain", "/tmp/notes.txt");
+    type(composer.textarea(), "!pwd");
+
+    const dragOver = dispatchFileDrag(dropTarget, "dragover", [file]);
+    const drop = dispatchFileDrag(dropTarget, "drop", [file]);
+
+    expect(dragOver.defaultPrevented).toBe(true);
+    expect(drop.defaultPrevented).toBe(true);
+    expect(composer.container.querySelector(".composer__file-drop")).toBeNull();
+    expect(composer.container.querySelectorAll(".composer__attachment-item")).toHaveLength(0);
+    expect(useSessionsStore.getState().sessions.get(SID)?.editorAttachments).toHaveLength(0);
     composer.unmount();
   });
 

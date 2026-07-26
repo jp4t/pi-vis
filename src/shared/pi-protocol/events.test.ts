@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { PiEventSchema } from "./events.js";
+import {
+  BashExecutionEndEventSchema,
+  BashTerminalDataEventSchema,
+  PiEventSchema,
+} from "./events.js";
 
 const usage = {
   input: 100,
@@ -74,5 +78,73 @@ describe("PiEventSchema", () => {
       id: "bash-1",
       delta: "streamed output",
     });
+  });
+
+  it("accepts the complete PTY Shell Turn lifecycle without treating raw bytes as unknown", () => {
+    expect(
+      PiEventSchema.parse({
+        type: "bash_execution_start",
+        id: "shell-1",
+        command: "vim package.json",
+        excludeFromContext: true,
+        pty: true,
+        startedAt: 1_700_000_000_000,
+        cwd: "/workspace",
+        cols: 80,
+        rows: 24,
+      }),
+    ).not.toHaveProperty("__unknown");
+
+    expect(
+      PiEventSchema.parse({
+        type: "bash_terminal_data",
+        id: "shell-1",
+        data: "\u001b[?1049h",
+        sequence: 1,
+        mode: "fullscreen",
+      }),
+    ).toEqual({
+      type: "bash_terminal_data",
+      id: "shell-1",
+      data: "\u001b[?1049h",
+      sequence: 1,
+      mode: "fullscreen",
+    });
+
+    expect(
+      PiEventSchema.parse({
+        type: "bash_execution_end",
+        id: "shell-1",
+        command: "vim package.json",
+        output: "[alternate screen final frame 80x24]\npackage.json",
+        exitCode: 0,
+        cancelled: false,
+        excludeFromContext: true,
+        pty: true,
+        durationMs: 321,
+        signal: "SIGINT",
+        normalization: "alternate_screen_final",
+      }),
+    ).not.toHaveProperty("__unknown");
+  });
+
+  it("rejects invalid PTY sequence and normalization metadata", () => {
+    expect(
+      BashTerminalDataEventSchema.safeParse({
+        type: "bash_terminal_data",
+        id: "shell-1",
+        data: "output",
+        sequence: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      BashExecutionEndEventSchema.safeParse({
+        type: "bash_execution_end",
+        id: "shell-1",
+        command: "true",
+        output: "",
+        normalization: "raw_ansi",
+      }).success,
+    ).toBe(false);
   });
 });

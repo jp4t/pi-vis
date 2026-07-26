@@ -7,15 +7,18 @@ import {
   IntentEnvelopeSchema,
   IntentOutcomeSchema,
   IntentPayloadConflictSchema,
+  IntentReceiptSchema,
   PanelPresentationBaselineSchema,
   RendererPublicationSchema,
   SESSION_QUERY_POLICY,
   SemanticSnapshotSchema,
+  SessionIntentSchema,
   SessionQueryEnvelopeSchema,
   SessionQueryResultSchema,
   SessionQuerySchema,
   SessionRuntimeResumeStateSchema,
   SessionSubmissionSchema,
+  ShellTurnSnapshotSchema,
 } from "./runtime-state.js";
 
 const owner = { hostInstanceId: "host-a", sessionEpoch: 4 };
@@ -589,6 +592,57 @@ describe("authority protocol schemas", () => {
 
   it("requires attach baselines, panel reconstruction, and replay to be internally coherent", () => {
     expect(AuthorityAttachBaselineSchema.safeParse(baseline()).success).toBe(true);
+    const currentShellTurn = {
+      id: "shell-1",
+      command: "npm init",
+      owner,
+      startedAt: 1_700_000_000_000,
+      cwd: "/workspace",
+      excludeFromContext: true,
+      cols: 96,
+      rows: 30,
+      mode: "compact",
+      ansi: "Package name: ",
+      reconstructionFenceToken: 7,
+      outputThroughSequence: 4,
+      inputAcknowledgedThrough: 2,
+      resizeRevision: 3,
+      interruptRequestedAt: 1_700_000_001_000,
+    };
+    expect(
+      ShellTurnSnapshotSchema.safeParse({
+        ...currentShellTurn,
+        replayTruncated: true,
+      }).success,
+    ).toBe(true);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse(
+        baseline({
+          transcript: {
+            sync: { state: "following", cursor },
+            persistedHistoryCursor: null,
+            liveTailCursor: null,
+            overlapBoundary: null,
+            currentShellTurn,
+          },
+        }),
+      ).success,
+    ).toBe(true);
+    expect(
+      ShellTurnSnapshotSchema.safeParse({
+        ...currentShellTurn,
+        owner: otherOwner,
+        outputThroughSequence: -1,
+      }).success,
+    ).toBe(false);
+    expect(
+      ShellTurnSnapshotSchema.safeParse({
+        ...currentShellTurn,
+        reconstructionFenceToken: -1,
+      }).success,
+    ).toBe(false);
+    const { reconstructionFenceToken: _omittedFenceToken, ...missingFenceToken } = currentShellTurn;
+    expect(ShellTurnSnapshotSchema.safeParse(missingFenceToken).success).toBe(false);
     expect(
       AuthorityAttachBaselineSchema.safeParse(
         baseline({
@@ -639,5 +693,66 @@ describe("authority protocol schemas", () => {
         replay: [{ ...response.replay[0], publicationSequence: 20 }],
       }).success,
     ).toBe(false);
+  });
+
+  it("models a busy Shell Turn refusal as a non-admitted receipt", () => {
+    expect(
+      IntentReceiptSchema.parse({
+        status: "not_admitted",
+        intentId: "shell-1",
+        reason: "busy",
+      }),
+    ).toMatchObject({ status: "not_admitted", reason: "busy" });
+  });
+
+  it("binds a Shell Turn command and context mode to its exact raw editor source", () => {
+    expect(
+      SessionIntentSchema.parse({
+        kind: "runBash",
+        command: "!echo once",
+        excludeFromContext: true,
+        editorRevision: 7,
+        editorText: "!!!echo once  ",
+      }),
+    ).toMatchObject({
+      command: "!echo once",
+      excludeFromContext: true,
+      editorRevision: 7,
+    });
+    for (const intent of [
+      {
+        kind: "runBash",
+        command: "echo once",
+        excludeFromContext: false,
+        editorRevision: 7,
+        editorText: "!!echo once",
+      },
+      {
+        kind: "runBash",
+        command: "echo different",
+        excludeFromContext: false,
+        editorRevision: 7,
+        editorText: "!echo once",
+      },
+      {
+        kind: "runBash",
+        command: "echo once",
+        excludeFromContext: false,
+        editorRevision: 7,
+        editorText: "echo once",
+      },
+    ]) {
+      expect(SessionIntentSchema.safeParse(intent).success).toBe(false);
+    }
+  });
+
+  it("models an exact-editor Shell Turn refusal as a typed non-admitted receipt", () => {
+    expect(
+      IntentReceiptSchema.parse({
+        status: "not_admitted",
+        intentId: "shell-2",
+        reason: "stale_editor",
+      }),
+    ).toMatchObject({ status: "not_admitted", reason: "stale_editor" });
   });
 });

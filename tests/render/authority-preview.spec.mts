@@ -120,8 +120,12 @@ test("preview implements owner-bound query/intent frames without legacy commands
       terminalSnapshot: { model: { id: "claude-fable-5", provider: "anthropic" } },
     },
   });
-  expect(result.publication.payload.transportSequence).toBe(
-    result.attach.baseline.semantic.sync.cursor.transportSequence + 1,
+  // Activation may publish another same-owner semantic snapshot between the
+  // observed baseline and this asynchronously settled intent. Intent outcomes
+  // must advance the authority cursor, but they are not required to be the
+  // immediately adjacent frame.
+  expect(result.publication.payload.transportSequence).toBeGreaterThan(
+    result.attach.baseline.semantic.sync.cursor.transportSequence,
   );
   expect(result.publication.payload.terminalSnapshot.snapshotSequence).toBeGreaterThan(
     result.attach.baseline.semantic.sync.cursor.snapshotSequence,

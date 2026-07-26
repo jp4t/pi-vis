@@ -52,6 +52,8 @@ const LARGE_SINGLE_LINE_CHARS = 24_000;
 const LARGE_STRUCTURED_TEXT_CHARS = 120_000;
 const LARGE_DIFF_CHARS = 240_000;
 const LARGE_DIFF_LINES = 1_500;
+const SHELL_VIRTUALIZE_LINES = 1_000;
+const SHELL_VIRTUALIZE_CHARS = 256 * 1024;
 // Treat only the browser's sub-pixel rounding fringe as the bottom. A small
 // intentional scroll must leave bottom-follow immediately instead of sitting
 // in a fuzzy zone that later layout/streaming work can snap back down.
@@ -267,11 +269,14 @@ function ToolCardShell({
   );
 }
 
-function useCardDisclosure(preserveScroll: (mutate: () => void) => void): {
+function useCardDisclosure(
+  preserveScroll: (mutate: () => void) => void,
+  initialOpen = false,
+): {
   open: boolean;
   toggle: () => void;
 } {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(initialOpen);
   const toggle = useCallback(() => {
     preserveScroll(() => setOpen((value) => !value));
   }, [preserveScroll]);
@@ -282,9 +287,13 @@ function useCardDisclosure(preserveScroll: (mutate: () => void) => void): {
 const CopyButton = memo(function CopyButton({
   text,
   label = "Copy all",
+  iconOnly = false,
+  className,
 }: {
   text: string;
   label?: string;
+  iconOnly?: boolean;
+  className?: string;
 }): React.ReactElement {
   const [copied, setCopied] = useState(false);
   const copy = useCallback(async () => {
@@ -298,9 +307,20 @@ const CopyButton = memo(function CopyButton({
   }, [text]);
 
   return (
-    <button type="button" className="tool-card__copy" onClick={copy}>
+    <button
+      type="button"
+      className={`tool-card__copy${iconOnly ? " tool-card__copy--icon-only" : ""}${copied ? " tool-card__copy--copied" : ""}${className ? ` ${className}` : ""}`}
+      onClick={copy}
+      {...(iconOnly ? { "aria-label": label, title: copied ? "Copied" : label } : {})}
+    >
       <IconCopy />
-      <span>{copied ? "Copied" : label}</span>
+      {iconOnly ? (
+        <span className="tool-card__copy-status" role="status" aria-live="polite">
+          {copied ? "Copied" : ""}
+        </span>
+      ) : (
+        <span>{copied ? "Copied" : label}</span>
+      )}
     </button>
   );
 });
@@ -556,9 +576,11 @@ const AssistantBlock = memo(function AssistantBlock({
 const VirtualizedOutput = memo(function VirtualizedOutput({
   text,
   label = "output",
+  hideHeader = false,
 }: {
   text: string;
   label?: string;
+  hideHeader?: boolean;
 }): React.ReactElement | null {
   const lines = useMemo(() => splitOutputLines(text), [text]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -593,11 +615,13 @@ const VirtualizedOutput = memo(function VirtualizedOutput({
   if (lines.length === 1 && text.length >= LARGE_SINGLE_LINE_CHARS) {
     return (
       <div className="tool-card__output-panel">
-        <SectionHeader
-          title={label}
-          meta={`${formatLineCount(1)} · ${formatCharCount(text.length)}`}
-          copyText={text}
-        />
+        {!hideHeader && (
+          <SectionHeader
+            title={label}
+            meta={`${formatLineCount(1)} · ${formatCharCount(text.length)}`}
+            copyText={text}
+          />
+        )}
         <textarea
           className="tool-card__large-payload"
           aria-label={`${label}, complete value`}
@@ -616,7 +640,9 @@ const VirtualizedOutput = memo(function VirtualizedOutput({
   const afterHeight = Math.max(0, (lines.length - end) * rowHeight);
   return (
     <div className="tool-card__output-panel">
-      <SectionHeader title={label} meta={formatLineCount(lines.length)} copyText={text} />
+      {!hideHeader && (
+        <SectionHeader title={label} meta={formatLineCount(lines.length)} copyText={text} />
+      )}
       <div className="tool-card__output-frame">
         <div
           ref={scrollRef}
@@ -844,93 +870,112 @@ const BashBlock = memo(function BashBlock({
 }: {
   data: BashBlockData;
   preserveScroll: (mutate: () => void) => void;
-}): React.ReactElement {
+}): React.ReactElement | null {
   const outputLines = useMemo(() => splitOutputLines(data.outputText), [data.outputText]);
-  const isError = data.exitCode != null && data.exitCode !== 0;
-  const wasInterrupted = !!data.interrupted || !!data.cancelled;
-  const { open, toggle } = useCardDisclosure(preserveScroll);
+  const { open, toggle } = useCardDisclosure(preserveScroll, true);
+  const bodyId = useId();
+  // The correlated live PTY is mounted in the Composer boundary. Reveal this
+  // same transcript turn in chronological position only after it settles.
+  if (data.pty && data.isStreaming) return null;
+  const wasCancelled = data.cancelled === true;
+  const wasInterrupted = data.interrupted === true && !wasCancelled;
+  const isError =
+    data.errorMessage !== undefined ||
+    (!wasCancelled && !wasInterrupted && data.exitCode != null && data.exitCode !== 0);
   const status = data.isStreaming
     ? "running"
-    : isError
-      ? `exited with code ${data.exitCode}`
+    : wasCancelled
+      ? "cancelled"
       : wasInterrupted
         ? "interrupted"
-        : "complete";
-
-  const trailing =
-    outputLines.length > 0 || data.isStreaming || isError || wasInterrupted || data.truncated ? (
-      <>
-        {outputLines.length > 0 && (
-          <span className="tool-card__summary-meta">{formatLineCount(outputLines.length)}</span>
-        )}
-        {data.isStreaming && <Spinner className="tool-card__spinner" />}
-        {isError && <span className="tool-card__badge">exit {data.exitCode}</span>}
-        {wasInterrupted && !isError && (
-          <span className="tool-card__badge tool-card__badge--interrupted">interrupted</span>
-        )}
-        {data.truncated && !isError && !wasInterrupted && (
-          <span className="tool-card__badge tool-card__badge--neutral">truncated</span>
-        )}
-      </>
-    ) : undefined;
+        : data.errorMessage
+          ? "failed"
+          : data.exitCode != null
+            ? `exit ${data.exitCode}`
+            : "complete";
+  const duration =
+    data.durationMs === undefined
+      ? undefined
+      : data.durationMs < 1_000
+        ? `${Math.round(data.durationMs)} ms`
+        : `${(data.durationMs / 1_000).toFixed(data.durationMs < 10_000 ? 1 : 0)} s`;
+  const shellPrefix = data.excludeFromContext ? "!!" : "!";
+  const accessibleContext = data.excludeFromContext ? "context excluded" : "context included";
+  const virtualized =
+    outputLines.length > SHELL_VIRTUALIZE_LINES || data.outputText.length > SHELL_VIRTUALIZE_CHARS;
+  const hasDetails = Boolean(data.cwd || data.truncated || data.fullOutputPath);
+  const hasBody = outputLines.length > 0 || hasDetails;
+  const headerIdentity = (
+    <>
+      <span className="shell-turn__prefix" aria-hidden="true">
+        {shellPrefix}
+      </span>
+      <FadeText className="shell-turn__command" title={data.command}>
+        {data.command}
+      </FadeText>
+      <span className="shell-turn__meta">
+        <span className="shell-turn__status">{status}</span>
+        {duration && <span>{duration}</span>}
+        {data.signal && <span>{data.signal}</span>}
+      </span>
+    </>
+  );
 
   return (
-    <ToolCardShell
-      isError={isError}
-      open={open}
-      onToggle={toggle}
-      accessibleLabel="shell command"
-      accessibleSummary={
-        [
-          firstNonEmptyLine(data.command),
-          outputLines.length > 0 ? formatLineCount(outputLines.length) : null,
-          data.isStreaming ? "running" : null,
-          isError ? `exit ${data.exitCode}` : null,
-          wasInterrupted && !isError ? "interrupted" : null,
-          data.truncated && !isError && !wasInterrupted ? "truncated" : null,
-        ]
-          .filter(Boolean)
-          .join(" · ") || undefined
-      }
-      kind={<span className="tool-card__name tool-card__name--bash">$</span>}
-      subject={
-        <FadeText className="tool-card__subject tool-card__subject--command" title={data.command}>
-          {data.command}
-        </FadeText>
-      }
-      trailing={trailing}
+    <article
+      className={`shell-turn${open && hasBody ? " shell-turn--open" : ""}${isError ? " shell-turn--error" : ""}${wasInterrupted ? " shell-turn--interrupted" : ""}${wasCancelled ? " shell-turn--cancelled" : ""}`}
+      aria-label={`You, Shell, ${accessibleContext}, ${status}`}
     >
-      <ProvenanceGrid
-        values={[
-          ["Kind", "Direct shell command"],
-          ["Status", status],
-          ...(data.timestamp !== undefined
-            ? [["Timestamp", data.timestamp] as [string, React.ReactNode]]
-            : []),
-        ]}
-      />
-      <StructuredPayload label="Command" value={data.command} />
-      {outputLines.length > 0 ? (
-        <VirtualizedOutput text={data.outputText} />
-      ) : (
-        <EmptySection label="Output">The command produced no output.</EmptySection>
+      <header className="shell-turn__header">
+        {hasBody ? (
+          <button
+            type="button"
+            className="shell-turn__disclosure fade-scope"
+            onClick={toggle}
+            aria-expanded={open}
+            aria-controls={bodyId}
+            aria-label={`Shell Turn details — ${shellPrefix}${data.command} · ${status}`}
+          >
+            <IconChevronRight className="shell-turn__chevron" />
+            {headerIdentity}
+          </button>
+        ) : (
+          <div className="shell-turn__summary">{headerIdentity}</div>
+        )}
+        {outputLines.length > 0 && (
+          <CopyButton
+            text={data.outputText}
+            label="Copy output"
+            iconOnly
+            className="shell-turn__output-copy"
+          />
+        )}
+      </header>
+      {hasBody && open && (
+        <div id={bodyId} className="shell-turn__body">
+          {outputLines.length > 0 && (
+            <section className="shell-turn__output-section" aria-label="Shell output">
+              {virtualized ? (
+                <VirtualizedOutput text={data.outputText} label="Shell output" hideHeader />
+              ) : (
+                <pre
+                  className={`shell-turn__output${outputLines.length > 8 ? " shell-turn__output--scroll" : ""}`}
+                >
+                  {data.outputText}
+                </pre>
+              )}
+            </section>
+          )}
+          {hasDetails && (
+            <footer className="shell-turn__details">
+              {data.cwd && <span>Cwd: {data.cwd}</span>}
+              {data.truncated && <span>Output truncated</span>}
+              {data.fullOutputPath && <span>Full output: {data.fullOutputPath}</span>}
+            </footer>
+          )}
+        </div>
       )}
-      {(data.truncated ||
-        data.fullOutputPath !== undefined ||
-        data.excludeFromContext !== undefined ||
-        data.cancelled !== undefined) && (
-        <StructuredPayload
-          label="Execution metadata"
-          value={{
-            cancelled: data.cancelled ?? false,
-            truncated: data.truncated ?? false,
-            fullOutputPath: data.fullOutputPath ?? null,
-            excludeFromContext: data.excludeFromContext ?? false,
-            timestamp: data.timestamp ?? null,
-          }}
-        />
-      )}
-    </ToolCardShell>
+    </article>
   );
 });
 
@@ -1693,6 +1738,7 @@ function buildCompactRenderItems(
     const item: TranscriptRenderItem = { kind: "block", block };
     if (
       block.type === "user" ||
+      block.type === "bash" ||
       block.type === "custom_entry" ||
       (block.type === "error" && !block.data.retryable)
     ) {

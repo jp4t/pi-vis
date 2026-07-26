@@ -150,7 +150,26 @@ test.describe("process-level ESC cancellation", () => {
       await textarea.fill("!test-long-bash");
       await textarea.press("Enter");
       const bash = await waitForOperation(folders, "started", "bash");
-      await textarea.press("Escape");
+      const shell = window.getByRole("region", { name: "Active Shell Turn" });
+      await expect(shell).toBeVisible();
+      const shellInput = shell.locator(".xterm-helper-textarea");
+      await shellInput.evaluate((element) => (element as HTMLTextAreaElement).focus());
+      await window.keyboard.press("Escape");
+      // A direct Shell Turn owns focused terminal input. Escape is an input
+      // byte for the foreground program, never a global cancellation request.
+      await window.waitForTimeout(250);
+      expect(
+        operationEntries(folders).some(
+          (entry) =>
+            entry.event === "cancelled" && entry.kind === "bash" && entry.token === bash.token,
+        ),
+      ).toBe(false);
+      await expect(shell).toBeVisible();
+      await expect(
+        shell.getByRole("button", { name: /(?:Interrupt|Force stop) shell command/ }),
+      ).toHaveCount(0);
+      await shellInput.evaluate((element) => (element as HTMLTextAreaElement).focus());
+      await window.keyboard.press("Control+C");
       await waitForOperation(folders, "cancelled", "bash");
       await window.waitForTimeout(900);
       expect(

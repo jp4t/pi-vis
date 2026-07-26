@@ -362,6 +362,187 @@
   margin: var(--space-2) 0;
 }
 
+/* ── User-owned Shell Turns ────────────────────────────────────────── */
+.shell-turn {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-lg);
+}
+
+.shell-turn--error .shell-turn__status {
+  color: var(--danger);
+}
+
+.shell-turn--interrupted .shell-turn__status,
+.shell-turn--cancelled .shell-turn__status {
+  color: var(--warning);
+}
+
+.shell-turn__header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.shell-turn__disclosure,
+.shell-turn__summary {
+  display: grid;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.shell-turn__disclosure {
+  grid-template-columns: max-content max-content minmax(0, 1fr) max-content;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.shell-turn__summary {
+  grid-template-columns: max-content minmax(0, 1fr) max-content;
+}
+
+.shell-turn__disclosure:focus-visible {
+  outline: none;
+}
+
+.shell-turn__chevron {
+  color: var(--text-ghost);
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+
+.shell-turn__disclosure:is(:hover, :focus-visible) .shell-turn__chevron {
+  color: var(--text-secondary);
+}
+
+.shell-turn--open .shell-turn__chevron {
+  transform: rotate(90deg);
+}
+
+.shell-turn__prefix {
+  flex: none;
+  color: var(--success);
+  font-family: var(--font-display);
+  font-size: var(--font-size-small);
+  font-weight: 600;
+  line-height: var(--leading-label);
+  white-space: nowrap;
+}
+
+.shell-turn__command {
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--font-code);
+  font-size: var(--font-size-code);
+  line-height: var(--leading-code);
+}
+
+.shell-turn__meta,
+.shell-turn__details {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--font-size-tiny);
+}
+
+.shell-turn__meta > * + *::before,
+.shell-turn__details > * + *::before {
+  content: "·";
+  margin-right: var(--space-2);
+  color: var(--text-ghost);
+}
+
+.shell-turn__status {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.shell-turn__output-section {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--bg);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--radius-md);
+}
+
+.shell-turn__output {
+  max-width: 100%;
+  margin: 0;
+  padding: var(--space-3);
+  overflow-x: auto;
+  color: var(--text-muted);
+  font-family: var(--font-code);
+  font-size: var(--font-size-code);
+  line-height: var(--leading-code);
+  white-space: pre;
+}
+
+.shell-turn__output--scroll {
+  max-height: min(45vh, 34rem);
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.shell-turn__body {
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.tool-card__copy.shell-turn__output-copy {
+  margin-left: 0;
+}
+
+.shell-turn__output-section .tool-card__output-panel {
+  gap: 0;
+}
+
+.shell-turn__output-section .tool-card__output-frame {
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+
+.shell-turn__details {
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border-faint);
+}
+
+@media (max-width: 48rem) {
+  .shell-turn__disclosure {
+    grid-template-columns: max-content max-content minmax(0, 1fr);
+  }
+
+  .shell-turn__summary {
+    grid-template-columns: max-content minmax(0, 1fr);
+  }
+
+  .shell-turn__disclosure .shell-turn__meta {
+    grid-column: 3 / -1;
+    grid-row: 2;
+  }
+
+  .shell-turn__summary .shell-turn__meta {
+    grid-column: 2 / -1;
+    grid-row: 2;
+  }
+}
+
 /* ── Tool/bash cards (terminal boxes) ────────────────────────────────
    Header layout: label (tool name) · monospace subject (file path /
    command).  The label uses the UI font per the typography spec; the
@@ -567,9 +748,37 @@
   color: var(--text);
 }
 
+.tool-card__copy:active {
+  background: var(--surface-inset);
+}
+
 .tool-card__copy svg {
   width: 0.786rem;
   height: 0.786rem;
+}
+
+.tool-card__copy--icon-only {
+  justify-content: center;
+  width: 1.714rem;
+  height: 1.714rem;
+  padding: 0;
+}
+
+.tool-card__copy--copied {
+  color: var(--success);
+}
+
+.tool-card__copy-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  opacity: 0;
+  white-space: nowrap;
+  border: 0;
 }
 
 .tool-card__provenance {
@@ -740,7 +949,6 @@
 
 .tool-card__extension-render--error {
   border-color: color-mix(in srgb, var(--danger) 35%, transparent);
-  box-shadow: inset 2px 0 0 var(--danger);
 }
 
 .tool-card__output {

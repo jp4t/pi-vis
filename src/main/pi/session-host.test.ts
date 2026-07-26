@@ -607,7 +607,13 @@ describe("SessionHost", () => {
     const intentEnvelope = {
       intentId: "intent-1",
       expectedOwner: { hostInstanceId: "", sessionEpoch: 0 },
-      intent: { kind: "runBash", command: "pwd" },
+      intent: {
+        kind: "runBash",
+        command: "pwd",
+        excludeFromContext: false,
+        editorRevision: 1,
+        editorText: "!pwd",
+      },
     };
 
     it("returns an admission receipt while terminal outcomes arrive on the authority wire", async () => {
@@ -795,6 +801,57 @@ describe("SessionHost", () => {
       await host.waitForReady();
       host.sendInterrupt();
       expect(fake.sent).toContainEqual({ type: "interrupt" });
+    });
+  });
+
+  describe("Shell Turn I/O round-trips", () => {
+    it("forwards sequenced input and returns the host acknowledgement", async () => {
+      await fake.emitReady("0.82.1");
+      await host.waitForReady();
+
+      await expect(host.sendShellInput("shell-1", 2, "yes\n")).resolves.toEqual({
+        accepted: true,
+        acknowledgedThrough: 2,
+      });
+      expect(fake.sent).toContainEqual(
+        expect.objectContaining({
+          type: "shell_input",
+          executionId: "shell-1",
+          sequence: 2,
+          data: "yes\n",
+        }),
+      );
+    });
+
+    it("forwards resize revisions, reconstruction acknowledgement, and signals", async () => {
+      await fake.emitReady("0.82.1");
+      await host.waitForReady();
+
+      await expect(host.sendShellResize("shell-1", 4, 120, 40)).resolves.toBe(true);
+      await expect(host.acknowledgeShellReconstruction("shell-1", 3, 8)).resolves.toBe(true);
+      await expect(host.sendShellSignal("shell-1", "interrupt")).resolves.toBe(true);
+      expect(fake.sent).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "shell_resize",
+            executionId: "shell-1",
+            revision: 4,
+            cols: 120,
+            rows: 40,
+          }),
+          expect.objectContaining({
+            type: "shell_reconstruction_ack",
+            executionId: "shell-1",
+            reconstructionFenceToken: 3,
+            outputThroughSequence: 8,
+          }),
+          expect.objectContaining({
+            type: "shell_signal",
+            executionId: "shell-1",
+            signal: "interrupt",
+          }),
+        ]),
+      );
     });
   });
 

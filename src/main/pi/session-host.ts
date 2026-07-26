@@ -228,7 +228,15 @@ export interface IntentReceipt {
   status: "admitted" | "duplicate" | "not_admitted" | "delivery_unknown";
   intentId: string;
   owner?: RuntimeOwner;
-  reason?: "stale_owner" | "transport_unavailable" | "closing" | "transitioning" | "invalid";
+  reason?:
+    | "stale_owner"
+    | "stale_editor"
+    | "transport_unavailable"
+    | "closing"
+    | "transitioning"
+    | "busy"
+    | "invalid";
+  invalidReason?: "malformed" | "payload_conflict" | "payload_too_large" | "capacity";
 }
 
 interface PendingRequest {
@@ -1769,6 +1777,64 @@ export class SessionHost extends EventEmitter {
    *  the extension's custom() promise with undefined and tears it down. */
   sendPanelClose(panelId: number, operationId: string): void {
     this.sendToHost({ type: "panel_close_request", panelId, operationId });
+  }
+
+  sendShellInput(
+    executionId: string,
+    sequence: number,
+    data: string,
+  ): Promise<{
+    accepted: boolean;
+    acknowledgedThrough: number;
+    gap?: { expected: number; received: number };
+  }> {
+    return this.requestHost({ type: "shell_input", executionId, sequence, data }).then(
+      (response) => {
+        if (!response.success || !response.data) {
+          throw new Error(response.error ?? "Shell input was not acknowledged");
+        }
+        return response.data as {
+          accepted: boolean;
+          acknowledgedThrough: number;
+          gap?: { expected: number; received: number };
+        };
+      },
+    );
+  }
+
+  sendShellResize(
+    executionId: string,
+    revision: number,
+    cols: number,
+    rows: number,
+  ): Promise<boolean> {
+    return this.requestHost({ type: "shell_resize", executionId, revision, cols, rows }).then(
+      (response) =>
+        Boolean(
+          response.success && (response.data as { accepted?: boolean } | undefined)?.accepted,
+        ),
+    );
+  }
+
+  acknowledgeShellReconstruction(
+    executionId: string,
+    reconstructionFenceToken: number,
+    outputThroughSequence: number,
+  ): Promise<boolean> {
+    return this.requestHost({
+      type: "shell_reconstruction_ack",
+      executionId,
+      reconstructionFenceToken,
+      outputThroughSequence,
+    }).then((response) =>
+      Boolean(response.success && (response.data as { accepted?: boolean } | undefined)?.accepted),
+    );
+  }
+
+  sendShellSignal(executionId: string, signal: "interrupt" | "kill"): Promise<boolean> {
+    return this.requestHost({ type: "shell_signal", executionId, signal }).then((response) =>
+      Boolean(response.success && (response.data as { accepted?: boolean } | undefined)?.accepted),
+    );
   }
 
   private killTimer: ReturnType<typeof setTimeout> | null = null;

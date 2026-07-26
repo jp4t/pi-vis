@@ -6,6 +6,7 @@ import {
   applyPiEvent,
   clearPendingUserEcho,
   createTranscriptState,
+  restoreActiveShellTurn,
   seedFromHistory,
   transcriptBlockCount,
 } from "./transcript.js";
@@ -555,6 +556,347 @@ describe("transcript reducer", () => {
         },
       },
     ]);
+  });
+
+  it("keeps raw PTY replay transient and settles on normalized Shell Turn output", () => {
+    let state = applyPiEvent(
+      createTranscriptState(),
+      e({
+        type: "bash_execution_start",
+        id: "shell-pty-1",
+        command: "vim notes.txt",
+        excludeFromContext: true,
+        pty: true,
+        startedAt: 1_786_000_000_000,
+        cwd: "/workspace/project",
+        cols: 100,
+        rows: 24,
+      }),
+    );
+
+    expect(state.activeBashExecutionId).toBe("shell-pty-1");
+    expect(state.blocks).toMatchObject([
+      {
+        type: "bash",
+        data: {
+          executionId: "shell-pty-1",
+          command: "vim notes.txt",
+          outputText: "",
+          terminalOutput: "",
+          terminalOutputSequence: 0,
+          terminalOutputChunks: [],
+          terminalOutputChunkChars: 0,
+          terminalMode: "compact",
+          pty: true,
+          isStreaming: true,
+          excludeFromContext: true,
+          startedAt: 1_786_000_000_000,
+          timestamp: 1_786_000_000_000,
+          cwd: "/workspace/project",
+        },
+      },
+    ]);
+
+    // Pi's text bash-update record is not a terminal screen and must not be
+    // mixed into the normalized persisted output of a PTY-backed turn.
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_update",
+        id: "shell-pty-1",
+        delta: "text projection that must stay out of the terminal replay",
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_terminal_data",
+        id: "shell-pty-1",
+        data: "\u001b[2J\u001b[Hediting",
+        sequence: 1,
+        mode: "compact",
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_terminal_data",
+        id: "shell-pty-1",
+        data: "\u001b[?1049hfull screen",
+        sequence: 2,
+        mode: "fullscreen",
+      }),
+    );
+
+    const liveBlock = state.blocks[0];
+    expect(liveBlock?.type).toBe("bash");
+    if (liveBlock?.type === "bash") {
+      expect(liveBlock.data.outputText).toBe("");
+      expect(liveBlock.data.terminalOutput).toBe("");
+      expect(liveBlock.data.terminalOutputSequence).toBe(2);
+      expect(liveBlock.data.terminalOutputChunks).toEqual([
+        { sequence: 1, data: "\u001b[2J\u001b[Hediting" },
+        { sequence: 2, data: "\u001b[?1049hfull screen" },
+      ]);
+      expect(liveBlock.data.terminalMode).toBe("fullscreen");
+    }
+
+    const beforeStaleData = state;
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_terminal_data",
+        id: "different-shell",
+        data: "stale bytes",
+        sequence: 3,
+      }),
+    );
+    expect(state).toBe(beforeStaleData);
+
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_end",
+        id: "shell-pty-1",
+        command: "vim notes.txt",
+        output: "final alternate-screen snapshot\n",
+        exitCode: 130,
+        cancelled: true,
+        truncated: true,
+        fullOutputPath: "/tmp/shell-pty-1.log",
+        excludeFromContext: true,
+        pty: true,
+        durationMs: 1_234,
+        signal: "SIGINT",
+        normalization: "alternate_screen_final",
+      }),
+    );
+
+    expect(state.activeBashId).toBeNull();
+    expect(state.activeBashExecutionId).toBeNull();
+    expect(state.blocks).toMatchObject([
+      {
+        type: "bash",
+        data: {
+          executionId: "shell-pty-1",
+          command: "vim notes.txt",
+          outputText: "final alternate-screen snapshot\n",
+          terminalOutput: "",
+          terminalOutputChunks: [],
+          terminalOutputChunkChars: 0,
+          terminalMode: "fullscreen",
+          terminalOutputSequence: 2,
+          pty: true,
+          isStreaming: false,
+          exitCode: 130,
+          cancelled: true,
+          truncated: true,
+          fullOutputPath: "/tmp/shell-pty-1.log",
+          excludeFromContext: true,
+          durationMs: 1_234,
+          signal: "SIGINT",
+          normalization: "alternate_screen_final",
+          startedAt: 1_786_000_000_000,
+          cwd: "/workspace/project",
+        },
+      },
+    ]);
+  });
+
+  it("retains an admitted PTY failure as a failed Shell Turn", () => {
+    let state = applyPiEvent(
+      createTranscriptState(),
+      e({
+        type: "bash_execution_start",
+        id: "failed-shell",
+        command: "missing-command",
+        pty: true,
+        startedAt: 1_786_000_000_000,
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_end",
+        id: "failed-shell",
+        command: "missing-command",
+        output: "[Shell execution failed: spawn failed]",
+        errorMessage: "spawn failed",
+        pty: true,
+        durationMs: 4,
+        normalization: "terminal_buffer",
+      }),
+    );
+
+    expect(state.blocks).toMatchObject([
+      {
+        type: "bash",
+        data: {
+          executionId: "failed-shell",
+          outputText: "[Shell execution failed: spawn failed]",
+          errorMessage: "spawn failed",
+          isStreaming: false,
+          pty: true,
+          durationMs: 4,
+        },
+      },
+    ]);
+  });
+
+  it("bounds live PTY replay to the newest one MiB without accepting stale execution data", () => {
+    let state = applyPiEvent(
+      createTranscriptState(),
+      e({
+        type: "bash_execution_start",
+        id: "bounded-shell",
+        command: "generate-output",
+        pty: true,
+      }),
+    );
+    const prefix = "old-prefix";
+    const newest = "n".repeat(1024 * 1024);
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_terminal_data",
+        id: "bounded-shell",
+        data: `${prefix}${newest}`,
+        sequence: 9,
+      }),
+    );
+
+    const block = state.blocks[0];
+    expect(block?.type).toBe("bash");
+    if (block?.type === "bash") {
+      expect(block.data.terminalOutput).toBe("");
+      expect(block.data.terminalReconstructionSequence).toBe(0);
+      expect(block.data.terminalOutputSequence).toBe(9);
+      expect(block.data.terminalOutputChunks).toEqual([
+        { sequence: 9, data: newest, truncated: true },
+      ]);
+    }
+  });
+
+  it("keeps a reconstruction base static across sustained small live chunks", () => {
+    const base = `\u001b[2J\u001b[H${"k".repeat(1024 * 1024 - 10)}`;
+    let state = restoreActiveShellTurn(createTranscriptState(), {
+      id: "sustained-shell",
+      command: "yes",
+      owner: { hostInstanceId: "shell-host", sessionEpoch: 4 },
+      startedAt: 1_786_000_000_100,
+      cols: 120,
+      rows: 30,
+      mode: "compact",
+      ansi: base,
+      outputThroughSequence: 100,
+      reconstructionFenceToken: 1,
+      inputAcknowledgedThrough: 0,
+      resizeRevision: 0,
+    });
+
+    for (let sequence = 101; sequence <= 2_100; sequence += 1) {
+      state = applyPiEvent(
+        state,
+        e({
+          type: "bash_terminal_data",
+          id: "sustained-shell",
+          data: `line-${sequence}\r\n`,
+          sequence,
+        }),
+      );
+    }
+
+    const block = state.blocks[0];
+    expect(block?.type).toBe("bash");
+    if (block?.type === "bash") {
+      expect(block.data.terminalOutput).toBe(base);
+      expect(block.data.terminalOutput).toHaveLength(base.length);
+      expect(block.data.terminalOutputSequence).toBe(2_100);
+      expect(block.data.terminalOutputChunks?.length).toBeLessThanOrEqual(512);
+      expect(block.data.terminalOutputChunkChars).toBeLessThanOrEqual(1024 * 1024);
+    }
+  });
+
+  it("restores and refreshes one active Shell Turn from a bounded reconstruction keyframe", () => {
+    const owner = { hostInstanceId: "shell-host", sessionEpoch: 4 };
+    const shell = {
+      id: "restored-shell",
+      command: "python",
+      owner,
+      startedAt: 1_786_000_000_100,
+      cwd: "/workspace/restored",
+      excludeFromContext: false,
+      cols: 120,
+      rows: 30,
+      mode: "compact" as const,
+      ansi: "\u001b[2J\u001b[H>>> ",
+      outputThroughSequence: 7,
+      reconstructionFenceToken: 1,
+      inputAcknowledgedThrough: 3,
+      resizeRevision: 2,
+      interruptRequestedAt: 1_786_000_000_500,
+      replayTruncated: true,
+    };
+
+    const restored = restoreActiveShellTurn(createTranscriptState(), shell);
+    const restoredBlock = restored.blocks[0];
+    expect(restored.activeBashId).toBe(restoredBlock?.id);
+    expect(restored.activeBashExecutionId).toBe("restored-shell");
+    expect(restoredBlock).toMatchObject({
+      type: "bash",
+      data: {
+        executionId: "restored-shell",
+        command: "python",
+        outputText: "",
+        terminalOutput: "\u001b[2J\u001b[H>>> ",
+        terminalReconstructionSequence: 7,
+        terminalReconstructionFenceToken: 1,
+        terminalOutputSequence: 7,
+        terminalOutputChunks: [],
+        terminalOutputChunkChars: 0,
+        liveReplayTruncated: true,
+        terminalMode: "compact",
+        inputAcknowledgedThrough: 3,
+        resizeRevision: 2,
+        interruptRequestedAt: 1_786_000_000_500,
+        pty: true,
+        isStreaming: true,
+        excludeFromContext: false,
+        startedAt: 1_786_000_000_100,
+        timestamp: 1_786_000_000_100,
+        cwd: "/workspace/restored",
+      },
+    });
+
+    const refreshed = restoreActiveShellTurn(restored, {
+      ...shell,
+      mode: "fullscreen",
+      ansi: "\u001b[2J\u001b[Hfull-screen keyframe",
+      outputThroughSequence: 12,
+      reconstructionFenceToken: 2,
+      inputAcknowledgedThrough: 8,
+      resizeRevision: 5,
+      cols: 160,
+      rows: 48,
+      replayTruncated: false,
+    });
+    expect(refreshed.blocks).toHaveLength(1);
+    expect(refreshed.blocks[0]?.id).toBe(restoredBlock?.id);
+    expect(refreshed.blocks[0]).toMatchObject({
+      type: "bash",
+      data: {
+        terminalOutput: "\u001b[2J\u001b[Hfull-screen keyframe",
+        terminalReconstructionSequence: 12,
+        terminalReconstructionFenceToken: 2,
+        terminalOutputSequence: 12,
+        terminalOutputChunks: [],
+        terminalOutputChunkChars: 0,
+        liveReplayTruncated: false,
+        terminalMode: "fullscreen",
+        inputAcknowledgedThrough: 8,
+        resizeRevision: 5,
+      },
+    });
   });
 
   it("preserves usage on live tool results and compaction summaries", () => {

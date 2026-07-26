@@ -75,11 +75,28 @@ function makeRequest(intentId, overrides = {}) {
   };
 }
 
+function shellIntent(command, excludeFromContext = false, editorRevision = 1) {
+  return {
+    kind: "runBash",
+    command,
+    excludeFromContext,
+    editorRevision,
+    editorText: `${excludeFromContext ? "!!" : "!"}${command}`,
+  };
+}
+
 function setup(sessionOverrides = {}, options = {}) {
   const session = makeSession(sessionOverrides);
   const sendControl = vi.fn();
   const sendRecord = vi.fn();
   let editor = { revision: 1, text: "draft" };
+  const acceptShellEditorSubmission = vi.fn((request) => {
+    if (request.editorRevision !== editor.revision || request.editorText !== editor.text) {
+      return false;
+    }
+    editor = { ...editor, revision: editor.revision + 1, text: "" };
+    return true;
+  });
   const authority = createStateAuthority({
     hostInstanceId: "host-1",
     initialSession: session,
@@ -87,6 +104,7 @@ function setup(sessionOverrides = {}, options = {}) {
     sendRecord,
     getCatalog: () => ({ pendingDialogs: 3 }),
     getEditor: () => editor,
+    acceptShellEditorSubmission,
     ...options,
   });
   return {
@@ -94,6 +112,7 @@ function setup(sessionOverrides = {}, options = {}) {
     authority,
     sendControl,
     sendRecord,
+    acceptShellEditorSubmission,
     setEditor(value) {
       editor = value;
     },
@@ -1745,7 +1764,7 @@ describe("state authority", () => {
         {
           intentId: "scheduler-blocker",
           expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
-          intent: { kind: "runBash", command: "pwd" },
+          intent: { kind: "setThinking", level: "low" },
         },
         blockerExecute,
       ),
@@ -3269,15 +3288,16 @@ describe("state authority", () => {
 
   it("serializes an attach without waiting for long-running ingress", async () => {
     const gate = deferred();
-    const { authority } = setup();
+    const { authority, setEditor } = setup();
+    setEditor({ revision: 1, text: "!sleep 60" });
     const envelope = {
       intentId: "long-ingress",
       expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
-      intent: { kind: "runBash", command: "sleep 60" },
+      intent: shellIntent("sleep 60"),
     };
-    await expect(authority.dispatchIntent(envelope, () => gate.promise)).resolves.toMatchObject({
-      status: "admitted",
-    });
+    await expect(
+      authority.dispatchIntent(envelope, () => ({ deferredOutcome: gate.promise })),
+    ).resolves.toMatchObject({ status: "admitted" });
     await vi.waitFor(() =>
       expect(authority.semanticSnapshot().activeIntents).toContainEqual(
         expect.objectContaining({ intentId: "long-ingress", state: "admitted" }),
@@ -3424,16 +3444,17 @@ describe("state authority", () => {
 
   it("records dispatch admission before Pi, retains outcomes, and separates receipt from settlement", async () => {
     const gate = deferred();
-    const { authority, sendRecord } = setup();
+    const { authority, sendRecord, setEditor } = setup();
+    setEditor({ revision: 1, text: "!pwd" });
     const envelope = {
       intentId: "wire-intent",
       expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
-      intent: { kind: "runBash", command: "pwd" },
+      intent: shellIntent("pwd"),
     };
     let snapshotAtExecution;
     const execute = vi.fn(() => {
       snapshotAtExecution = authority.semanticSnapshot();
-      return gate.promise;
+      return { deferredOutcome: gate.promise };
     });
 
     await expect(authority.dispatchIntent(envelope, execute)).resolves.toEqual({
@@ -3445,10 +3466,7 @@ describe("state authority", () => {
       status: "duplicate",
     });
     await expect(
-      authority.dispatchIntent(
-        { ...envelope, intent: { kind: "runBash", command: "rm -rf /nope" } },
-        execute,
-      ),
+      authority.dispatchIntent({ ...envelope, intent: shellIntent("rm -rf /nope") }, execute),
     ).resolves.toMatchObject({ status: "not_admitted", reason: "invalid" });
     await expect(
       authority.dispatchIntent(
@@ -3462,7 +3480,10 @@ describe("state authority", () => {
     ).resolves.toMatchObject({ status: "not_admitted", reason: "stale_owner" });
 
     await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
-    expect(snapshotAtExecution.activeIntents).toContainEqual(
+    expect(snapshotAtExecution.activeIntents).not.toContainEqual(
+      expect.objectContaining({ intentId: "wire-intent" }),
+    );
+    expect(authority.semanticSnapshot().activeIntents).toContainEqual(
       expect.objectContaining({ intentId: "wire-intent", kind: "runBash", state: "admitted" }),
     );
     expect(sendRecord).not.toHaveBeenCalledWith(
@@ -3483,6 +3504,288 @@ describe("state authority", () => {
         }),
       ),
     );
+  });
+
+  it("consumes an admitted shell draft in authority while preserving staged context across reattach", async () => {
+    const terminal = deferred();
+    const { authority, setEditor, acceptShellEditorSubmission } = setup();
+    const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    setEditor({
+      revision: 1,
+      text: "!read answer",
+      attachments,
+      conflictText: "newer draft",
+      conflictAttachments: [{ kind: "file", name: "new.txt", path: "/tmp/new.txt" }],
+      alternateConflictText: "alternate draft",
+      alternateConflictAttachments: [],
+      additionalConflictCandidates: [
+        {
+          text: "third draft",
+          attachments: [{ kind: "file", name: "third.txt", path: "/tmp/third.txt" }],
+        },
+      ],
+    });
+    const envelope = {
+      intentId: "authority-owned-shell",
+      expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      intent: shellIntent("read answer"),
+    };
+    const execute = vi.fn(() => ({ deferredOutcome: terminal.promise }));
+
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toMatchObject({
+      status: "admitted",
+      intentId: "authority-owned-shell",
+    });
+    expect(acceptShellEditorSubmission).toHaveBeenCalledWith({
+      intentId: "authority-owned-shell",
+      editorRevision: 1,
+      editorText: "!read answer",
+    });
+    expect(authority.semanticSnapshot().editor).toMatchObject({
+      revision: 2,
+      text: "",
+      attachments,
+      conflictText: "newer draft",
+      conflictAttachments: [{ kind: "file", name: "new.txt", path: "/tmp/new.txt" }],
+      alternateConflictText: "alternate draft",
+      additionalConflictCandidates: [
+        {
+          text: "third draft",
+          attachments: [{ kind: "file", name: "third.txt", path: "/tmp/third.txt" }],
+        },
+      ],
+    });
+
+    // Model renderer disappearance: no renderer-originated clear patch occurs.
+    // A fresh authority attach still receives the consumed editor and retained
+    // staged context, while an intent retry remains exactly-once.
+    const attached = await readyAttach(authority, 23);
+    expect(attached.semantic.snapshot.editor).toMatchObject({
+      revision: 2,
+      text: "",
+      attachments,
+      conflictText: "newer draft",
+    });
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toMatchObject({
+      status: "duplicate",
+      intentId: "authority-owned-shell",
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(acceptShellEditorSubmission).toHaveBeenCalledOnce();
+
+    terminal.resolve({ output: "answer", exitCode: 0 });
+    await flush();
+  });
+
+  it("keeps a durably started shell visible and reports bounded custody failure", async () => {
+    const terminal = deferred();
+    const acceptShellEditorSubmission = vi.fn(() => false);
+    const { authority, setEditor } = setup({}, { acceptShellEditorSubmission });
+    setEditor({ revision: 1, text: "!pwd", attachments: [] });
+    const envelope = {
+      intentId: "shell-custody-anomaly",
+      expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      intent: shellIntent("pwd"),
+    };
+    const execute = vi.fn(() => ({ deferredOutcome: terminal.promise }));
+
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toMatchObject({
+      status: "admitted",
+      intentId: "shell-custody-anomaly",
+    });
+    const attached = await readyAttach(authority, 24);
+    expect(attached.operationJournal).toContainEqual(
+      expect.objectContaining({
+        type: "anomaly",
+        code: "shell_editor_custody_lost",
+        detail: "durable_shell_start_without_editor_consumption",
+      }),
+    );
+    expect(execute).toHaveBeenCalledOnce();
+
+    terminal.resolve({ output: "", exitCode: 0 });
+    await flush();
+  });
+
+  it("refuses a foreground Shell Turn before admission while the session is busy", async () => {
+    const { authority, session, setEditor, acceptShellEditorSubmission } = setup({
+      isIdle: false,
+      isStreaming: true,
+    });
+    setEditor({ revision: 1, text: "!pwd" });
+    const execute = vi.fn();
+    const envelope = {
+      intentId: "busy-shell",
+      expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      intent: shellIntent("pwd"),
+    };
+
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "busy-shell",
+      reason: "busy",
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(acceptShellEditorSubmission).not.toHaveBeenCalled();
+    expect(authority.semanticSnapshot().activeIntents).toEqual([]);
+
+    session.isStreaming = false;
+    session.isIdle = true;
+    await expect(
+      authority.dispatchIntent(envelope, () => ({
+        deferredOutcome: Promise.resolve({ output: "", exitCode: 0 }),
+      })),
+    ).resolves.toMatchObject({ status: "admitted" });
+  });
+
+  it("revalidates the exact shell editor source in its serialized admission slot", async () => {
+    const sendFrame = vi.fn();
+    const { authority, setEditor, acceptShellEditorSubmission } = setup({}, { sendFrame });
+    setEditor({ revision: 1, text: "!pwd" });
+    const envelope = {
+      intentId: "raced-shell-editor",
+      expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      intent: shellIntent("pwd"),
+    };
+    const execute = vi.fn(() => ({
+      deferredOutcome: Promise.resolve({ output: "/tmp", exitCode: 0 }),
+    }));
+
+    const receipt = authority.dispatchIntent(envelope, execute);
+    // Same-owner typing can race the microtask-backed ingress scheduler. The
+    // older command must never consume or execute against the newer revision.
+    setEditor({ revision: 2, text: "!pwd --logical" });
+
+    await expect(receipt).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "raced-shell-editor",
+      reason: "stale_editor",
+    });
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "raced-shell-editor",
+      reason: "stale_editor",
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(acceptShellEditorSubmission).not.toHaveBeenCalled();
+    expect(authority.semanticSnapshot().activeIntents).toEqual([]);
+    expect(authority.failureEscrow().dispatchedIntents).toEqual([]);
+    expect(sendFrame).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        records: expect.arrayContaining([expect.objectContaining({ type: "intent_admitted" })]),
+      }),
+    );
+  });
+
+  it("withholds Shell Turn admission until preparation succeeds and deduplicates while pending", async () => {
+    const preparation = deferred();
+    const terminal = deferred();
+    const { authority, setEditor } = setup();
+    setEditor({ revision: 1, text: "!!read answer" });
+    const envelope = {
+      intentId: "pending-shell-preparation",
+      expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      intent: shellIntent("read answer", true),
+    };
+    const execute = vi.fn(async () => {
+      await preparation.promise;
+      return { deferredOutcome: terminal.promise };
+    });
+
+    const first = authority.dispatchIntent(envelope, execute);
+    const duplicate = authority.dispatchIntent(envelope, execute);
+    let firstSettled = false;
+    void first.then(() => {
+      firstSettled = true;
+    });
+    await flush();
+    expect(firstSettled).toBe(false);
+    expect(authority.semanticSnapshot().activeIntents).toEqual([]);
+
+    preparation.resolve();
+    await expect(first).resolves.toMatchObject({ status: "admitted" });
+    await expect(duplicate).resolves.toMatchObject({ status: "duplicate" });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(authority.semanticSnapshot().activeIntents).toContainEqual(
+      expect.objectContaining({ intentId: "pending-shell-preparation", state: "admitted" }),
+    );
+    terminal.resolve({ output: "ok", exitCode: 0 });
+  });
+
+  it("returns a truthful non-admission when Shell Turn preparation fails", async () => {
+    const sendFrame = vi.fn();
+    const { authority, setEditor, acceptShellEditorSubmission } = setup({}, { sendFrame });
+    setEditor({ revision: 1, text: "!pwd" });
+    const envelope = {
+      intentId: "failed-shell-preparation",
+      expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      intent: shellIntent("pwd"),
+    };
+    const execute = vi.fn(() => {
+      throw new Error("PTY unavailable");
+    });
+
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "failed-shell-preparation",
+      reason: "transport_unavailable",
+    });
+    await expect(authority.dispatchIntent(envelope, execute)).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "failed-shell-preparation",
+      reason: "transport_unavailable",
+    });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(authority.semanticSnapshot().activeIntents).toEqual([]);
+    expect(authority.semanticSnapshot().recentIntentOutcomes).toEqual([]);
+    expect(authority.failureEscrow().dispatchedIntents).toEqual([]);
+    expect(authority.semanticSnapshot().editor).toMatchObject({
+      revision: 1,
+      text: "!pwd",
+    });
+    expect(acceptShellEditorSubmission).not.toHaveBeenCalled();
+  });
+
+  it("does not admit a Shell Turn while compatibility submission custody is unresolved", async () => {
+    vi.useFakeTimers();
+    try {
+      const promptDone = deferred();
+      const { authority, session, setEditor } = setup({
+        isIdle: true,
+        isStreaming: false,
+        prompt: vi.fn(() => promptDone.promise),
+      });
+      setEditor({ revision: 1, text: "!pwd" });
+
+      const pendingSubmission = authority.submit(makeRequest("held-submission"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pendingSubmission).resolves.toMatchObject({ disposition: "admitting" });
+      expect(authority.snapshot().hostFacts.submitting).toBe(true);
+
+      // Pi's direct getters can still look idle while an input hook/preflight
+      // owns submission custody. The child ledger must also fence Shell Turns.
+      session.isIdle = true;
+      session.isStreaming = false;
+      await expect(
+        authority.dispatchIntent(
+          {
+            intentId: "shell-during-custody",
+            expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+            intent: shellIntent("pwd"),
+          },
+          vi.fn(),
+        ),
+      ).resolves.toEqual({
+        status: "not_admitted",
+        intentId: "shell-during-custody",
+        reason: "busy",
+      });
+
+      promptDone.resolve();
+      await flush();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("retains successful navigate post-state but omits it for cancelled navigation", async () => {
@@ -3705,15 +4008,18 @@ describe("state authority", () => {
 
   it("normalizes command, model, bash, and trust outcomes without leaking raw SDK values", async () => {
     const sendFrame = vi.fn();
-    const { authority } = setup({}, { sendFrame });
+    const { authority, setEditor } = setup({}, { sendFrame });
+    setEditor({ revision: 1, text: "!pwd" });
     const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
     const dispatch = (intentId, intent, execute) =>
       authority.dispatchIntent({ intentId, expectedOwner: owner, intent }, execute);
 
-    await dispatch("bash-result", { kind: "runBash", command: "pwd" }, async () => ({
-      output: "/tmp",
-      exitCode: 0,
-      cancelled: false,
+    await dispatch("bash-result", shellIntent("pwd"), async () => ({
+      deferredOutcome: Promise.resolve({
+        output: "/tmp",
+        exitCode: 0,
+        cancelled: false,
+      }),
     }));
     await dispatch(
       "trust-result",
@@ -3834,19 +4140,25 @@ describe("state authority", () => {
   });
 
   it("bounds dispatched intent retention and rejects image payloads over its byte cap", async () => {
-    const { authority } = setup(
+    const { authority, setEditor } = setup(
       {},
       { dispatchedIntentCapacity: 2, dispatchedIntentPayloadBytes: 200 },
     );
     const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
-    const dispatch = (intentId) =>
+    const dispatch = (intentId, editorRevision) =>
       authority.dispatchIntent(
-        { intentId, expectedOwner: owner, intent: { kind: "runBash", command: "pwd" } },
-        async () => ({ output: "/tmp", exitCode: 0 }),
+        { intentId, expectedOwner: owner, intent: shellIntent("pwd", false, editorRevision) },
+        async () => ({
+          deferredOutcome: Promise.resolve({ output: "/tmp", exitCode: 0 }),
+        }),
       );
 
-    for (const id of ["one", "two", "three"]) {
-      await expect(dispatch(id)).resolves.toMatchObject({ status: "admitted" });
+    for (const [index, id] of ["one", "two", "three"].entries()) {
+      const editorRevision = index + 1;
+      setEditor({ revision: editorRevision, text: "!pwd" });
+      await expect(dispatch(id, editorRevision)).resolves.toMatchObject({
+        status: "admitted",
+      });
       await vi.waitFor(() =>
         expect(
           authority
@@ -3912,9 +4224,9 @@ describe("state authority", () => {
       {
         intentId: "outcome-intent",
         expectedOwner: owner,
-        intent: { kind: "runBash", command: "pwd" },
+        intent: { kind: "setThinking", level: "low" },
       },
-      async () => ({ output: "/tmp", exitCode: 0 }),
+      async () => ({ level: "low" }),
     );
     await vi.waitFor(() =>
       expect(authority.createSemanticFrame().terminalSnapshot.recentIntentOutcomes).toContainEqual(
@@ -3982,7 +4294,14 @@ describe("state authority", () => {
       },
       { kind: "compact", instructions: 1 },
       { kind: "invokeCommand", text: "/x", editorRevision: 1, extra: true },
-      { kind: "runBash", command: "pwd", excludeFromContext: "no" },
+      { ...shellIntent("pwd"), excludeFromContext: "no" },
+      { ...shellIntent("pwd"), editorRevision: -1 },
+      { ...shellIntent("pwd"), editorText: "pwd" },
+      { ...shellIntent("pwd"), editorText: "!!pwd" },
+      { ...shellIntent("pwd"), command: "other" },
+      { ...shellIntent("pwd"), command: "" },
+      { ...shellIntent("pwd"), command: " \n\t " },
+      { ...shellIntent("pwd"), command: " pwd" },
       { kind: "setTrust", optionLabel: "", updates: [] },
       { kind: "navigate", targetId: "", summarize: "yes" },
       { kind: "setModel", provider: "p", modelId: "" },
@@ -4008,6 +4327,49 @@ describe("state authority", () => {
     expect(execute).not.toHaveBeenCalled();
     expect(sendFrame).not.toHaveBeenCalled();
     expect((await readyAttach(authority, 1)).operationJournal).toEqual([]);
+  });
+
+  it("reports the UTF-8 shell command limit as payload_too_large at the hostile child boundary", async () => {
+    const { authority } = setup();
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
+    const execute = vi.fn();
+    const command = "é".repeat(32_769);
+
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "oversized-shell",
+          expectedOwner: owner,
+          intent: shellIntent(command),
+        },
+        execute,
+      ),
+    ).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "oversized-shell",
+      reason: "invalid",
+      invalidReason: "payload_too_large",
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("accepts a shell command at exactly 64 KiB UTF-8", async () => {
+    const { authority, setEditor } = setup();
+    const command = "é".repeat(32_768);
+    setEditor({ revision: 1, text: `!${command}` });
+
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "max-sized-shell",
+          expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+          intent: shellIntent(command),
+        },
+        () => ({
+          deferredOutcome: Promise.resolve({ output: "", exitCode: 0 }),
+        }),
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
   });
 
   it("exposes an atomic semantic frame and failure escrow without inventing a compaction end", () => {

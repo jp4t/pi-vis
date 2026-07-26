@@ -1128,6 +1128,64 @@ describe("unified TUI: authoritative submit draft", () => {
     });
   });
 
+  it("atomically consumes only an exact Shell Turn draft and preserves staged context", () => {
+    const h = makeHarness();
+    const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 0,
+        revision: 1,
+        text: "!!read answer",
+        attachments,
+      }),
+    ).toMatchObject({ accepted: true });
+    expect(
+      h.bundle.state.applyEditorPatch({
+        baseRevision: 0,
+        revision: 1,
+        text: "newer local draft",
+        attachments: [{ kind: "file", name: "newer.txt", path: "/tmp/newer.txt" }],
+        alternateConflictText: "alternate draft",
+        alternateConflictAttachments: [],
+        additionalConflictCandidates: [
+          {
+            text: "third draft",
+            attachments: [{ kind: "file", name: "third.txt", path: "/tmp/third.txt" }],
+          },
+        ],
+      }),
+    ).toMatchObject({ accepted: false });
+
+    expect(
+      h.bundle.state.acceptShellEditorSubmission({
+        intentId: "shell-1",
+        editorRevision: 1,
+        editorText: "!!different",
+      }),
+    ).toBe(false);
+    expect(
+      h.bundle.state.acceptShellEditorSubmission({
+        intentId: "shell-1",
+        editorRevision: 1,
+        editorText: "!!read answer",
+      }),
+    ).toBe(true);
+    expect(h.bundle.state.editorSnapshot()).toMatchObject({
+      revision: 2,
+      text: "",
+      attachments,
+      conflictText: "newer local draft",
+      conflictAttachments: [{ kind: "file", name: "newer.txt", path: "/tmp/newer.txt" }],
+      alternateConflictText: "alternate draft",
+      additionalConflictCandidates: [
+        {
+          text: "third draft",
+          attachments: [{ kind: "file", name: "third.txt", path: "/tmp/third.txt" }],
+        },
+      ],
+    });
+  });
+
   it("clears attachments for ordinary input whose transported text starts with a file path", () => {
     const h = makeHarness();
     const attachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];

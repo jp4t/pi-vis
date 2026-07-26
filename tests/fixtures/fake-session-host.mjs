@@ -45,6 +45,7 @@ let runtimeBash = false;
 let runtimeEditorPending = false;
 let retryAttempt = 0;
 let operationSequence = 0;
+let activeShell = null;
 const activeOperations = new Map();
 const steeringQueue = [];
 const followUpQueue = [];
@@ -199,7 +200,21 @@ function semanticSnapshot() {
       retryAttempt: value.retryAttempt,
       isBashRunning: value.isBashRunning,
     },
-    activity: {},
+    activity: activeShell
+      ? {
+          bash: {
+            kind: "bash",
+            state: "active",
+            intentId: activeShell.executionId,
+            command: activeShell.command,
+            startedAt: activeShell.startedAt,
+            excludeFromContext: activeShell.excludeFromContext,
+            pty: true,
+            inputReady: !activeShell.inputFenced,
+            terminalMode: activeShell.mode,
+          },
+        }
+      : {},
     queues: {
       steering: value.steering,
       followUp: value.followUp,
@@ -450,6 +465,12 @@ function logOperation(event, details = {}) {
   fs.appendFileSync(file, `${JSON.stringify({ event, at: Date.now(), ...details })}\n`);
 }
 
+function logHostMessage(entry) {
+  const file = process.env.PIVIS_TEST_HOST_MESSAGE_LOG;
+  if (!file) return;
+  fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+}
+
 function beginOperation(kind) {
   const token = `${kind}-${++operationSequence}`;
   activeOperations.set(kind, token);
@@ -474,6 +495,177 @@ function cancelOperation(kind) {
   activeOperations.delete(kind);
   logOperation("cancelled", { kind, token });
   return true;
+}
+
+function fakeShellSnapshot() {
+  if (!activeShell) return undefined;
+  return {
+    id: activeShell.executionId,
+    command: activeShell.command,
+    owner: authorityOwner(),
+    startedAt: activeShell.startedAt,
+    cwd: activeShell.cwd,
+    excludeFromContext: activeShell.excludeFromContext,
+    cols: activeShell.cols,
+    rows: activeShell.rows,
+    mode: activeShell.mode,
+    ansi: activeShell.ansi,
+    reconstructionFenceToken: activeShell.reconstructionFenceToken,
+    outputThroughSequence: activeShell.outputSequence,
+    inputAcknowledgedThrough: activeShell.inputAcknowledgedThrough,
+    resizeRevision: activeShell.resizeRevision,
+  };
+}
+
+function emitFakeShellData(data, mode = activeShell?.mode ?? "compact") {
+  if (!activeShell) return;
+  activeShell.mode = mode;
+  activeShell.outputSequence += 1;
+  activeShell.ansi = `${activeShell.ansi}${data}`.slice(-1024 * 1024);
+  emitEvent({
+    type: "bash_terminal_data",
+    id: activeShell.executionId,
+    data,
+    sequence: activeShell.outputSequence,
+    mode,
+  });
+}
+
+function settleFakeShell({ output, exitCode, cancelled = false, signal, terminalTail = "" }) {
+  const shell = activeShell;
+  if (!shell) return false;
+  if (terminalTail) emitFakeShellData(terminalTail);
+  const durationMs = Math.max(0, Date.now() - shell.startedAt);
+  appendEntry({
+    type: "message",
+    message: {
+      role: "bashExecution",
+      command: shell.command,
+      output,
+      exitCode,
+      cancelled,
+      excludeFromContext: shell.excludeFromContext,
+      timestamp: Date.now(),
+    },
+  });
+  appendEntry({
+    type: "custom",
+    customType: "pivis.shell_turn_complete",
+    data: {
+      version: 1,
+      executionId: shell.executionId,
+      durationMs,
+      ...(signal ? { signal } : {}),
+      cancelled,
+      normalization: "terminal_buffer",
+    },
+  });
+  emitEvent({
+    type: "bash_execution_end",
+    id: shell.executionId,
+    command: shell.command,
+    output,
+    exitCode,
+    cancelled,
+    excludeFromContext: shell.excludeFromContext,
+    pty: true,
+    durationMs,
+    ...(signal ? { signal } : {}),
+    normalization: "terminal_buffer",
+  });
+  activeShell = null;
+  runtimeBash = false;
+  if (cancelled) cancelOperation("bash");
+  else completeOperation("bash", shell.operationToken);
+  publishSnapshot();
+  shell.resolve({
+    output,
+    exitCode,
+    cancelled,
+  });
+  return true;
+}
+
+function startFakeShell(executionId, command, excludeFromContext) {
+  const startedAt = Date.now();
+  let resolve;
+  const completion = new Promise((done) => {
+    resolve = done;
+  });
+  const shell = {
+    executionId,
+    command,
+    excludeFromContext: excludeFromContext === true,
+    startedAt,
+    cwd,
+    cols: 80,
+    rows: 24,
+    mode: "compact",
+    ansi: "",
+    outputSequence: 0,
+    inputAcknowledgedThrough: 0,
+    resizeRevision: 0,
+    inputText: "",
+    inputFenced: false,
+    inputFenceThrough: 0,
+    reconstructionFenceToken: 0,
+    operationToken: undefined,
+    resolve,
+  };
+  appendEntry({
+    type: "custom",
+    customType: "pivis.shell_turn_start",
+    data: {
+      version: 1,
+      executionId,
+      command,
+      excludeFromContext: excludeFromContext === true,
+      startedAt,
+      cwd,
+      pty: true,
+    },
+  });
+  shell.operationToken = beginOperation("bash");
+  activeShell = shell;
+  runtimeBash = true;
+  emitEvent({
+    type: "bash_execution_start",
+    id: executionId,
+    command,
+    excludeFromContext: excludeFromContext === true,
+    pty: true,
+    startedAt,
+    cwd,
+    cols: activeShell.cols,
+    rows: activeShell.rows,
+  });
+  if (command.includes("test-interactive-shell")) {
+    emitFakeShellData("Name: ");
+  } else if (command.includes("test-background-shell")) {
+    const configuredDelay = Number.parseInt(
+      process.env.PIVIS_TEST_BACKGROUND_SHELL_DELAY_MS ?? "",
+      10,
+    );
+    const delayMs =
+      Number.isFinite(configuredDelay) && configuredDelay > 0 ? configuredDelay : 1000;
+    setTimeout(() => {
+      if (activeShell?.executionId !== executionId) return;
+      settleFakeShell({
+        output: "background shell complete\n",
+        exitCode: 0,
+        terminalTail: "background shell complete\r\n",
+      });
+    }, delayMs).unref?.();
+  } else if (!command.includes("test-long-bash")) {
+    queueMicrotask(() => {
+      settleFakeShell({
+        output: `bash output for ${command}\n`,
+        exitCode: 0,
+        terminalTail: `bash output for ${command}\r\n`,
+      });
+    });
+  }
+  return completion;
 }
 
 function submissionResult(submission, disposition, extra = {}) {
@@ -1273,14 +1465,6 @@ async function executeAuthorityIntent(entry) {
       });
       finishAuthorityIntent(entry, "completed", {});
       return;
-    case "runBash":
-      await handleCommand(`authority-${entry.intentId}`, { type: "bash", command: intent.command });
-      finishAuthorityIntent(entry, "completed", {
-        started: true,
-        output: `$ ${intent.command}\nbash output here\n`,
-        exitCode: 0,
-      });
-      return;
     case "setModel":
       if (!fakeModels.some((model) => model.id === intent.modelId)) {
         finishAuthorityIntent(entry, "failed", undefined, `Model not found: ${intent.modelId}`);
@@ -1460,6 +1644,27 @@ function dispatchAuthorityIntent(envelope) {
     }
     return { status: "duplicate", intentId, owner: structuredClone(owner) };
   }
+  if (
+    intent.kind === "runBash" &&
+    (intent.editorRevision !== editorRevision || intent.editorText !== editorText)
+  ) {
+    return { status: "not_admitted", intentId, reason: "stale_editor" };
+  }
+  if (
+    intent.kind === "runBash" &&
+    (runtimeStreaming ||
+      runtimeCompacting ||
+      runtimeRetrying ||
+      runtimeNavigation ||
+      runtimeBash ||
+      runtimeEditorPending ||
+      activeOperations.size > 0 ||
+      steeringQueue.length > 0 ||
+      followUpQueue.length > 0 ||
+      [...authorityIntents.values()].some((entry) => !entry.outcome))
+  ) {
+    return { status: "not_admitted", intentId, reason: "busy" };
+  }
   const entry = {
     intentId,
     owner: structuredClone(owner),
@@ -1468,6 +1673,34 @@ function dispatchAuthorityIntent(envelope) {
     recordedAt: Date.now(),
     outcome: null,
   };
+
+  if (intent.kind === "runBash") {
+    let completion;
+    try {
+      // The production authority transfers editor custody only after PTY
+      // construction and its durable start marker succeed. This fake has no
+      // PTY, so `startFakeShell()` returning is the equivalent start proof.
+      completion = startFakeShell(intentId, intent.command, intent.excludeFromContext);
+    } catch {
+      return { status: "not_admitted", intentId, reason: "transport_unavailable" };
+    }
+    editorRevision++;
+    editorText = "";
+    // Direct Shell Turns consume only their exact command text. Attachments
+    // remain staged for the next ordinary prompt.
+    authorityIntents.set(key, entry);
+    emitAuthorityFrame();
+    void completion.then((result) => {
+      finishAuthorityIntent(entry, "completed", {
+        started: true,
+        output: result.output,
+        exitCode: result.exitCode,
+        cancelled: result.cancelled,
+      });
+    });
+    return { status: "admitted", intentId, owner: structuredClone(owner) };
+  }
+
   authorityIntents.set(key, entry);
   emitAuthorityFrame();
   queueMicrotask(() => {
@@ -1487,7 +1720,13 @@ function authorityAttach(rendererGeneration) {
   if (process.env.PIVIS_TEST_AUTHORITY_ATTACH_TRANSITIONING === "1") {
     return { status: "transitioning", transitionId: "test-transition" };
   }
+  if (activeShell) {
+    activeShell.reconstructionFenceToken += 1;
+    activeShell.inputFenced = true;
+    activeShell.inputFenceThrough = activeShell.outputSequence;
+  }
   const semantic = semanticSnapshot();
+  const currentShellTurn = fakeShellSnapshot();
   if (semanticTransportSequence === 0) semanticTransportSequence = 1;
   if (presentationTransportSequence.transcript === 0) presentationTransportSequence.transcript = 1;
   if (presentationTransportSequence.extensionUi === 0)
@@ -1525,6 +1764,7 @@ function authorityAttach(rendererGeneration) {
         persistedHistoryCursor: sessionFile ?? null,
         liveTailCursor: null,
         overlapBoundary: sessionFile ? `persisted:${sessionFile}` : null,
+        ...(currentShellTurn ? { currentShellTurn } : {}),
       },
       extensionUi: {
         sync: { state: "following", cursor: extensionUiCursor },
@@ -1545,17 +1785,15 @@ function authorityAttach(rendererGeneration) {
 }
 
 async function handleMessage(message) {
-  if (process.env.PIVIS_TEST_HOST_MESSAGE_LOG) {
-    fs.appendFileSync(
-      process.env.PIVIS_TEST_HOST_MESSAGE_LOG,
-      `${JSON.stringify({
-        type: message?.type,
-        command: message?.command?.type,
-        text: message?.submission?.text,
-        intent: message?.envelope?.intent,
-      })}\n`,
-    );
-  }
+  logHostMessage({
+    type: message?.type,
+    command: message?.command?.type,
+    text: message?.submission?.text,
+    intent: message?.envelope?.intent,
+    executionId: message?.executionId,
+    sequence: message?.sequence,
+    reconstructionFenceToken: message?.reconstructionFenceToken,
+  });
   switch (message?.type) {
     case "init": {
       if (initialized) return;
@@ -1891,6 +2129,11 @@ async function handleMessage(message) {
         openPanels.clear();
         send({ type: "panel_clear_all" });
       }
+      if (activeShell) {
+        activeShell.reconstructionFenceToken += 1;
+        activeShell.inputFenced = true;
+        activeShell.inputFenceThrough = activeShell.outputSequence;
+      }
       send({ type: "renderer_cancelled", rendererGeneration: message.rendererGeneration });
       publishSnapshot();
       break;
@@ -1902,6 +2145,129 @@ async function handleMessage(message) {
     case "panel_input":
       reply(message.id, true, { acknowledgedThrough: message.sequence });
       break;
+    case "shell_input": {
+      if (!activeShell || activeShell.executionId !== message.executionId) {
+        reply(message.id, true, { accepted: false, acknowledgedThrough: 0 });
+        break;
+      }
+      if (activeShell.inputFenced) {
+        reply(message.id, true, {
+          accepted: false,
+          acknowledgedThrough: activeShell.inputAcknowledgedThrough,
+        });
+        break;
+      }
+      if (message.sequence <= activeShell.inputAcknowledgedThrough) {
+        reply(message.id, true, {
+          accepted: false,
+          acknowledgedThrough: activeShell.inputAcknowledgedThrough,
+        });
+        break;
+      }
+      if (message.sequence !== activeShell.inputAcknowledgedThrough + 1) {
+        reply(message.id, true, {
+          accepted: false,
+          acknowledgedThrough: activeShell.inputAcknowledgedThrough,
+          gap: {
+            expected: activeShell.inputAcknowledgedThrough + 1,
+            received: message.sequence,
+          },
+        });
+        break;
+      }
+      activeShell.inputAcknowledgedThrough = message.sequence;
+      const inputData = String(message.data ?? "");
+      activeShell.inputText += inputData;
+      reply(message.id, true, {
+        accepted: true,
+        acknowledgedThrough: activeShell.inputAcknowledgedThrough,
+      });
+      logHostMessage({
+        type: "shell_input_result",
+        executionId: message.executionId,
+        sequence: message.sequence,
+        accepted: true,
+        acknowledgedThrough: activeShell.inputAcknowledgedThrough,
+      });
+      if (inputData.includes("\x03")) {
+        queueMicrotask(() => {
+          settleFakeShell({
+            output: "^C",
+            exitCode: 130,
+            cancelled: true,
+            signal: "SIGINT",
+            terminalTail: "^C\r\n",
+          });
+        });
+      } else if (/[\r\n]/u.test(inputData)) {
+        const name = activeShell.inputText.replace(/[\r\n]+/gu, "").trim() || "anonymous";
+        queueMicrotask(() => {
+          settleFakeShell({
+            output: `Name: ${name}\nHello, ${name}\n`,
+            exitCode: 0,
+            terminalTail: `${name}\r\nHello, ${name}\r\n`,
+          });
+        });
+      }
+      break;
+    }
+    case "shell_resize": {
+      const accepted = Boolean(
+        activeShell?.executionId === message.executionId &&
+          activeShell.inputFenced !== true &&
+          Number.isSafeInteger(message.revision) &&
+          message.revision > activeShell.resizeRevision &&
+          Number.isSafeInteger(message.cols) &&
+          Number.isSafeInteger(message.rows),
+      );
+      if (accepted) {
+        activeShell.resizeRevision = message.revision;
+        activeShell.cols = Math.max(20, Math.min(500, message.cols));
+        activeShell.rows = Math.max(2, Math.min(200, message.rows));
+      }
+      reply(message.id, true, { accepted });
+      break;
+    }
+    case "shell_reconstruction_ack": {
+      const accepted = Boolean(
+        activeShell?.executionId === message.executionId &&
+          Number.isSafeInteger(message.reconstructionFenceToken) &&
+          message.reconstructionFenceToken === activeShell.reconstructionFenceToken &&
+          Number.isSafeInteger(message.outputThroughSequence) &&
+          message.outputThroughSequence === activeShell.inputFenceThrough,
+      );
+      if (accepted) activeShell.inputFenced = false;
+      reply(message.id, true, { accepted });
+      logHostMessage({
+        type: "shell_reconstruction_ack_result",
+        executionId: message.executionId,
+        reconstructionFenceToken: message.reconstructionFenceToken,
+        accepted,
+      });
+      if (accepted) publishSnapshot();
+      break;
+    }
+    case "shell_signal": {
+      const accepted = Boolean(
+        activeShell?.executionId === message.executionId &&
+          activeShell.inputFenced !== true &&
+          ["interrupt", "kill"].includes(message.signal),
+      );
+      reply(message.id, true, { accepted });
+      if (accepted) {
+        const signal = message.signal === "kill" ? "SIGKILL" : "SIGINT";
+        queueMicrotask(() => {
+          settleFakeShell({
+            output: "^C",
+            exitCode: 130,
+            cancelled: true,
+            signal,
+            terminalTail: "^C\r\n",
+          });
+        });
+      }
+      break;
+    }
     case "panel_resize":
     case "restoration_ack":
     case "unified_submit_response":

@@ -466,6 +466,10 @@ export const BashActivitySchema = z
     intentId: NonEmptyIdSchema.optional(),
     command: z.string().optional(),
     startedAt: z.number().optional(),
+    excludeFromContext: z.boolean().optional(),
+    pty: z.boolean().optional(),
+    inputReady: z.boolean().optional(),
+    terminalMode: z.enum(["compact", "fullscreen"]).optional(),
   })
   .strict();
 export type BashActivity = z.infer<typeof BashActivitySchema>;
@@ -777,9 +781,31 @@ export const SessionIntentSchema = z.union([
     .object({
       kind: z.literal("runBash"),
       command: z.string(),
-      excludeFromContext: z.boolean().optional(),
+      excludeFromContext: z.boolean(),
+      /** Exact authoritative editor revision whose shell draft is being consumed. */
+      editorRevision: NonNegativeIntegerSchema,
+      /** Exact raw editor source, including its editable `!` or `!!` prefix. */
+      editorText: z.string(),
     })
-    .strict(),
+    .strict()
+    .superRefine((intent, ctx) => {
+      const excludeFromContext = intent.editorText.startsWith("!!");
+      const prefixLength = excludeFromContext ? 2 : 1;
+      const command = intent.editorText.startsWith("!")
+        ? intent.editorText.slice(prefixLength).trim()
+        : "";
+      if (
+        command.length === 0 ||
+        command !== intent.command ||
+        excludeFromContext !== intent.excludeFromContext
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["editorText"],
+          message: "runBash command and context mode must match its raw editor source",
+        });
+      }
+    }),
   z
     .object({
       kind: z.literal("setTrust"),
@@ -887,6 +913,8 @@ export const IntentReceiptSchema = z
           "transport_unavailable",
           "closing",
           "transitioning",
+          "busy",
+          "stale_editor",
           "invalid",
         ]),
         /** Machine-readable detail for invalid payload or bounded-admission rejection. */
@@ -1172,6 +1200,7 @@ export const OperationJournalRecordSchema = z.discriminatedUnion("type", [
         "missing_start_event",
         "missing_compaction_start",
         "queue_correlation_lost",
+        "shell_editor_custody_lost",
       ]),
       observedAt: z.number(),
       detail: z.string().optional(),
@@ -1376,6 +1405,36 @@ export const PlaneSyncSchema = z.discriminatedUnion("state", [
 ]);
 export type PlaneSync = z.infer<typeof PlaneSyncSchema>;
 
+/**
+ * Bounded live-shell reconstruction retained by the SDK host. This is
+ * presentation-only: final normalized output is persisted by Pi's public bash
+ * execution message, while input bytes are never retained here.
+ */
+export const ShellTurnSnapshotSchema = z
+  .object({
+    id: NonEmptyIdSchema,
+    command: z.string(),
+    owner: RuntimeIdentitySchema,
+    startedAt: z.number(),
+    cwd: z.string().optional(),
+    excludeFromContext: z.boolean().optional(),
+    cols: z.number().int().positive(),
+    rows: z.number().int().positive(),
+    mode: z.enum(["compact", "fullscreen"]),
+    ansi: z.string(),
+    /** Host-issued identity of the exact reconstruction fence represented here. */
+    reconstructionFenceToken: NonNegativeIntegerSchema,
+    outputThroughSequence: NonNegativeIntegerSchema,
+    inputAcknowledgedThrough: NonNegativeIntegerSchema,
+    resizeRevision: NonNegativeIntegerSchema,
+    /** Epoch time when the host accepted the graceful interrupt request. */
+    interruptRequestedAt: z.number().nonnegative().optional(),
+    /** True when bounded reconstruction omitted older terminal scrollback. */
+    replayTruncated: z.boolean().optional(),
+  })
+  .strict();
+export type ShellTurnSnapshot = z.infer<typeof ShellTurnSnapshotSchema>;
+
 export const TranscriptPresentationBaselineSchema = z
   .object({
     sync: PlaneSyncSchema,
@@ -1383,6 +1442,7 @@ export const TranscriptPresentationBaselineSchema = z
     liveTailCursor: z.string().nullable(),
     overlapBoundary: z.string().nullable(),
     currentStreamingMessage: z.unknown().optional(),
+    currentShellTurn: ShellTurnSnapshotSchema.optional(),
   })
   .strict();
 export type TranscriptPresentationBaseline = z.infer<typeof TranscriptPresentationBaselineSchema>;

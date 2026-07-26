@@ -4,8 +4,40 @@ type Page = import("@playwright/test").Page;
 
 interface PreviewStoreState {
   activeSessionId: string;
+  sessions: Map<
+    string,
+    {
+      widgets?: Map<string, string[]>;
+      authorityProjection?: {
+        rendererGeneration?: number;
+        owner?: { hostInstanceId: string; sessionEpoch: number };
+        publicationSequence?: number;
+        semantic:
+          | {
+              state: "following";
+              cursor: {
+                hostInstanceId: string;
+                sessionEpoch: number;
+                transportSequence: number;
+                snapshotSequence: number;
+              };
+            }
+          | { state: string };
+        authoritativeSnapshot?: {
+          owner: { hostInstanceId: string; sessionEpoch: number };
+          snapshotSequence: number;
+          sdk: Record<string, unknown>;
+          activity: Record<string, unknown>;
+          [key: string]: unknown;
+        };
+      };
+    }
+  >;
   setSessionName: (sessionId: string, name: string) => void;
   seedHistory: (sessionId: string, history: Array<Record<string, unknown>>) => void;
+  applyEvent: (sessionId: string, event: Record<string, unknown>) => void;
+  applyAuthorityPublication: (publication: Record<string, unknown>) => void;
+  markAuthorityUnavailable: (sessionId: string, reason: string) => void;
 }
 
 async function setLongTitle(page: Page): Promise<void> {
@@ -100,6 +132,549 @@ test.describe("layout overflow and markdown separators", () => {
       "title",
       "dropped-notes.txt",
     );
+  });
+
+  test("shell drafts replace the attachment affordance without moving the insertion edge", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.waitForLoadState("domcontentloaded");
+    const composer = page.locator(".composer");
+    const textarea = composer.locator(".composer__textarea");
+    const attach = composer.locator(".composer__attach-btn");
+    await expect(attach).toBeEnabled({ timeout: 20_000 });
+    const ordinaryAffordance = await attach.evaluate((element) => {
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      return { color: style.color, fontFamily: style.fontFamily, width: bounds.width };
+    });
+    const accentColor = await page.evaluate(() => {
+      const probe = document.createElement("span");
+      probe.style.color = "var(--accent)";
+      document.body.append(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    });
+    const ordinaryInsertionEdge = await textarea.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return (
+        element.getBoundingClientRect().left +
+        Number.parseFloat(style.borderLeftWidth) +
+        Number.parseFloat(style.paddingLeft)
+      );
+    });
+
+    await composer.evaluate((element) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(["kept"], "kept.txt", { type: "text/plain" }));
+      element.dispatchEvent(
+        new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer }),
+      );
+    });
+    await expect(composer.locator(".composer__attachment-item")).toHaveCount(1);
+
+    await textarea.fill("!echo ready");
+    const prefix = composer.locator(".composer__shell-prefix");
+    await expect(prefix).toHaveText("!");
+    await expect(attach).toHaveCount(0);
+    await expect(composer.locator(".composer__attachment-item")).toHaveCount(0);
+    await expect(composer.locator(".composer__shell-guidance")).toHaveCount(0);
+    await expect(textarea).toHaveClass(/composer__textarea--shell-prefix-1/);
+    const includedInsertionEdge = await textarea.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return element.getBoundingClientRect().left + Number.parseFloat(style.borderLeftWidth);
+    });
+    expect(Math.abs(includedInsertionEdge - ordinaryInsertionEdge)).toBeLessThan(0.5);
+
+    await textarea.fill("!!echo ready");
+    await expect(prefix).toHaveText("!!");
+    await expect(textarea).toHaveClass(/composer__textarea--shell-prefix-2/);
+    const excludedInsertionEdge = await textarea.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return element.getBoundingClientRect().left + Number.parseFloat(style.borderLeftWidth);
+    });
+    expect(Math.abs(excludedInsertionEdge - ordinaryInsertionEdge)).toBeLessThan(0.5);
+    expect(Math.abs(excludedInsertionEdge - includedInsertionEdge)).toBeLessThan(0.5);
+    const prefixBounds = await prefix.boundingBox();
+    if (!prefixBounds) throw new Error("Shell prefix has no fixed-slot geometry");
+    expect(Math.abs(prefixBounds.width - ordinaryAffordance.width)).toBeLessThan(0.5);
+
+    const shellTypography = await composer.evaluate((element) => {
+      const prefixStyle = getComputedStyle(element.querySelector(".composer__shell-prefix")!);
+      const textareaStyle = getComputedStyle(element.querySelector(".composer__textarea")!);
+      return {
+        prefixColor: prefixStyle.color,
+        prefixFontFamily: prefixStyle.fontFamily,
+        commandFontFamily: textareaStyle.fontFamily,
+        textIndent: textareaStyle.textIndent,
+      };
+    });
+    expect(shellTypography.prefixColor).toBe(accentColor);
+    expect(shellTypography.prefixColor).not.toBe(ordinaryAffordance.color);
+    expect(shellTypography.prefixFontFamily).toBe(ordinaryAffordance.fontFamily);
+    expect(shellTypography.commandFontFamily).not.toBe(shellTypography.prefixFontFamily);
+    expect(shellTypography.textIndent).not.toBe("0px");
+
+    await textarea.fill("ordinary message");
+    await expect(prefix).toHaveCount(0);
+    await expect(attach).toBeVisible();
+    await expect(composer.locator(".composer__attachment-item")).toHaveCount(1);
+  });
+
+  test("clipped shell prefixes preserve native textarea editing state", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("domcontentloaded");
+    const composer = page.locator(".composer");
+    const textarea = composer.locator(".composer__textarea");
+    const prefix = composer.locator(".composer__shell-prefix");
+    await expect(textarea).toBeEnabled({ timeout: 20_000 });
+
+    await textarea.fill("ls");
+    await textarea.evaluate((element) => {
+      const input = element as HTMLTextAreaElement;
+      input.focus();
+      input.setSelectionRange(0, 0);
+    });
+    await page.keyboard.type("!");
+    await expect(textarea).toHaveValue("!ls");
+    await expect(prefix).toHaveText("!");
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => ({
+          start: (element as HTMLTextAreaElement).selectionStart,
+          end: (element as HTMLTextAreaElement).selectionEnd,
+        })),
+      )
+      .toEqual({ start: 1, end: 1 });
+
+    await page.keyboard.press("ControlOrMeta+z");
+    await expect(textarea).toHaveValue("ls");
+    await expect(prefix).toHaveCount(0);
+
+    await textarea.fill("!!ls");
+    await textarea.press("Home");
+    await expect(prefix.locator(".composer__shell-prefix-caret")).toHaveCount(1);
+    await textarea.press("Shift+ArrowRight");
+    await textarea.press("Shift+ArrowRight");
+    await expect(prefix.locator(".composer__shell-prefix-char--selected")).toHaveCount(2);
+    await expect(prefix.locator(".composer__shell-prefix-caret")).toHaveCount(0);
+
+    const prefixText = prefix.locator(".composer__shell-prefix-text");
+    const prefixBounds = await prefixText.boundingBox();
+    if (!prefixBounds) throw new Error("shell prefix has no pointer geometry");
+    await page.mouse.click(prefixBounds.x + 1, prefixBounds.y + prefixBounds.height / 2);
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => ({
+          start: (element as HTMLTextAreaElement).selectionStart,
+          end: (element as HTMLTextAreaElement).selectionEnd,
+        })),
+      )
+      .toEqual({ start: 0, end: 0 });
+    await page.mouse.move(prefixBounds.x + 1, prefixBounds.y + prefixBounds.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(
+      prefixBounds.x + prefixBounds.width - 1,
+      prefixBounds.y + prefixBounds.height / 2,
+    );
+    await page.mouse.up();
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => ({
+          start: (element as HTMLTextAreaElement).selectionStart,
+          end: (element as HTMLTextAreaElement).selectionEnd,
+        })),
+      )
+      .toEqual({ start: 0, end: 2 });
+    await expect(prefix.locator(".composer__shell-prefix-char--selected")).toHaveCount(2);
+
+    const textareaBounds = await textarea.boundingBox();
+    if (!textareaBounds) throw new Error("shell textarea has no pointer geometry");
+    await page.mouse.move(prefixBounds.x + 1, prefixBounds.y + prefixBounds.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(textareaBounds.x + 48, textareaBounds.y + textareaBounds.height / 2);
+    await page.mouse.up();
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => ({
+          start: (element as HTMLTextAreaElement).selectionStart,
+          end: (element as HTMLTextAreaElement).selectionEnd,
+        })),
+      )
+      .toMatchObject({ start: 0 });
+    expect(
+      await textarea.evaluate((element) => (element as HTMLTextAreaElement).selectionEnd),
+    ).toBeGreaterThan(2);
+
+    await textarea.evaluate((element) => {
+      const input = element as HTMLTextAreaElement;
+      input.focus();
+      input.setSelectionRange(2, 2);
+    });
+    await page.keyboard.press("Backspace");
+    await expect(textarea).toHaveValue("!ls");
+    await expect(prefix).toHaveText("!");
+    await page.keyboard.press("Backspace");
+    await expect(textarea).toHaveValue("ls");
+    await expect(prefix).toHaveCount(0);
+
+    await page.keyboard.press("ControlOrMeta+z");
+    await expect(textarea).toHaveValue("!ls");
+    await expect(prefix).toHaveText("!");
+    await page.keyboard.press("ControlOrMeta+z");
+    await expect(textarea).toHaveValue("!!ls");
+    await expect(prefix).toHaveText("!!");
+
+    await textarea.press("ControlOrMeta+a");
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => ({
+          start: (element as HTMLTextAreaElement).selectionStart,
+          end: (element as HTMLTextAreaElement).selectionEnd,
+          value: (element as HTMLTextAreaElement).value,
+        })),
+      )
+      .toEqual({ start: 0, end: 4, value: "!!ls" });
+
+    await textarea.fill("!!!echo ready");
+    await expect(textarea).toHaveValue("!!!echo ready");
+    await expect(prefix).toHaveText("!!");
+    await expect(textarea).toHaveClass(/composer__textarea--shell-prefix-2/);
+  });
+
+  test("prefix drags autoscroll through wrapped tabs and wide glyphs", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("domcontentloaded");
+    const composer = page.locator(".composer");
+    const textarea = composer.locator(".composer__textarea");
+    const prefix = composer.locator(".composer__shell-prefix");
+    await expect(textarea).toBeEnabled({ timeout: 20_000 });
+
+    const command = `!!${Array.from(
+      { length: 28 },
+      (_, index) => `printf '\\t界🙂 ${index.toString().padStart(2, "0")} wrapped shell text'`,
+    ).join("\n")}`;
+    await textarea.fill(command);
+    await textarea.evaluate((element) => {
+      const input = element as HTMLTextAreaElement;
+      input.focus();
+      input.setSelectionRange(0, 0);
+      input.scrollTop = 0;
+    });
+    await expect
+      .poll(() =>
+        textarea.evaluate(
+          (element) =>
+            (element as HTMLTextAreaElement).scrollHeight >
+            (element as HTMLTextAreaElement).clientHeight,
+        ),
+      )
+      .toBe(true);
+
+    const prefixBounds = await prefix.locator(".composer__shell-prefix-text").boundingBox();
+    const textareaBounds = await textarea.boundingBox();
+    if (!prefixBounds || !textareaBounds) throw new Error("shell drag geometry is unavailable");
+    const viewport = page.viewportSize();
+    if (!viewport) throw new Error("shell drag viewport is unavailable");
+    await page.mouse.move(prefixBounds.x + 1, prefixBounds.y + prefixBounds.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(50);
+    await page.mouse.move(
+      textareaBounds.x + textareaBounds.width / 2,
+      Math.min(viewport.height - 2, textareaBounds.y + textareaBounds.height + 24),
+      { steps: 5 },
+    );
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => ({
+          start: (element as HTMLTextAreaElement).selectionStart,
+          end: (element as HTMLTextAreaElement).selectionEnd,
+        })),
+      )
+      .toEqual({ start: 0, end: command.length });
+    await page.mouse.up();
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => {
+          const input = element as HTMLTextAreaElement;
+          return input.scrollTop / (input.scrollHeight - input.clientHeight);
+        }),
+      )
+      .toBeGreaterThan(0.9);
+  });
+
+  test("a recoverable Shell semantic fence never flashes the Composer into its slot", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.waitForLoadState("domcontentloaded");
+    await expect(page.locator(".composer")).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator(".composer__attach-btn")).toBeEnabled({ timeout: 20_000 });
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const store = (
+              window as unknown as {
+                __pivisStore: {
+                  getState: () => PreviewStoreState;
+                };
+              }
+            ).__pivisStore;
+            const state = store.getState();
+            const projection = state.sessions.get(state.activeSessionId)?.authorityProjection;
+            return (
+              projection?.owner !== undefined &&
+              projection.semantic.state === "following" &&
+              projection.authoritativeSnapshot !== undefined
+            );
+          }),
+        { timeout: 20_000 },
+      )
+      .toBe(true);
+
+    await page.evaluate(() => {
+      const store = (
+        window as unknown as {
+          __pivisStore: {
+            getState: () => PreviewStoreState;
+            setState: (partial: Partial<PreviewStoreState>) => void;
+          };
+        }
+      ).__pivisStore;
+      const state = store.getState();
+      const sessionId = state.activeSessionId;
+      const session = state.sessions.get(sessionId);
+      const projection = session?.authorityProjection;
+      if (
+        !session ||
+        !projection?.owner ||
+        projection.semantic.state !== "following" ||
+        !projection.authoritativeSnapshot
+      ) {
+        throw new Error("Preview authority did not attach");
+      }
+      const originalInvoke = window.pivis.invoke.bind(window.pivis);
+      Reflect.set(window.pivis, "invoke", (channel: string, input: unknown) =>
+        channel === "session.authorityAttach"
+          ? new Promise(() => {})
+          : originalInvoke(channel as never, input as never),
+      );
+
+      const executionId = "render-fenced-shell";
+      const startedAt = Date.now();
+      state.applyEvent(sessionId, {
+        type: "bash_execution_start",
+        id: executionId,
+        command: "interactive-command",
+        excludeFromContext: false,
+        pty: true,
+        startedAt,
+      });
+
+      const cursor = projection.semantic.cursor;
+      const activeSnapshot = {
+        ...projection.authoritativeSnapshot,
+        snapshotSequence: projection.authoritativeSnapshot.snapshotSequence + 1,
+        sdk: {
+          ...projection.authoritativeSnapshot.sdk,
+          isStreaming: false,
+          isIdle: false,
+          isBashRunning: true,
+        },
+        activity: {
+          ...projection.authoritativeSnapshot.activity,
+          bash: {
+            kind: "bash",
+            state: "active",
+            intentId: executionId,
+            command: "interactive-command",
+            startedAt,
+            excludeFromContext: false,
+            pty: true,
+            inputReady: true,
+            terminalMode: "compact",
+          },
+        },
+      };
+      const publicationSequence = (projection.publicationSequence ?? 0) + 1;
+      const transportSequence = cursor.transportSequence + 1;
+      state.applyAuthorityPublication({
+        sessionId,
+        rendererGeneration: projection.rendererGeneration ?? 0,
+        publicationSequence,
+        plane: "semantic",
+        owner: projection.owner,
+        payload: {
+          owner: projection.owner,
+          transportSequence,
+          frameId: "render-shell-active",
+          records: [],
+          terminalSnapshot: activeSnapshot,
+        },
+      });
+      state.applyAuthorityPublication({
+        sessionId,
+        rendererGeneration: projection.rendererGeneration ?? 0,
+        publicationSequence: publicationSequence + 2,
+        plane: "semantic",
+        owner: projection.owner,
+        payload: {
+          owner: projection.owner,
+          transportSequence: transportSequence + 1,
+          frameId: "render-shell-gap",
+          records: [],
+          terminalSnapshot: {
+            ...activeSnapshot,
+            snapshotSequence: activeSnapshot.snapshotSequence + 1,
+          },
+        },
+      });
+      const latestState = store.getState();
+      const latestSessions = new Map(latestState.sessions);
+      latestSessions.set(sessionId, {
+        ...latestSessions.get(sessionId)!,
+        widgets: new Map([["usage", ["Codex / 11% (6d 6h 17m)"]]]),
+      });
+      store.setState({ sessions: latestSessions });
+    });
+
+    const shell = page.locator(".shell-terminal");
+    await expect(shell).toBeVisible();
+    const resizeHandle = page.getByRole("separator", { name: /Resize shell terminal/ });
+    await expect(resizeHandle).toBeVisible();
+    await expect(resizeHandle).toHaveAttribute("aria-valuenow", "50");
+    await expect(
+      shell.getByRole("button", { name: /(?:Interrupt|Force stop) shell command/ }),
+    ).toHaveCount(0);
+    const shellViewportGeometry = await page.evaluate(() => {
+      const viewport = document.querySelector<HTMLElement>(".shell-terminal__viewport");
+      const session = document.querySelector<HTMLElement>(".app__session");
+      if (!viewport || !session) return null;
+      return {
+        viewportHeight: viewport.getBoundingClientRect().height,
+        sessionHeight: session.getBoundingClientRect().height,
+      };
+    });
+    expect(shellViewportGeometry).not.toBeNull();
+    expect(shellViewportGeometry!.viewportHeight).toBeGreaterThan(
+      shellViewportGeometry!.sessionHeight * 0.35,
+    );
+    expect(shellViewportGeometry!.viewportHeight).toBeLessThanOrEqual(
+      shellViewportGeometry!.sessionHeight * 0.5 + 12,
+    );
+
+    // The shared resize affordance remains live while authority is fenced:
+    // keyboard input, pointer drag, and double-click reset all resize the
+    // restoring viewport itself instead of waiting for xterm to mount.
+    await resizeHandle.focus();
+    await resizeHandle.press("ArrowUp");
+    await expect(resizeHandle).toBeFocused();
+    await expect(resizeHandle).toHaveAttribute("aria-valuenow", "55");
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          window.pivis
+            .invoke("settings.get", undefined)
+            .then((settings) => settings.customPanelHeightFraction),
+        ),
+      )
+      .toBe(0.55);
+    const keyboardHeight = await shell
+      .locator(".shell-terminal__viewport")
+      .evaluate((element) => element.getBoundingClientRect().height);
+    expect(keyboardHeight).toBeGreaterThan(shellViewportGeometry!.viewportHeight + 20);
+
+    const handleBounds = await resizeHandle.boundingBox();
+    expect(handleBounds).not.toBeNull();
+    const shellBottom = await shell.evaluate((element) => element.getBoundingClientRect().bottom);
+    const targetY = shellBottom - shellViewportGeometry!.sessionHeight * 0.75;
+    await page.mouse.move(
+      handleBounds!.x + handleBounds!.width / 2,
+      handleBounds!.y + handleBounds!.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(handleBounds!.x + handleBounds!.width / 2, targetY, { steps: 8 });
+    const liveDraggedHeight = await shell
+      .locator(".shell-terminal__viewport")
+      .evaluate((element) => element.getBoundingClientRect().height);
+    expect(liveDraggedHeight).toBeGreaterThan(keyboardHeight + 80);
+    // Pointer movement is live presentation; persistence waits for mouseup.
+    expect(
+      await page.evaluate(() =>
+        window.pivis
+          .invoke("settings.get", undefined)
+          .then((settings) => settings.customPanelHeightFraction),
+      ),
+    ).toBe(0.55);
+    await page.mouse.up();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          window.pivis
+            .invoke("settings.get", undefined)
+            .then((settings) => settings.customPanelHeightFraction),
+        ),
+      )
+      .toBeGreaterThan(0.65);
+
+    await resizeHandle.dblclick();
+    await expect(resizeHandle).toHaveAttribute("aria-valuenow", "50");
+    await expect
+      .poll(() =>
+        shell
+          .locator(".shell-terminal__viewport")
+          .evaluate((element) => element.getBoundingClientRect().height),
+      )
+      .toBeLessThanOrEqual(shellViewportGeometry!.viewportHeight + 4);
+
+    const dock = page.locator(".dock");
+    await expect(dock).toBeVisible();
+    await dock.evaluate(async (element) => {
+      await Promise.all(element.getAnimations().map((animation) => animation.finished));
+    });
+    const connectedStack = await page.evaluate(() => {
+      const dockElement = document.querySelector<HTMLElement>(".dock");
+      const shellElement = document.querySelector<HTMLElement>(".shell-terminal");
+      if (!dockElement || !shellElement) return null;
+      const dockBounds = dockElement.getBoundingClientRect();
+      const shellBounds = shellElement.getBoundingClientRect();
+      const shellStyle = getComputedStyle(shellElement);
+      return {
+        leftDelta: Math.abs(dockBounds.left - shellBounds.left),
+        rightDelta: Math.abs(dockBounds.right - shellBounds.right),
+        seamDelta: Math.abs(dockBounds.bottom - shellBounds.top),
+        topLeftRadius: shellStyle.borderTopLeftRadius,
+        topRightRadius: shellStyle.borderTopRightRadius,
+      };
+    });
+    expect(connectedStack).toMatchObject({
+      topLeftRadius: "0px",
+      topRightRadius: "0px",
+    });
+    expect(connectedStack!.leftDelta).toBeLessThan(0.2);
+    expect(connectedStack!.rightDelta).toBeLessThan(0.2);
+    expect(connectedStack!.seamDelta).toBeLessThan(0.2);
+    await expect(shell).toHaveAttribute("aria-busy", "true");
+    await expect(page.locator(".composer")).toHaveCount(0);
+    await page.waitForTimeout(1_250);
+    await expect(shell).toBeVisible();
+    await expect(page.locator(".composer")).toHaveCount(0);
+
+    await page.evaluate(() => {
+      const store = (
+        window as unknown as {
+          __pivisStore: {
+            getState: () => PreviewStoreState;
+          };
+        }
+      ).__pivisStore;
+      const state = store.getState();
+      state.markAuthorityUnavailable(state.activeSessionId, "render_transport_lost");
+    });
+    await expect(shell).toHaveCount(0);
+    await expect(page.locator(".composer")).toBeVisible();
   });
 
   test("collapsing the sidebar with a fading long title does not widen or clip the main grid", async ({

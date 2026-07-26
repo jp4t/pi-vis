@@ -86,6 +86,15 @@ export function IconClose(props: IconProps): React.ReactElement {
   );
 }
 
+/** Stop — terminate or interrupt a foreground operation. */
+export function IconStop(props: IconProps): React.ReactElement {
+  return (
+    <Icon {...props}>
+      <rect x="3" y="3" width="6" height="6" rx="0.75" />
+    </Icon>
+  );
+}
+
 /** Search — magnifying glass for workspace and modal search affordances. */
 export function IconSearch(props: IconProps): React.ReactElement {
   return (

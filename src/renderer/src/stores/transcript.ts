@@ -1,9 +1,51 @@
 import type { TranscriptBlock } from "@shared/ipc-contract.js";
 import type { KnownPiEvent } from "@shared/pi-protocol/events.js";
+import type { ShellTurnSnapshot } from "@shared/pi-protocol/runtime-state.js";
 import { extractTextAndImages, extractToolResult } from "@shared/pi-protocol/tool-result.js";
 import { detectTurnError } from "@shared/pi-protocol/turn-error.js";
 import type { PiUsage } from "@shared/pi-protocol/usage.js";
 import { assertNever } from "@shared/result.js";
+
+export const LIVE_SHELL_REPLAY_LIMIT = 1024 * 1024;
+const LIVE_SHELL_CHUNK_LIMIT = 512;
+
+export interface ShellTerminalChunk {
+  sequence: number;
+  data: string;
+  /** The source record exceeded the bounded renderer queue. */
+  truncated?: boolean | undefined;
+}
+
+function appendBoundedShellChunk(
+  current: readonly ShellTerminalChunk[] | undefined,
+  currentChars: number | undefined,
+  sequence: number,
+  data: string,
+): { chunks: ShellTerminalChunk[]; chars: number } {
+  const truncated = data.length > LIVE_SHELL_REPLAY_LIMIT;
+  const retainedData = truncated ? data.slice(-LIVE_SHELL_REPLAY_LIMIT) : data;
+  let chunks = [
+    ...(current ?? []),
+    {
+      sequence,
+      data: retainedData,
+      ...(truncated ? { truncated: true } : {}),
+    },
+  ];
+  let chars =
+    (currentChars ?? (current ?? []).reduce((total, chunk) => total + chunk.data.length, 0)) +
+    retainedData.length;
+  let drop = 0;
+  while (
+    drop < chunks.length &&
+    (chars > LIVE_SHELL_REPLAY_LIMIT || chunks.length - drop > LIVE_SHELL_CHUNK_LIMIT)
+  ) {
+    chars -= chunks[drop]?.data.length ?? 0;
+    drop += 1;
+  }
+  if (drop > 0) chunks = chunks.slice(drop);
+  return { chunks, chars };
+}
 
 // All TranscriptBlock data shapes
 export interface UserBlockData {
@@ -63,8 +105,33 @@ export interface ToolCallBlockData {
 }
 
 export interface BashBlockData {
+  executionId?: string | undefined;
   command: string;
   outputText: string;
+  /** Bounded raw ANSI replay used only while the owning PTY is live. */
+  terminalOutput?: string | undefined;
+  /** Output sequence captured by the reconstruction keyframe. This remains
+   * fixed while replay deltas advance terminalOutputSequence so the renderer
+   * acknowledges the exact host fence that enabled this terminal instance. */
+  terminalReconstructionSequence?: number | undefined;
+  /** Renderer-only generation advanced for every accepted live-shell
+   * reconstruction baseline, including equal-output remounts. */
+  terminalReconstructionRevision?: number | undefined;
+  /** Host-issued fence identity. An acknowledgement must match this token as
+   * well as the output sequence so a delayed ACK cannot release a newer,
+   * equal-sequence reconstruction fence. */
+  terminalReconstructionFenceToken?: number | undefined;
+  terminalOutputSequence?: number | undefined;
+  /** Exact ordered deltas retained after the current reconstruction keyframe. */
+  terminalOutputChunks?: readonly ShellTerminalChunk[] | undefined;
+  terminalOutputChunkChars?: number | undefined;
+  liveReplayTruncated?: boolean | undefined;
+  terminalMode?: "compact" | "fullscreen" | undefined;
+  inputAcknowledgedThrough?: number | undefined;
+  resizeRevision?: number | undefined;
+  /** Host time when the first graceful interrupt was accepted. */
+  interruptRequestedAt?: number | undefined;
+  pty?: boolean | undefined;
   isStreaming: boolean;
   interrupted?: boolean | undefined;
   exitCode?: number | undefined;
@@ -73,6 +140,12 @@ export interface BashBlockData {
   fullOutputPath?: string | undefined;
   excludeFromContext?: boolean | undefined;
   timestamp?: number | undefined;
+  startedAt?: number | undefined;
+  durationMs?: number | undefined;
+  signal?: string | undefined;
+  errorMessage?: string | undefined;
+  normalization?: "terminal_buffer" | "alternate_screen_final" | undefined;
+  cwd?: string | undefined;
 }
 
 export interface CompactionBlockData {
@@ -452,8 +525,10 @@ export function mapHistoryBlocks(history: TranscriptBlock[]): TypedTranscriptBlo
           id: b.id,
           type: "bash",
           data: {
+            executionId: d.executionId as string | undefined,
             command: (d.command as string) ?? "",
             outputText: (d.outputText as string) ?? "",
+            pty: d.pty as boolean | undefined,
             // History is an idle baseline, so a persisted streaming claim is
             // an interrupted operation rather than a live bash command.
             isStreaming: false,
@@ -464,6 +539,12 @@ export function mapHistoryBlocks(history: TranscriptBlock[]): TypedTranscriptBlo
             fullOutputPath: d.fullOutputPath as string | undefined,
             excludeFromContext: d.excludeFromContext as boolean | undefined,
             timestamp: timestampNumber(d.timestamp),
+            startedAt: timestampNumber(d.startedAt),
+            durationMs: d.durationMs as number | undefined,
+            signal: d.signal as string | undefined,
+            errorMessage: d.errorMessage as string | undefined,
+            normalization: d.normalization as BashBlockData["normalization"],
+            cwd: d.cwd as string | undefined,
           },
         };
       }
@@ -808,7 +889,18 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                     ...block,
                     data: {
                       ...block.data,
+                      executionId: event.id,
                       excludeFromContext: event.excludeFromContext,
+                      pty: event.pty,
+                      startedAt: event.startedAt,
+                      timestamp: event.startedAt,
+                      cwd: event.cwd,
+                      terminalMode: event.pty ? "compact" : undefined,
+                      terminalOutput: event.pty ? "" : undefined,
+                      terminalReconstructionSequence: event.pty ? 0 : undefined,
+                      terminalOutputSequence: event.pty ? 0 : undefined,
+                      terminalOutputChunks: event.pty ? [] : undefined,
+                      terminalOutputChunkChars: event.pty ? 0 : undefined,
                     },
                   }
                 : block,
@@ -834,9 +926,54 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                 ...block,
                 data: {
                   ...block.data,
-                  outputText: block.data.outputText + event.delta,
+                  outputText: block.data.pty
+                    ? block.data.outputText
+                    : block.data.outputText + event.delta,
                 },
               }
+            : block,
+        ),
+      };
+    }
+
+    case "bash_terminal_data": {
+      if (!activeBashId || activeBashExecutionId !== event.id) return state;
+      return {
+        ...state,
+        blocks: patchBlock(activeBashId, (block) =>
+          block.type === "bash"
+            ? (() => {
+                const currentSequence = block.data.terminalOutputSequence ?? 0;
+                const sequence =
+                  event.sequence ?? (event.data.length > 0 ? currentSequence + 1 : currentSequence);
+                const append = event.data.length > 0 && sequence > currentSequence;
+                const queued = append
+                  ? appendBoundedShellChunk(
+                      block.data.terminalOutputChunks,
+                      block.data.terminalOutputChunkChars,
+                      sequence,
+                      event.data,
+                    )
+                  : undefined;
+                return {
+                  ...block,
+                  data: {
+                    ...block.data,
+                    pty: true,
+                    // The reconstruction keyframe is immutable during live
+                    // output. Exact deltas live only in the bounded chunk ring.
+                    terminalOutput: block.data.terminalOutput,
+                    terminalOutputSequence: append ? sequence : block.data.terminalOutputSequence,
+                    ...(queued
+                      ? {
+                          terminalOutputChunks: queued.chunks,
+                          terminalOutputChunkChars: queued.chars,
+                        }
+                      : {}),
+                    terminalMode: event.mode ?? block.data.terminalMode ?? "compact",
+                  },
+                };
+              })()
             : block,
         ),
       };
@@ -856,12 +993,19 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
               data: {
                 command: event.command,
                 outputText: finalText,
+                executionId: event.id,
+                terminalOutput: "",
+                pty: event.pty,
                 isStreaming: false,
                 exitCode: event.exitCode,
                 cancelled: event.cancelled,
                 truncated: event.truncated,
                 fullOutputPath: event.fullOutputPath,
                 excludeFromContext: event.excludeFromContext,
+                durationMs: event.durationMs,
+                signal: event.signal,
+                errorMessage: event.errorMessage,
+                normalization: event.normalization,
               },
             },
           ],
@@ -878,12 +1022,20 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                   ...block.data,
                   command: event.command,
                   outputText: finalText || block.data.outputText,
+                  terminalOutput: "",
+                  terminalOutputChunks: [],
+                  terminalOutputChunkChars: 0,
+                  pty: event.pty ?? block.data.pty,
                   isStreaming: false,
                   exitCode: event.exitCode,
                   cancelled: event.cancelled,
                   truncated: event.truncated,
                   fullOutputPath: event.fullOutputPath,
                   excludeFromContext: event.excludeFromContext,
+                  durationMs: event.durationMs,
+                  signal: event.signal,
+                  errorMessage: event.errorMessage,
+                  normalization: event.normalization,
                 },
               }
             : block,
@@ -1677,6 +1829,89 @@ export function addBashBlock(state: TranscriptState, command: string): Transcrip
     ],
     activeBashId: blockId,
     activeBashExecutionId: null,
+  };
+}
+
+/** Install the host's bounded live-PTY keyframe before attach replay deltas. */
+export function restoreActiveShellTurn(
+  state: TranscriptState,
+  shell: ShellTurnSnapshot,
+): TranscriptState {
+  const existing = state.blocks.find(
+    (block) => block.type === "bash" && block.data.executionId === shell.id,
+  );
+  if (existing?.type === "bash") {
+    return {
+      ...state,
+      activeBashId: existing.id,
+      activeBashExecutionId: shell.id,
+      blocks: state.blocks.map((block) =>
+        block.id === existing.id && block.type === "bash"
+          ? {
+              ...block,
+              data: {
+                ...block.data,
+                executionId: shell.id,
+                command: shell.command,
+                terminalOutput: shell.ansi,
+                terminalMode: shell.mode,
+                pty: true,
+                isStreaming: true,
+                excludeFromContext: shell.excludeFromContext,
+                startedAt: shell.startedAt,
+                timestamp: shell.startedAt,
+                cwd: shell.cwd,
+                inputAcknowledgedThrough: shell.inputAcknowledgedThrough,
+                resizeRevision: shell.resizeRevision,
+                interruptRequestedAt: shell.interruptRequestedAt,
+                terminalReconstructionSequence: shell.outputThroughSequence,
+                terminalReconstructionRevision:
+                  (block.data.terminalReconstructionRevision ?? 0) + 1,
+                terminalReconstructionFenceToken: shell.reconstructionFenceToken,
+                terminalOutputSequence: shell.outputThroughSequence,
+                terminalOutputChunks: [],
+                terminalOutputChunkChars: 0,
+                liveReplayTruncated: shell.replayTruncated,
+              },
+            }
+          : block,
+      ),
+    };
+  }
+  const started = addBashBlock(state, shell.command);
+  const id = started.activeBashId;
+  if (!id) return started;
+  return {
+    ...started,
+    activeBashExecutionId: shell.id,
+    blocks: started.blocks.map((block) =>
+      block.id === id && block.type === "bash"
+        ? {
+            ...block,
+            data: {
+              ...block.data,
+              executionId: shell.id,
+              terminalOutput: shell.ansi,
+              terminalMode: shell.mode,
+              pty: true,
+              excludeFromContext: shell.excludeFromContext,
+              startedAt: shell.startedAt,
+              timestamp: shell.startedAt,
+              cwd: shell.cwd,
+              inputAcknowledgedThrough: shell.inputAcknowledgedThrough,
+              resizeRevision: shell.resizeRevision,
+              interruptRequestedAt: shell.interruptRequestedAt,
+              terminalReconstructionSequence: shell.outputThroughSequence,
+              terminalReconstructionRevision: 1,
+              terminalReconstructionFenceToken: shell.reconstructionFenceToken,
+              terminalOutputSequence: shell.outputThroughSequence,
+              terminalOutputChunks: [],
+              terminalOutputChunkChars: 0,
+              liveReplayTruncated: shell.replayTruncated,
+            },
+          }
+        : block,
+    ),
   };
 }
 

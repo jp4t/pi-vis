@@ -57,9 +57,14 @@ test.describe("runtime-native provider sign-in", () => {
       store.setState({ sessions });
     });
     await expect(page.locator(".dock")).toBeVisible();
-    await page.locator(".provider-login-dialog-slot").evaluate(async (slot) => {
-      await Promise.all(slot.getAnimations().map((animation) => animation.finished));
-    });
+    await Promise.all([
+      page.locator(".dock").evaluate(async (dock) => {
+        await Promise.all(dock.getAnimations().map((animation) => animation.finished));
+      }),
+      page.locator(".provider-login-dialog-slot").evaluate(async (slot) => {
+        await Promise.all(slot.getAnimations().map((animation) => animation.finished));
+      }),
+    ]);
     const connectedStack = await page.evaluate(() => {
       const dock = document.querySelector<HTMLElement>(".dock");
       const card = document.querySelector<HTMLElement>(".provider-login-dialog");

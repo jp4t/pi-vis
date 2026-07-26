@@ -13,6 +13,7 @@ import { ModelInfoSchema } from "@shared/pi-protocol/responses.js";
 import type {
   AgentSessionSnapshot,
   AuthorityAttachResponse,
+  BashActivity,
   CompactionActivity,
   IntentOutcome,
   RendererPublication,
@@ -88,6 +89,7 @@ import {
   createTranscriptState,
   finalizeActiveBlocks,
   finishBashBlock,
+  restoreActiveShellTurn,
   retirePendingUserEchoesByIntent,
   seedFromHistory,
   transcriptBlockCount,
@@ -129,6 +131,10 @@ export interface SessionViewState {
   runtimeSnapshot?: AgentSessionSnapshot | undefined;
   /** Sole renderer semantic projection. Only a following semantic plane is authoritative. */
   authorityProjection?: RendererAuthorityState | undefined;
+  /** Renderer-local identity of the last live-shell reconstruction this
+   * session successfully acknowledged. A remounted xterm requests a new host
+   * fence only when it would otherwise reuse this already-consumed keyframe. */
+  shellReconstructionAckKey?: string | undefined;
   hostInstanceId?: string | undefined;
   sessionEpoch: number;
   editorRevision: number;
@@ -652,13 +658,83 @@ export function authoritySnapshotFor(
   return projection?.semantic.state === "following" ? projection.authoritativeSnapshot : undefined;
 }
 
+export interface LiveShellPresentation {
+  snapshot: SemanticSnapshot;
+  activity: BashActivity;
+  executionId?: string | undefined;
+  /** Presentation may survive a recoverable semantic fence, but only this
+   * branch may authorize shell input, resize, or signals. */
+  authoritative: boolean;
+}
+
+/**
+ * Presentation-only live-shell ownership.
+ *
+ * During a recoverable same-owner semantic fence, retain the Composer-slot
+ * shell surface only when the stale semantic activity and independently
+ * retained transcript PTY identify the exact same execution. This must never
+ * be used as dispatch authority.
+ */
+export function liveShellPresentationFor(
+  session: SessionViewState | undefined,
+): LiveShellPresentation | undefined {
+  if (!session) return undefined;
+  const authoritativeSnapshot = authoritySnapshotFor(session);
+  const authoritativeActivity = authoritativeSnapshot?.activity.bash;
+  if (authoritativeSnapshot && authoritativeActivity?.pty === true) {
+    return {
+      snapshot: authoritativeSnapshot,
+      activity: authoritativeActivity,
+      executionId:
+        authoritativeActivity.intentId ?? session.transcript.activeBashExecutionId ?? undefined,
+      authoritative: true,
+    };
+  }
+
+  const projection = session.authorityProjection;
+  if (
+    projection?.semantic.state !== "synchronizing" ||
+    !projection.owner ||
+    !projection.staleDiagnosticSnapshot
+  ) {
+    return undefined;
+  }
+  const staleSnapshot = projection.staleDiagnosticSnapshot;
+  const staleActivity = staleSnapshot.activity.bash;
+  const executionId = staleActivity?.intentId;
+  if (
+    staleActivity?.pty !== true ||
+    !executionId ||
+    projection.owner.hostInstanceId !== staleSnapshot.owner.hostInstanceId ||
+    projection.owner.sessionEpoch !== staleSnapshot.owner.sessionEpoch ||
+    session.transcript.activeBashExecutionId !== executionId
+  ) {
+    return undefined;
+  }
+  const matchingBlock = session.transcript.blocks.find(
+    (block) =>
+      block.type === "bash" &&
+      block.data.executionId === executionId &&
+      block.data.pty === true &&
+      block.data.isStreaming,
+  );
+  if (!matchingBlock) return undefined;
+  return {
+    snapshot: staleSnapshot,
+    activity: staleActivity,
+    executionId,
+    authoritative: false,
+  };
+}
+
 /** Semantic controls require a complete authority frame, never a legacy lease. */
 export function hasAuthoritativeSemanticState(session: SessionViewState | undefined): boolean {
   return authoritySnapshotFor(session) !== undefined;
 }
 
 export function isSessionWorking(session: SessionViewState | undefined): boolean {
-  return authoritySnapshotFor(session)?.sdk.isStreaming === true;
+  const sdk = authoritySnapshotFor(session)?.sdk;
+  return sdk?.isStreaming === true || sdk?.isBashRunning === true;
 }
 
 export function sessionCompactionActivity(
@@ -1338,6 +1414,7 @@ interface SessionsStore {
   applyRuntimeState: (sessionId: SessionId, state: RuntimeStateUpdate) => void;
   /** Shadow reducer entry points for the authority-frame protocol. */
   applyAuthorityAttach: (sessionId: SessionId, response: AuthorityAttachResponse) => void;
+  acknowledgeShellReconstruction: (sessionId: SessionId, reconstructionKey: string) => void;
   applyAuthorityPublication: (publication: RendererPublication) => void;
   markAuthorityUnavailable: (sessionId: SessionId, reason: string) => void;
   applyTransitionBatch: (
@@ -2518,11 +2595,17 @@ const buildSessionsStore = (
         const droppedReplayCount = transcriptFollowing
           ? invalidReplayEntries.length
           : replayTranscriptEntries.length;
+        const semanticProjection = applyAuthoritySemanticProjection(current, authorityProjection);
+        const shellSnapshot = response.baseline.transcript.currentShellTurn;
+        const projectionWithShell =
+          transcriptFollowing && shellSnapshot
+            ? {
+                ...semanticProjection,
+                transcript: restoreActiveShellTurn(semanticProjection.transcript, shellSnapshot),
+              }
+            : semanticProjection;
         sessions.set(sessionId, {
-          ...appendQueueRestorations(
-            applyAuthoritySemanticProjection(current, authorityProjection),
-            restorations,
-          ),
+          ...appendQueueRestorations(projectionWithShell, restorations),
           authorityProjection,
           panel: customPanel
             ? {
@@ -2621,6 +2704,19 @@ const buildSessionsStore = (
     if (following && get().sessions.get(sessionId)?.status === "ready") {
       void get().refreshCommands(sessionId);
     }
+  },
+
+  acknowledgeShellReconstruction: (sessionId, reconstructionKey) => {
+    set((state) => {
+      const current = state.sessions.get(sessionId);
+      if (!current || current.shellReconstructionAckKey === reconstructionKey) return {};
+      const sessions = new Map(state.sessions);
+      sessions.set(sessionId, {
+        ...current,
+        shellReconstructionAckKey: reconstructionKey,
+      });
+      return { sessions };
+    });
   },
 
   applyAuthorityPublication: (publication) => {

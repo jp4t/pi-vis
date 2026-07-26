@@ -13,17 +13,47 @@ function disc(commands: Array<[string, string]>): Map<string, SlashCommandInfo> 
 describe("parseComposerInput — bash", () => {
   it("!cmd → bash (excludeFromContext=false)", () => {
     const action = parseComposerInput("!ls -la", { discovered: new Map() });
-    expect(action).toEqual({ kind: "bash", command: "ls -la", excludeFromContext: false });
+    expect(action).toEqual({
+      kind: "bash",
+      command: "ls -la",
+      excludeFromContext: false,
+      editorText: "!ls -la",
+    });
   });
 
   it("!!cmd → bash (excludeFromContext=true)", () => {
     const action = parseComposerInput("!!npm test", { discovered: new Map() });
-    expect(action).toEqual({ kind: "bash", command: "npm test", excludeFromContext: true });
+    expect(action).toEqual({
+      kind: "bash",
+      command: "npm test",
+      excludeFromContext: true,
+      editorText: "!!npm test",
+    });
   });
 
   it("trims whitespace from the command", () => {
     const action = parseComposerInput("!   pwd  ", { discovered: new Map() });
-    expect(action).toEqual({ kind: "bash", command: "pwd", excludeFromContext: false });
+    expect(action).toEqual({
+      kind: "bash",
+      command: "pwd",
+      excludeFromContext: false,
+      editorText: "!   pwd  ",
+    });
+  });
+
+  it("treats a third exclamation mark as excluded command text", () => {
+    const action = parseComposerInput("!!!foo", { discovered: new Map() });
+    expect(action).toEqual({
+      kind: "bash",
+      command: "!foo",
+      excludeFromContext: true,
+      editorText: "!!!foo",
+    });
+  });
+
+  it("does not classify a prefix away from position zero as bash", () => {
+    const action = parseComposerInput(" !ls", { discovered: new Map() });
+    expect(action).toEqual({ kind: "send-prompt", text: " !ls" });
   });
 });
 

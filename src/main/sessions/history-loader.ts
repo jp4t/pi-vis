@@ -39,6 +39,19 @@ export async function entriesToTranscript(
 ): Promise<TranscriptBlock[]> {
   const blocks: TranscriptBlock[] = [];
   const toolCallsById = new Map<string, TranscriptBlock>();
+  const pendingShellStarts: Array<{
+    data: Record<string, unknown>;
+    order: number;
+    blockIndex: number;
+  }> = [];
+  const pendingShellBashes: Array<{
+    block: TranscriptBlock;
+    command: string;
+    excludeFromContext: boolean;
+    order: number;
+    claimed: boolean;
+  }> = [];
+  const shellBlocksByExecutionId = new Map<string, TranscriptBlock>();
   const pushBlock = (block: TranscriptBlock): void => {
     blocks.push(block);
     if (block.type === "tool_call") {
@@ -154,10 +167,15 @@ export async function entriesToTranscript(
         }
 
         if (role === "bashExecution") {
-          pushBlock({
+          // A BashExecutionMessage has no execution id. Keep it generic until
+          // an exact completion marker proves which Shell Turn produced it.
+          // Matching here by command alone would let an old orphaned marker
+          // steal a later agent bash or a new Shell Turn with the same text.
+          const block: TranscriptBlock = {
             id: entry.id,
             type: "bash",
             data: {
+              executionId: undefined,
               command: typeof msg.command === "string" ? msg.command : "",
               outputText: typeof msg.output === "string" ? msg.output : "",
               isStreaming: false,
@@ -170,6 +188,14 @@ export async function entriesToTranscript(
                 typeof msg.excludeFromContext === "boolean" ? msg.excludeFromContext : undefined,
               timestamp: messageTimestamp(msg.timestamp, entry.timestamp),
             },
+          };
+          pushBlock(block);
+          pendingShellBashes.push({
+            block,
+            command: typeof msg.command === "string" ? msg.command : "",
+            excludeFromContext: msg.excludeFromContext === true,
+            order: processed,
+            claimed: false,
           });
           break;
         }
@@ -333,6 +359,108 @@ export async function entriesToTranscript(
         break;
       }
       case "custom": {
+        if (entry.customType === "pivis.shell_turn_start") {
+          if (entry.data && typeof entry.data === "object") {
+            pendingShellStarts.push({
+              data: entry.data as Record<string, unknown>,
+              order: processed,
+              blockIndex: blocks.length,
+            });
+          }
+          break;
+        }
+        if (entry.customType === "pivis.shell_turn_complete") {
+          if (!entry.data || typeof entry.data !== "object") break;
+          const metadata = entry.data as Record<string, unknown>;
+          const executionId = metadata["executionId"];
+          let block =
+            typeof executionId === "string" ? shellBlocksByExecutionId.get(executionId) : undefined;
+          const pendingStartIndex =
+            typeof executionId === "string"
+              ? pendingShellStarts.findIndex(
+                  (candidate) => candidate.data["executionId"] === executionId,
+                )
+              : -1;
+          const pendingStart =
+            pendingStartIndex >= 0 ? pendingShellStarts[pendingStartIndex] : undefined;
+
+          if (!block && pendingStart && typeof executionId === "string") {
+            const start = pendingStart.data;
+            const command = typeof start["command"] === "string" ? start["command"] : "";
+            const excludeFromContext = start["excludeFromContext"] === true;
+            let bashCandidate: (typeof pendingShellBashes)[number] | undefined;
+            for (let index = pendingShellBashes.length - 1; index >= 0; index--) {
+              const candidate = pendingShellBashes[index];
+              if (
+                candidate &&
+                !candidate.claimed &&
+                candidate.order > pendingStart.order &&
+                candidate.command === command &&
+                candidate.excludeFromContext === excludeFromContext
+              ) {
+                bashCandidate = candidate;
+                break;
+              }
+            }
+            if (bashCandidate) {
+              bashCandidate.claimed = true;
+              block = bashCandidate.block;
+              const data = block.data as Record<string, unknown>;
+              data["executionId"] = executionId;
+              data["pty"] = start["pty"] === true ? true : undefined;
+              data["startedAt"] =
+                typeof start["startedAt"] === "number" ? start["startedAt"] : undefined;
+              data["cwd"] = typeof start["cwd"] === "string" ? start["cwd"] : undefined;
+              shellBlocksByExecutionId.set(executionId, block);
+              pendingShellStarts.splice(pendingStartIndex, 1);
+            }
+          }
+
+          if (block?.type === "bash") {
+            const data = block.data as Record<string, unknown>;
+            if (typeof metadata["durationMs"] === "number")
+              data["durationMs"] = metadata["durationMs"];
+            if (typeof metadata["signal"] === "string") data["signal"] = metadata["signal"];
+            if (typeof metadata["errorMessage"] === "string")
+              data["errorMessage"] = metadata["errorMessage"];
+            if (metadata["interrupted"] === true) data["interrupted"] = true;
+            if (typeof metadata["exitCode"] === "number") data["exitCode"] = metadata["exitCode"];
+            if (typeof metadata["cancelled"] === "boolean")
+              data["cancelled"] = metadata["cancelled"];
+            if (typeof metadata["truncated"] === "boolean")
+              data["truncated"] = metadata["truncated"];
+            if (
+              metadata["normalization"] === "terminal_buffer" ||
+              metadata["normalization"] === "alternate_screen_final"
+            ) {
+              data["normalization"] = metadata["normalization"];
+            }
+          } else if (pendingStart) {
+            const pending = pendingStart.data;
+            if (pending) {
+              pending["completed"] = true;
+              if (typeof metadata["durationMs"] === "number")
+                pending["durationMs"] = metadata["durationMs"];
+              if (typeof metadata["signal"] === "string") pending["signal"] = metadata["signal"];
+              if (typeof metadata["errorMessage"] === "string")
+                pending["errorMessage"] = metadata["errorMessage"];
+              if (metadata["interrupted"] === true) pending["interrupted"] = true;
+              if (typeof metadata["exitCode"] === "number")
+                pending["exitCode"] = metadata["exitCode"];
+              if (typeof metadata["cancelled"] === "boolean")
+                pending["cancelled"] = metadata["cancelled"];
+              if (typeof metadata["truncated"] === "boolean")
+                pending["truncated"] = metadata["truncated"];
+              if (
+                metadata["normalization"] === "terminal_buffer" ||
+                metadata["normalization"] === "alternate_screen_final"
+              ) {
+                pending["normalization"] = metadata["normalization"];
+              }
+            }
+          }
+          break;
+        }
         // Pi >= 0.80.4 extensions can pair appendEntry(customType, data) with
         // registerEntryRenderer(). Preserve the entry in transcript history;
         // the renderer asks the live SDK host to run that pi-tui renderer at
@@ -371,6 +499,59 @@ export async function entriesToTranscript(
       data["isStreaming"] = false;
       data["interrupted"] = true;
     }
+  }
+  let insertedShellBlocks = 0;
+  for (const pendingShellStart of pendingShellStarts) {
+    const shellStart = pendingShellStart.data;
+    const executionId =
+      typeof shellStart["executionId"] === "string" ? shellStart["executionId"] : undefined;
+    const errorMessage =
+      typeof shellStart["errorMessage"] === "string" ? shellStart["errorMessage"] : undefined;
+    const recoveryState =
+      errorMessage !== undefined
+        ? "failed"
+        : shellStart["completed"] === true
+          ? "completed"
+          : "interrupted";
+    const recoveredBlock: TranscriptBlock = {
+      id: executionId
+        ? `${recoveryState}-${executionId}`
+        : `${recoveryState}-shell-${pendingShellStart.order}`,
+      type: "bash",
+      data: {
+        executionId,
+        command: typeof shellStart["command"] === "string" ? shellStart["command"] : "",
+        outputText: errorMessage ?? "",
+        isStreaming: false,
+        interrupted: shellStart["completed"] === true ? shellStart["interrupted"] === true : true,
+        pty: shellStart["pty"] === true ? true : undefined,
+        excludeFromContext:
+          typeof shellStart["excludeFromContext"] === "boolean"
+            ? shellStart["excludeFromContext"]
+            : undefined,
+        startedAt:
+          typeof shellStart["startedAt"] === "number" ? shellStart["startedAt"] : undefined,
+        timestamp:
+          typeof shellStart["startedAt"] === "number" ? shellStart["startedAt"] : undefined,
+        cwd: typeof shellStart["cwd"] === "string" ? shellStart["cwd"] : undefined,
+        durationMs:
+          typeof shellStart["durationMs"] === "number" ? shellStart["durationMs"] : undefined,
+        signal: typeof shellStart["signal"] === "string" ? shellStart["signal"] : undefined,
+        exitCode: typeof shellStart["exitCode"] === "number" ? shellStart["exitCode"] : undefined,
+        cancelled:
+          typeof shellStart["cancelled"] === "boolean" ? shellStart["cancelled"] : undefined,
+        truncated:
+          typeof shellStart["truncated"] === "boolean" ? shellStart["truncated"] : undefined,
+        errorMessage,
+        normalization:
+          shellStart["normalization"] === "terminal_buffer" ||
+          shellStart["normalization"] === "alternate_screen_final"
+            ? shellStart["normalization"]
+            : undefined,
+      },
+    };
+    blocks.splice(pendingShellStart.blockIndex + insertedShellBlocks, 0, recoveredBlock);
+    insertedShellBlocks++;
   }
 
   return blocks;

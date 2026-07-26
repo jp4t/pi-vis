@@ -290,11 +290,12 @@
   min-width: 0;
 }
 
-/* Custom-panel resize handle. Rendered as its own non-overlapping gutter
-   above the pending-message boundary and `.session-dock`, so it cannot steal
-   clicks from queued-message or dock/widget controls. The gutter stays
-   transparent, with a subtle centered pill so the resize affordance is
-   discoverable without adding visual weight. */
+/* Fixed Composer-viewport resize handle, shared by Custom views and live Shell
+   Turns. Rendered as its own non-overlapping gutter above the pending-message
+   boundary and `.session-dock`, so it cannot steal clicks from queued-message
+   or dock/widget controls. The gutter stays transparent, with a subtle
+   centered pill so the resize affordance is discoverable without visual
+   weight. */
 .custom-panel-dock-resize {
   position: relative;
   z-index: 4;
@@ -317,9 +318,14 @@
   transition: opacity 0.15s ease, background 0.15s ease;
 }
 
-.custom-panel-dock-resize:hover::before {
+.custom-panel-dock-resize:hover::before,
+.custom-panel-dock-resize:focus-visible::before {
   background: var(--text-muted);
   opacity: 0.8;
+}
+
+.custom-panel-dock-resize:focus {
+  outline: none;
 }
 
 /* Connected stack — when the Dock tray is present above one of the
@@ -335,6 +341,7 @@
    Dock's `--border-strong` so the seam is a single strong outline, not a
    strong/faint mismatch. */
 .session-dock:has(.dock) ~ .custom-panel,
+.session-dock:has(.dock) ~ .shell-terminal,
 .session-dock:has(.dock) ~ .picker-slot .picker,
 .session-dock:has(.dock) ~ .ext-dialog-slot .ext-dialog,
 .session-dock:has(.dock) ~ .ext-dialog-slot .provider-login-dialog {

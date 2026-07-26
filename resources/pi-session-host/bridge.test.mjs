@@ -8,7 +8,10 @@ import {
 } from "../../src/shared/pi-protocol/runtime-state.ts";
 import { assertHostCapabilities, setupCommandBridge } from "./bridge.mjs";
 
-const MODEL_SCOPE_PI = { resolveModelScopeWithDiagnostics };
+const MODEL_SCOPE_PI = {
+  resolveModelScopeWithDiagnostics,
+  getShellConfig: vi.fn(() => ({ shell: "/bin/bash", args: ["-c"] })),
+};
 
 function deferred() {
   let resolve;
@@ -75,6 +78,7 @@ function makeSession(overrides = {}) {
     setAutoCompactionEnabled: vi.fn(() => {}),
     setAutoRetryEnabled: vi.fn(() => {}),
     executeBash: vi.fn(async () => ({ output: "ok", exitCode: 0, cancelled: false })),
+    recordBashResult: vi.fn(),
     abortBash: vi.fn(() => {}),
     compact: vi.fn(async () => {}),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1 } })),
@@ -101,7 +105,12 @@ function makeSession(overrides = {}) {
       getRegisteredCommands: vi.fn(() => []),
     },
     resourceLoader: { getSkills: vi.fn(() => ({ skills: [] })) },
-    sessionManager: { getLeafId: vi.fn(() => "leaf-9"), getBranch: vi.fn(() => []) },
+    sessionManager: {
+      getLeafId: vi.fn(() => "leaf-9"),
+      getBranch: vi.fn(() => []),
+      getCwd: vi.fn(() => "/work"),
+      appendCustomEntry: vi.fn(),
+    },
     settingsManager: { setEnabledModels: vi.fn(), getEnabledModels: vi.fn(() => undefined) },
     scopedModels: [],
     setScopedModels: vi.fn(),
@@ -122,11 +131,43 @@ function makeRuntime(session) {
 }
 
 function makeUiState(overrides = {}) {
+  const editorSnapshot =
+    overrides.editorSnapshot ?? (() => ({ revision: 0, text: "", attachments: [] }));
+  let consumedShellEditor;
   return {
     catalogSnapshot: () => ({}),
-    editorSnapshot: () => ({ revision: 0, text: "", attachments: [] }),
     acceptEditorSubmission: () => false,
     applyEditorPatch: () => ({ accepted: false }),
+    ...overrides,
+    editorSnapshot: () => consumedShellEditor ?? editorSnapshot(),
+    acceptShellEditorSubmission:
+      overrides.acceptShellEditorSubmission ??
+      ((request) => {
+        const editor = consumedShellEditor ?? editorSnapshot();
+        if (request.editorRevision !== editor.revision || request.editorText !== editor.text) {
+          return false;
+        }
+        consumedShellEditor = { ...editor, revision: editor.revision + 1, text: "" };
+        return true;
+      }),
+  };
+}
+
+function makeShellController(overrides = {}) {
+  return {
+    operations: { exec: vi.fn() },
+    snapshot: vi.fn(() => ({
+      cols: 80,
+      rows: 8,
+      interruptRequested: false,
+      forceKillRequested: false,
+      terminal: { alternateScreenSeen: false },
+    })),
+    writeInput: vi.fn(),
+    resize: vi.fn(),
+    interrupt: vi.fn(),
+    forceKill: vi.fn(),
+    dispose: vi.fn(),
     ...overrides,
   };
 }
@@ -175,6 +216,14 @@ function setup(sessionOverrides, bridgeOverrides = {}) {
     handleReload,
     dispatchIntent,
     bindExtensions,
+    requestAuthorityAttach: bridge.requestAuthorityAttach,
+    sendShellInput: bridge.sendShellInput,
+    resizeShell: bridge.resizeShell,
+    acknowledgeShellReconstruction: bridge.acknowledgeShellReconstruction,
+    setShellTransportBackpressure: bridge.setShellTransportBackpressure,
+    signalShell: bridge.signalShell,
+    retainedShellSnapshot: bridge.retainedShellSnapshot,
+    authority: bridge.authority,
     run,
   };
 }
@@ -987,10 +1036,19 @@ describe("setupCommandBridge — target intent dispatch", () => {
   }
 
   it("records admission separately from terminal outcomes for every child-owned intent kind", async () => {
-    let editorText = "";
+    let editor = { revision: 0, text: "", attachments: [] };
+    const shellController = makeShellController();
     const { session, runtime, send, dispatchIntent } = setup(undefined, {
+      createShellController: vi.fn(() => shellController),
       uiState: makeUiState({
-        editorSnapshot: () => ({ revision: 0, text: editorText, attachments: [] }),
+        editorSnapshot: () => editor,
+        acceptShellEditorSubmission: (request) => {
+          if (request.editorRevision !== editor.revision || request.editorText !== editor.text) {
+            return false;
+          }
+          editor = { ...editor, revision: editor.revision + 1, text: "" };
+          return true;
+        },
       }),
     });
     session.prompt.mockImplementation(async (_text, options) => options.preflightResult(true));
@@ -1012,19 +1070,31 @@ describe("setupCommandBridge — target intent dispatch", () => {
         { operation: "clear", expectedSteeringIntentIds: [], expectedFollowUpIntentIds: [] },
       ],
       ["compact", { instructions: "brief" }],
-      ["runBash", { command: "pwd", excludeFromContext: true }],
+      [
+        "runBash",
+        {
+          command: "pwd",
+          excludeFromContext: true,
+          editorRevision: 0,
+          editorText: "!!pwd",
+        },
+      ],
       ["setTrust", { optionLabel: "Trust this folder" }],
       ["navigate", { targetId: "leaf-9", summarize: true }],
       ["setModel", { provider: "anthropic", modelId: "claude-x" }],
       ["setThinking", { level: "high" }],
       ["rename", { name: "Renamed" }],
       ["reload", {}],
-      ["invokeCommand", { text: "/extension arg", editorRevision: 0 }],
+      ["invokeCommand", { text: "/extension arg", editorRevision: 1 }],
     ];
 
     for (const [kind, payload] of intents) {
-      if (kind === "submit") editorText = "hello";
-      else if (kind === "invokeCommand") editorText = payload.text;
+      if (kind === "submit") editor = { ...editor, text: "hello" };
+      else if (kind === "runBash") {
+        editor = { ...editor, revision: payload.editorRevision, text: payload.editorText };
+      } else if (kind === "invokeCommand") {
+        editor = { ...editor, revision: payload.editorRevision, text: payload.text };
+      }
       await expect(
         dispatchIntent(envelope(`intent-${kind}`, { kind, ...payload })),
       ).resolves.toEqual(
@@ -1044,6 +1114,7 @@ describe("setupCommandBridge — target intent dispatch", () => {
     expect(session.executeBash).toHaveBeenCalledWith("pwd", undefined, {
       id: "intent-runBash",
       excludeFromContext: true,
+      operations: shellController.operations,
     });
     expect(session.navigateTree).toHaveBeenCalledWith("leaf-9", { summarize: true });
     expect(session.setModel).toHaveBeenCalled();
@@ -1065,6 +1136,7 @@ describe("setupCommandBridge — target intent dispatch", () => {
 
   it("publishes the direct bash streaming lifecycle on the live transcript plane", async () => {
     const sendPresentation = vi.fn();
+    const shellController = makeShellController();
     let listener;
     const { session, dispatchIntent } = setup(
       {
@@ -1083,7 +1155,13 @@ describe("setupCommandBridge — target intent dispatch", () => {
           };
         }),
       },
-      { sendPresentation },
+      {
+        createShellController: vi.fn(() => shellController),
+        sendPresentation,
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "!!printf hello", attachments: [] }),
+        }),
+      },
     );
 
     await expect(
@@ -1092,6 +1170,8 @@ describe("setupCommandBridge — target intent dispatch", () => {
           kind: "runBash",
           command: "printf hello",
           excludeFromContext: true,
+          editorRevision: 0,
+          editorText: "!!printf hello",
         }),
       ),
     ).resolves.toMatchObject({ status: "admitted" });
@@ -1149,7 +1229,454 @@ describe("setupCommandBridge — target intent dispatch", () => {
     expect(session.executeBash).toHaveBeenCalledWith("printf hello", undefined, {
       id: "visible-bash",
       excludeFromContext: true,
+      operations: shellController.operations,
     });
+  });
+
+  it("injects an interactive PTY through Pi's public BashOperations and fences its controls", async () => {
+    const gate = deferred();
+    const sendPresentation = vi.fn();
+    let factoryOptions;
+    const controllerState = {
+      cols: 80,
+      rows: 24,
+      inputAcknowledgedThrough: 0,
+      resizeRevision: 0,
+      outputSequence: 1,
+      inputReady: false,
+      replay: {
+        gap: false,
+        truncated: false,
+        chunks: [{ sequence: 1, data: "prompt> " }],
+      },
+      interruptRequested: false,
+      forceKillRequested: false,
+      terminal: { alternateScreenSeen: false },
+    };
+    const controller = {
+      operations: { exec: vi.fn() },
+      snapshot: vi.fn(() => structuredClone(controllerState)),
+      reconstructionSnapshot: vi.fn(async () => ({
+        keyframe: {
+          ansi: "\u001b[2J\u001b[Hserialized prompt> ",
+          throughSequence: 1,
+          retainedScrollback: 0,
+          availableScrollback: 2,
+          truncated: true,
+        },
+        snapshot: {
+          ...structuredClone(controllerState),
+          replay: {
+            afterSequence: 1,
+            fromSequence: 2,
+            throughSequence: 1,
+            gap: false,
+            truncated: false,
+            chunks: [],
+          },
+        },
+      })),
+      writeInput: vi.fn(({ sequence }) => {
+        controllerState.inputAcknowledgedThrough = sequence;
+        return { accepted: true, acknowledgedThrough: sequence };
+      }),
+      resize: vi.fn(({ revision, cols, rows }) => {
+        controllerState.resizeRevision = revision;
+        controllerState.cols = cols;
+        controllerState.rows = rows;
+        return { accepted: true };
+      }),
+      interrupt: vi.fn(() => {
+        if (controllerState.interruptRequested) {
+          return { requested: false, alreadyRequested: true };
+        }
+        controllerState.interruptRequested = true;
+        return { requested: true };
+      }),
+      forceKill: vi.fn(() => ({ requested: true })),
+      setTransportBackpressured: vi.fn(),
+      dispose: vi.fn(),
+    };
+    const createShellController = vi.fn((options) => {
+      factoryOptions = options;
+      return controller;
+    });
+    const executeBash = vi.fn((_command, _onChunk, options) => {
+      factoryOptions.onRawData({ executionId: options.id, sequence: 1, data: "prompt> " });
+      return gate.promise;
+    });
+    const stagedAttachments = [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }];
+    const applyEditorPatch = vi.fn(() => ({ accepted: false }));
+    const uiState = makeUiState({
+      editorSnapshot: () => ({
+        revision: 0,
+        text: "!!read answer",
+        attachments: stagedAttachments,
+        conflictText: "newer local draft",
+        conflictAttachments: [],
+      }),
+      applyEditorPatch,
+    });
+    const {
+      session,
+      dispatchIntent,
+      requestAuthorityAttach,
+      sendShellInput,
+      resizeShell,
+      acknowledgeShellReconstruction,
+      setShellTransportBackpressure,
+      signalShell,
+      retainedShellSnapshot,
+      authority,
+    } = setup(
+      {
+        executeBash,
+        sessionManager: {
+          getLeafId: vi.fn(() => "leaf-9"),
+          getBranch: vi.fn(() => []),
+          getCwd: vi.fn(() => "/work"),
+          appendCustomEntry: vi.fn(),
+        },
+        settingsManager: {
+          setEnabledModels: vi.fn(),
+          getEnabledModels: vi.fn(() => undefined),
+          getShellPath: vi.fn(() => "/bin/zsh"),
+        },
+      },
+      {
+        createShellController,
+        sendPresentation,
+        uiState,
+        pi: {
+          ...MODEL_SCOPE_PI,
+          getShellConfig: vi.fn(() => ({
+            shell: "/bin/zsh",
+            args: ["-c"],
+            commandTransport: "argv",
+          })),
+        },
+      },
+    );
+
+    const shellEnvelope = envelope("pty-bash", {
+      kind: "runBash",
+      command: "read answer",
+      excludeFromContext: true,
+      editorRevision: 0,
+      editorText: "!!read answer",
+    });
+    await expect(dispatchIntent(shellEnvelope)).resolves.toMatchObject({ status: "admitted" });
+    await expect(dispatchIntent(shellEnvelope)).resolves.toMatchObject({ status: "duplicate" });
+    await vi.waitFor(() => expect(createShellController).toHaveBeenCalledOnce());
+    expect(executeBash).toHaveBeenCalledOnce();
+    expect(applyEditorPatch).not.toHaveBeenCalled();
+    expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledWith(
+      "pivis.shell_turn_start",
+      expect.objectContaining({
+        executionId: "pty-bash",
+        command: "read answer",
+        excludeFromContext: true,
+        pty: true,
+      }),
+    );
+    expect(executeBash).toHaveBeenCalledWith("read answer", undefined, {
+      id: "pty-bash",
+      excludeFromContext: true,
+      operations: controller.operations,
+    });
+    factoryOptions.onStateChange({ terminal: { activeBuffer: "alternate" } });
+    expect(retainedShellSnapshot()).toMatchObject({
+      id: "pty-bash",
+      command: "read answer",
+      cwd: "/work",
+      mode: "fullscreen",
+      ansi: "prompt> ",
+      inputAcknowledgedThrough: 0,
+      resizeRevision: 0,
+    });
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_terminal_data",
+              id: "pty-bash",
+              data: "",
+              mode: "fullscreen",
+            }),
+          ],
+        }),
+      }),
+    );
+    const attached = await requestAuthorityAttach(7);
+    expect(attached).toMatchObject({
+      status: "ready",
+      baseline: {
+        semantic: {
+          snapshot: {
+            editor: {
+              revision: 1,
+              text: "",
+              attachments: stagedAttachments,
+              conflictText: "newer local draft",
+            },
+            activity: {
+              bash: {
+                inputReady: false,
+              },
+            },
+          },
+        },
+        transcript: {
+          currentShellTurn: {
+            id: "pty-bash",
+            owner: { hostInstanceId: "test-host", sessionEpoch: 0 },
+            ansi: "\u001b[2J\u001b[Hserialized prompt> ",
+            reconstructionFenceToken: 1,
+            outputThroughSequence: 1,
+            replayTruncated: true,
+          },
+        },
+      },
+    });
+    expect(controller.reconstructionSnapshot).toHaveBeenCalledOnce();
+    expect(sendShellInput("other", 1, "secret")).toEqual({
+      accepted: false,
+      acknowledgedThrough: 0,
+    });
+    expect(sendShellInput("pty-bash", 1, "before-keyframe-ack")).toEqual({
+      accepted: false,
+      acknowledgedThrough: 0,
+    });
+    expect(resizeShell("pty-bash", 1, 100, 30)).toBe(false);
+    expect(controller.resize).not.toHaveBeenCalled();
+    expect(signalShell("pty-bash", "interrupt")).toBe(false);
+    expect(controller.interrupt).not.toHaveBeenCalled();
+    const firstFenceToken =
+      attached.status === "ready"
+        ? attached.baseline.transcript.currentShellTurn.reconstructionFenceToken
+        : -1;
+    expect(acknowledgeShellReconstruction("pty-bash", firstFenceToken, 2)).toBe(false);
+    expect(acknowledgeShellReconstruction("pty-bash", firstFenceToken, 1)).toBe(false);
+    expect(sendShellInput("pty-bash", 1, "still-bootstrapping")).toEqual({
+      accepted: false,
+      acknowledgedThrough: 0,
+    });
+
+    // A second attach at the same quiet output sequence installs a new host
+    // fence. A delayed acknowledgement for the first keyframe must not release
+    // this newer fence (the output sequence alone cannot distinguish them).
+    const reattached = await requestAuthorityAttach(8);
+    expect(reattached).toMatchObject({
+      status: "ready",
+      baseline: {
+        transcript: {
+          currentShellTurn: {
+            id: "pty-bash",
+            reconstructionFenceToken: 2,
+            outputThroughSequence: 1,
+          },
+        },
+      },
+    });
+    const secondFenceToken =
+      reattached.status === "ready"
+        ? reattached.baseline.transcript.currentShellTurn.reconstructionFenceToken
+        : -1;
+    expect(secondFenceToken).not.toBe(firstFenceToken);
+    expect(controller.reconstructionSnapshot).toHaveBeenCalledTimes(2);
+    controllerState.inputReady = true;
+    factoryOptions.onStateChange({ inputReady: true, terminal: { activeBuffer: "alternate" } });
+    expect(acknowledgeShellReconstruction("pty-bash", firstFenceToken, 1)).toBe(false);
+    expect(sendShellInput("pty-bash", 1, "after-stale-ack")).toEqual({
+      accepted: false,
+      acknowledgedThrough: 0,
+    });
+    expect(acknowledgeShellReconstruction("pty-bash", secondFenceToken, 1)).toBe(true);
+    expect(authority.semanticSnapshot().activity.bash).toMatchObject({
+      pty: true,
+      inputReady: true,
+    });
+    expect(sendShellInput("pty-bash", 1, "answer\r")).toEqual({
+      accepted: true,
+      acknowledgedThrough: 1,
+    });
+    expect(resizeShell("pty-bash", 1, 100, 30)).toBe(true);
+    setShellTransportBackpressure(true);
+    setShellTransportBackpressure(false);
+    expect(controller.setTransportBackpressured.mock.calls).toEqual([[true], [false]]);
+    expect(signalShell("pty-bash", "interrupt")).toBe(true);
+    expect(signalShell("pty-bash", "interrupt")).toBe(true);
+    expect(session.abortBash).toHaveBeenCalledOnce();
+    expect(retainedShellSnapshot()).toMatchObject({
+      id: "pty-bash",
+      interruptRequestedAt: expect.any(Number),
+    });
+
+    gate.resolve({
+      output: "prompt> answer\n",
+      exitCode: 130,
+      cancelled: false,
+      truncated: false,
+    });
+    await vi.waitFor(() =>
+      expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledWith(
+        "pivis.shell_turn_complete",
+        expect.objectContaining({
+          executionId: "pty-bash",
+          cancelled: true,
+          normalization: "terminal_buffer",
+        }),
+      ),
+    );
+    expect(controller.dispose).toHaveBeenCalled();
+    expect(retainedShellSnapshot()).toBeUndefined();
+  });
+
+  it("records an admitted PTY failure through Pi's public canonical Bash recorder", async () => {
+    const sendPresentation = vi.fn();
+    const controller = {
+      operations: { exec: vi.fn() },
+      snapshot: vi.fn(() => ({
+        cols: 80,
+        rows: 24,
+        interruptRequested: false,
+        forceKillRequested: false,
+        terminal: { alternateScreenSeen: false },
+      })),
+      dispose: vi.fn(),
+    };
+    const failure = new Error("spawn exploded\u001b");
+    const { session, dispatchIntent } = setup(
+      {
+        executeBash: vi.fn(() => {
+          throw failure;
+        }),
+      },
+      {
+        createShellController: vi.fn(() => controller),
+        sendPresentation,
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "!!broken-command", attachments: [] }),
+        }),
+      },
+    );
+
+    await expect(
+      dispatchIntent(
+        envelope("failed-pty", {
+          kind: "runBash",
+          command: "broken-command",
+          excludeFromContext: true,
+          editorRevision: 0,
+          editorText: "!!broken-command",
+        }),
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+
+    await vi.waitFor(() =>
+      expect(session.recordBashResult).toHaveBeenCalledWith(
+        "broken-command",
+        {
+          output: "[Shell execution failed: spawn exploded]",
+          cancelled: false,
+          truncated: false,
+        },
+        { id: "failed-pty", excludeFromContext: true },
+      ),
+    );
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_execution_end",
+              id: "failed-pty",
+              output: "[Shell execution failed: spawn exploded]",
+              errorMessage: "spawn exploded",
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledWith(
+      "pivis.shell_turn_complete",
+      expect.objectContaining({
+        executionId: "failed-pty",
+        endedAt: expect.any(Number),
+        errorMessage: "spawn exploded",
+        cancelled: false,
+        truncated: false,
+      }),
+    );
+    expect(controller.dispose).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["PTY construction", "controller"],
+    ["durable start persistence", "marker"],
+  ])("rejects before admission when %s fails", async (_label, failurePoint) => {
+    const controller = makeShellController();
+    const createShellController =
+      failurePoint === "controller"
+        ? vi.fn(() => {
+            throw new Error("native PTY unavailable");
+          })
+        : vi.fn(() => controller);
+    const appendCustomEntry =
+      failurePoint === "marker"
+        ? vi.fn((type) => {
+            if (type === "pivis.shell_turn_start") throw new Error("session write failed");
+          })
+        : vi.fn();
+    const sendPresentation = vi.fn();
+    const { session, dispatchIntent } = setup(
+      {
+        sessionManager: {
+          getLeafId: vi.fn(() => "leaf-9"),
+          getBranch: vi.fn(() => []),
+          getCwd: vi.fn(() => "/work"),
+          appendCustomEntry,
+        },
+      },
+      {
+        createShellController,
+        sendPresentation,
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "!pwd", attachments: [] }),
+        }),
+      },
+    );
+
+    await expect(
+      dispatchIntent(
+        envelope("pre-start-failure", {
+          kind: "runBash",
+          command: "pwd",
+          excludeFromContext: false,
+          editorRevision: 0,
+          editorText: "!pwd",
+        }),
+      ),
+    ).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "pre-start-failure",
+      reason: "transport_unavailable",
+    });
+    expect(session.executeBash).not.toHaveBeenCalled();
+    expect(session.recordBashResult).not.toHaveBeenCalled();
+    expect(sendPresentation).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          entries: expect.arrayContaining([
+            expect.objectContaining({ type: "bash_execution_start" }),
+          ]),
+        }),
+      }),
+    );
+    if (failurePoint === "marker") expect(controller.dispose).toHaveBeenCalledOnce();
   });
 
   it("revalidates and persists the exact selected trust option", async () => {
@@ -1766,14 +2293,33 @@ describe("setupCommandBridge — target intent dispatch", () => {
   });
 
   it("deduplicates same-owner IDs, rejects conflicts and fences stale owners before Pi", async () => {
-    const { session, dispatchIntent } = setup();
+    const { session, dispatchIntent } = setup(undefined, {
+      createShellController: vi.fn(() => makeShellController()),
+      uiState: makeUiState({
+        editorSnapshot: () => ({ revision: 0, text: "!echo once", attachments: [] }),
+      }),
+    });
     session.executeBash.mockResolvedValue({ output: "ok" });
-    const original = envelope("once", { kind: "runBash", command: "echo once" });
+    const original = envelope("once", {
+      kind: "runBash",
+      command: "echo once",
+      excludeFromContext: false,
+      editorRevision: 0,
+      editorText: "!echo once",
+    });
 
     await expect(dispatchIntent(original)).resolves.toMatchObject({ status: "admitted" });
     await expect(dispatchIntent(original)).resolves.toMatchObject({ status: "duplicate" });
     await expect(
-      dispatchIntent(envelope("once", { kind: "runBash", command: "echo different" })),
+      dispatchIntent(
+        envelope("once", {
+          kind: "runBash",
+          command: "echo different",
+          excludeFromContext: false,
+          editorRevision: 0,
+          editorText: "!echo different",
+        }),
+      ),
     ).resolves.toMatchObject({ status: "not_admitted", reason: "invalid" });
     await expect(
       dispatchIntent({
@@ -2424,9 +2970,15 @@ describe("setupCommandBridge — command mapping", () => {
   });
 
   it("bash passes its request id for streaming updates and returns the full result", async () => {
-    const { session, run } = setup();
+    const controller = makeShellController();
+    const { session, run } = setup(undefined, {
+      createShellController: vi.fn(() => controller),
+    });
     const res = await run({ type: "bash", command: "ls" });
-    expect(session.executeBash).toHaveBeenCalledWith("ls", undefined, { id: "cmd-1" });
+    expect(session.executeBash).toHaveBeenCalledWith("ls", undefined, {
+      id: "cmd-1",
+      operations: controller.operations,
+    });
     expect(res.data).toMatchObject({ output: "ok", exitCode: 0 });
   });
 
@@ -3031,6 +3583,15 @@ describe("assertHostCapabilities", () => {
     const runtime = makeRuntime(session);
     expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
       /session\.executeBash/,
+    );
+  });
+
+  it("throws when Pi's canonical Bash failure recorder is missing", () => {
+    const session = makeSession();
+    session.recordBashResult = undefined;
+    const runtime = makeRuntime(session);
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
+      /session\.recordBashResult/,
     );
   });
 

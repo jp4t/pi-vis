@@ -205,6 +205,177 @@ describe("fake session host ESC process semantics", () => {
     }
   });
 
+  it("admits an active Shell Turn only after consuming its exact draft and preserving attachments", async () => {
+    const initial = latestSnapshot();
+    if (!initial) throw new Error("Missing runtime snapshot");
+    const owner = {
+      hostInstanceId: String(initial.hostInstanceId),
+      sessionEpoch: Number(initial.sessionEpoch),
+    };
+    const initialEditor = initial.editor as { revision: number };
+    const shellRevision = initialEditor.revision + 1;
+    const shellText = "!!test-interactive-shell";
+    const attachments = [{ kind: "file", name: "context.txt", path: "/tmp/context.txt" }];
+
+    send({
+      type: "editor_patch",
+      id: "shell-editor",
+      patch: {
+        baseRevision: initialEditor.revision,
+        revision: shellRevision,
+        text: shellText,
+        attachments,
+      },
+    });
+    await expect(response("shell-editor")).resolves.toMatchObject({
+      data: { accepted: true, revision: shellRevision, text: shellText, attachments },
+    });
+
+    send({
+      type: "dispatch_intent",
+      id: "stale-shell",
+      envelope: {
+        intentId: "stale-shell-intent",
+        expectedOwner: owner,
+        intent: {
+          kind: "runBash",
+          command: "test-interactive-shell",
+          excludeFromContext: true,
+          editorRevision: shellRevision - 1,
+          editorText: shellText,
+        },
+      },
+    });
+    await expect(response("stale-shell")).resolves.toMatchObject({
+      data: {
+        status: "not_admitted",
+        intentId: "stale-shell-intent",
+        reason: "stale_editor",
+      },
+    });
+    expect(logs().some((entry) => entry.event === "started" && entry.kind === "bash")).toBe(false);
+
+    send({
+      type: "dispatch_intent",
+      id: "active-shell",
+      envelope: {
+        intentId: "active-shell-intent",
+        expectedOwner: owner,
+        intent: {
+          kind: "runBash",
+          command: "test-interactive-shell",
+          excludeFromContext: true,
+          editorRevision: shellRevision,
+          editorText: shellText,
+        },
+      },
+    });
+    const admitted = await response("active-shell");
+    expect(admitted).toMatchObject({
+      data: {
+        status: "admitted",
+        intentId: "active-shell-intent",
+        owner,
+      },
+    });
+    const active = await waitUntil(() =>
+      messages.find(
+        (message) =>
+          message.type === "authority_frame" &&
+          (
+            message.frame as {
+              terminalSnapshot?: { activity?: { bash?: { intentId?: string } } };
+            }
+          )?.terminalSnapshot?.activity?.bash?.intentId === "active-shell-intent",
+      ),
+    );
+    const frame = AuthorityFrameSchema.parse(active.frame);
+    expect(frame.terminalSnapshot.activity.bash).toMatchObject({
+      kind: "bash",
+      state: "active",
+      intentId: "active-shell-intent",
+      command: "test-interactive-shell",
+      excludeFromContext: true,
+      pty: true,
+      inputReady: true,
+      terminalMode: "compact",
+    });
+    expect(frame.terminalSnapshot.editor).toEqual({
+      revision: shellRevision + 1,
+      text: "",
+      attachments,
+    });
+    expect(frame.terminalSnapshot.activeIntents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          intentId: "active-shell-intent",
+          kind: "runBash",
+          state: "admitted",
+        }),
+      ]),
+    );
+    expect(messages.indexOf(active)).toBeLessThan(messages.indexOf(admitted));
+
+    send({ type: "authority_attach", id: "shell-reattach", rendererGeneration: 9 });
+    const reattached = await response("shell-reattach");
+    const currentShellTurn = (
+      reattached.data as {
+        baseline?: {
+          transcript?: {
+            currentShellTurn?: {
+              reconstructionFenceToken: number;
+              outputThroughSequence: number;
+            };
+          };
+        };
+      }
+    ).baseline?.transcript?.currentShellTurn;
+    if (!currentShellTurn) throw new Error("Shell reattach omitted its reconstruction");
+
+    send({
+      type: "shell_resize",
+      id: "shell-resize-before-ack",
+      executionId: "active-shell-intent",
+      revision: 1,
+      cols: 100,
+      rows: 30,
+    });
+    await expect(response("shell-resize-before-ack")).resolves.toMatchObject({
+      data: { accepted: false },
+    });
+    send({
+      type: "shell_signal",
+      id: "shell-signal-before-ack",
+      executionId: "active-shell-intent",
+      signal: "interrupt",
+    });
+    await expect(response("shell-signal-before-ack")).resolves.toMatchObject({
+      data: { accepted: false },
+    });
+
+    send({
+      type: "shell_reconstruction_ack",
+      id: "shell-reconstruction-ack",
+      executionId: "active-shell-intent",
+      reconstructionFenceToken: currentShellTurn.reconstructionFenceToken,
+      outputThroughSequence: currentShellTurn.outputThroughSequence,
+    });
+    await expect(response("shell-reconstruction-ack")).resolves.toMatchObject({
+      data: { accepted: true },
+    });
+    send({
+      type: "shell_resize",
+      id: "shell-resize-after-ack",
+      executionId: "active-shell-intent",
+      revision: 1,
+      cols: 100,
+      rows: 30,
+    });
+    await expect(response("shell-resize-after-ack")).resolves.toMatchObject({
+      data: { accepted: true },
+    });
+  });
+
   it("reports editor preflight as outcome unknown without pretending to cancel it", async () => {
     await submit("/test-editor-wait");
     const started = await waitForLog("started", "editor");

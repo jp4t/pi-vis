@@ -16,12 +16,14 @@ import {
 } from "./components/ext-ui/CustomPanelHost.js";
 import { ExtensionDialogHost } from "./components/ext-ui/ExtensionDialogHost.js";
 import { UnifiedTuiHost } from "./components/ext-ui/UnifiedTuiHost.js";
+import { DEFAULT_HEIGHT_FRACTION } from "./components/ext-ui/panel-sizer.js";
 import { NotificationStack } from "./components/notifications/NotificationStack.js";
 import { AppPickerHost } from "./components/pickers/AppPickerHost.js";
 import { SessionSubBar } from "./components/session-header/SessionSubBar.js";
 import { SessionSearchModal } from "./components/session-search/SessionSearchModal.js";
 import { SettingsView } from "./components/settings/SettingsView.js";
 import { Dock } from "./components/shell/Dock.js";
+import { ShellTerminalHost } from "./components/shell/ShellTerminalHost.js";
 import { Sidebar } from "./components/shell/Sidebar.js";
 import { StatusBar } from "./components/shell/StatusBar.js";
 import { TitleBar } from "./components/shell/TitleBar.js";
@@ -30,35 +32,19 @@ import { TreeViewerHost } from "./components/tree/TreeViewerHost.js";
 import { AppUpdatePrompt } from "./components/updates/AppUpdatePrompt.js";
 import { useEscapeClaim } from "./hooks/useEscapeClaim.js";
 import { useGlobalEscapeInterrupt } from "./hooks/useGlobalEscapeInterrupt.js";
-import { AuthorityAttachRetry } from "./lib/authority-attach-retry.js";
+import { useShellViewportReveal } from "./hooks/useShellViewportReveal.js";
+import { AuthorityAttachRetry, authorityNeedsBaseline } from "./lib/authority-attach-retry.js";
 import { RENDERER_GENERATION } from "./lib/renderer-generation.js";
 import { useAppUpdatesStore } from "./stores/app-updates-store.js";
-import type { RendererAuthorityState } from "./stores/authority-reducer.js";
 import { openDiffForSession, useDiffStore } from "./stores/diff-store.js";
 import { useExtensionUpdatesStore } from "./stores/extension-updates-store.js";
-import { sessionMatchesRuntime, useSessionsStore } from "./stores/sessions-store.js";
+import {
+  liveShellPresentationFor,
+  sessionMatchesRuntime,
+  useSessionsStore,
+} from "./stores/sessions-store.js";
 import { useSettingsStore } from "./stores/settings-store.js";
 import "./App.css";
-
-function authorityNeedsBaseline(projection: RendererAuthorityState | undefined): boolean {
-  const expectedPanelReconstruction = new Set([
-    "panel_reset",
-    "repaint_required",
-    "repaint_ack_pending",
-    "panel_keyframe_required",
-  ]);
-  return (
-    projection?.semantic.state !== "following" ||
-    projection?.transcript.state !== "following" ||
-    projection?.extensionUi.state !== "following" ||
-    [...(projection?.panels.values() ?? [])].some(
-      (panel) =>
-        panel.sync.state === "unavailable" ||
-        (panel.sync.state === "synchronizing" &&
-          !expectedPanelReconstruction.has(panel.sync.reason)),
-    )
-  );
-}
 
 export function App(): React.ReactElement {
   useGlobalEscapeInterrupt();
@@ -87,6 +73,7 @@ export function App(): React.ReactElement {
   const statusBarVisible = useSettingsStore((s) => s.settings.statusBarVisible);
   const persistedSidebarWidth = useSettingsStore((s) => s.settings.sidebarWidth);
   const sidebarCollapsed = useSettingsStore((s) => s.settings.sidebarCollapsed);
+  const customPanelHeightFraction = useSettingsStore((s) => s.settings.customPanelHeightFraction);
   const updateSettings = useSettingsStore((s) => s.update);
   const setExtensionUpdateStatus = useExtensionUpdatesStore((s) => s.setStatus);
   const [sessionSearchAvailable, setSessionSearchAvailable] = useState(false);
@@ -116,7 +103,8 @@ export function App(): React.ReactElement {
     });
   }
   const requestAttach = useCallback(
-    (sessionId: SessionId): Promise<void> => authorityAttachRetryRef.current!.request(sessionId),
+    (sessionId: SessionId, force = false): Promise<void> =>
+      authorityAttachRetryRef.current!.request(sessionId, force),
     [],
   );
 
@@ -151,6 +139,12 @@ export function App(): React.ReactElement {
   useEffect(() => {
     setSidebarWidth(persistedSidebarWidth ?? 220);
   }, [persistedSidebarWidth]);
+  const [composerViewportFraction, setComposerViewportFraction] = useState(
+    customPanelHeightFraction ?? DEFAULT_HEIGHT_FRACTION,
+  );
+  useEffect(() => {
+    setComposerViewportFraction(customPanelHeightFraction ?? DEFAULT_HEIGHT_FRACTION);
+  }, [customPanelHeightFraction]);
 
   // Whether the window is in macOS fullscreen. In fullscreen the native
   // traffic-light buttons disappear, so the title bar (and the
@@ -202,18 +196,18 @@ export function App(): React.ReactElement {
     [updateSettings],
   );
 
-  // Custom-panel resize drag. The grab strip lives at the top of the dock /
-  // widget tray (rather than on the custom panel's top edge) so the whole
-  // above-composer stack reads as the resizable region. The grab offset keeps
-  // the panel from jumping even though the handle is visually above the panel.
-  const handleCustomPanelResizeStart = useCallback(
+  // Fixed Composer-viewport resize drag. Custom views and live Shell Turns use
+  // the same sizing language and persisted fraction. The grab strip lives at
+  // the top of the dock/widget tray, so the whole above-composer stack reads as
+  // the resizable region.
+  const handleComposerViewportResizeStart = useCallback(
     (e: React.MouseEvent) => {
       if (e.button !== 0) return;
       e.preventDefault();
       const session = (e.currentTarget as HTMLElement).closest(
         ".app__session",
       ) as HTMLElement | null;
-      const card = session?.querySelector(".custom-panel") as HTMLElement | null;
+      const card = session?.querySelector(".custom-panel, .shell-terminal") as HTMLElement | null;
       if (!session || !card) return;
 
       const rect = card.getBoundingClientRect();
@@ -232,6 +226,7 @@ export function App(): React.ReactElement {
       const onMove = (ev: MouseEvent): void => {
         const desiredTop = ev.clientY - grabOffset;
         latest = clamp((panelBottom - desiredTop) / sessionH);
+        setComposerViewportFraction(latest);
         emit(latest);
       };
       const onUp = (): void => {
@@ -249,10 +244,45 @@ export function App(): React.ReactElement {
     [updateSettings],
   );
 
-  const handleCustomPanelResizeReset = useCallback(() => {
+  const handleComposerViewportResizeReset = useCallback(() => {
+    setComposerViewportFraction(DEFAULT_HEIGHT_FRACTION);
     window.dispatchEvent(new CustomEvent("pivis:custom-panel-resize-reset"));
     void updateSettings({ customPanelHeightFraction: null });
   }, [updateSettings]);
+
+  const handleComposerViewportResizeKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      const step = 0.05;
+      let next: number;
+      switch (event.key) {
+        case "ArrowUp":
+        case "ArrowRight":
+          next = composerViewportFraction + step;
+          break;
+        case "ArrowDown":
+        case "ArrowLeft":
+          next = composerViewportFraction - step;
+          break;
+        case "Home":
+          next = CUSTOM_PANEL_MIN_HEIGHT_FRACTION;
+          break;
+        case "End":
+          next = CUSTOM_PANEL_MAX_HEIGHT_FRACTION;
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      const fraction = Math.min(
+        CUSTOM_PANEL_MAX_HEIGHT_FRACTION,
+        Math.max(CUSTOM_PANEL_MIN_HEIGHT_FRACTION, next),
+      );
+      setComposerViewportFraction(fraction);
+      window.dispatchEvent(new CustomEvent("pivis:custom-panel-resize", { detail: { fraction } }));
+      void updateSettings({ customPanelHeightFraction: fraction });
+    },
+    [composerViewportFraction, updateSettings],
+  );
 
   const toggleSidebar = useCallback(() => {
     void updateSettings({
@@ -336,8 +366,36 @@ export function App(): React.ReactElement {
     if (!id) return false;
     return s.sessions.get(id)?.pendingPicker !== undefined;
   });
+  const activeShellPresentationKey = useSessionsStore((s) => {
+    const id = s.activeSessionId;
+    if (!id) return undefined;
+    const presentation = liveShellPresentationFor(s.sessions.get(id));
+    if (!presentation) return undefined;
+    const { owner } = presentation.snapshot;
+    return [
+      id,
+      owner.hostInstanceId,
+      owner.sessionEpoch,
+      presentation.executionId ?? "",
+      presentation.activity.startedAt ?? "",
+      presentation.activity.command ?? "",
+    ].join("\u0000");
+  });
+  const activeShellStartedAt = useSessionsStore((s) => {
+    const id = s.activeSessionId;
+    if (!id) return undefined;
+    return liveShellPresentationFor(s.sessions.get(id))?.activity.startedAt;
+  });
+  const hasActiveShell = activeShellPresentationKey !== undefined;
+  const shellViewportVisible = useShellViewportReveal(
+    activeShellPresentationKey,
+    activeShellStartedAt,
+  );
+  const shellViewportPending = hasActiveShell && !shellViewportVisible;
 
   const customPanelSlotActive = hasOpenPanel && !hasPendingDialog;
+  const shellSlotActive = shellViewportVisible && !hasPendingDialog && !hasOpenPanel;
+  const resizableComposerViewportActive = customPanelSlotActive || shellSlotActive;
 
   // Boot: load settings
   useEffect(() => {
@@ -618,9 +676,12 @@ export function App(): React.ReactElement {
             await requestAttach(sid);
             current = useSessionsStore.getState().sessions.get(sid);
           }
-          // A predecessor attach may have been in flight when this replacement
-          // event arrived. Once that serialized attempt retires, make one fresh
-          // successor-baseline attempt before abandoning the event.
+          // A predecessor attach cycle may have been in flight when this
+          // replacement event arrived. `requestAttach` spans its bounded retry
+          // lifecycle, so retain this one-shot file payload until that cycle
+          // either installs the successor or becomes unavailable. One fresh
+          // cycle covers the case where the joined cycle belonged entirely to
+          // the predecessor.
           if (!sessionMatchesRuntime(current, { hostInstanceId, sessionEpoch })) {
             await requestAttach(sid);
             current = useSessionsStore.getState().sessions.get(sid);
@@ -639,7 +700,9 @@ export function App(): React.ReactElement {
             hostInstanceId,
             sessionEpoch,
           });
-        })();
+        })().catch((error) => {
+          console.error("Failed to adopt changed session file", error);
+        });
       },
     );
 
@@ -814,17 +877,22 @@ export function App(): React.ReactElement {
                 <TranscriptView sessionId={activeSessionId} />
                 <NotificationStack sessionId={activeSessionId} />
               </div>
-              {/* Custom panel resize handle sits above the pending-message
-                  boundary and dock, so it remains attached to the custom view
-                  rather than competing with an instruction bubble. */}
-              {customPanelSlotActive && (
+              {/* Fixed Composer-viewport resize handle. It sits above the
+                  pending-message boundary and dock for both Custom views and
+                  live Shell Turns, preserving one established affordance. */}
+              {resizableComposerViewportActive && (
                 <div
                   className="custom-panel-dock-resize"
                   role="separator"
                   aria-orientation="horizontal"
-                  aria-label="Resize custom view (drag; double-click to reset)"
-                  onMouseDown={handleCustomPanelResizeStart}
-                  onDoubleClick={handleCustomPanelResizeReset}
+                  aria-label={`${shellSlotActive ? "Resize shell terminal" : "Resize custom view"} (drag; double-click to reset)`}
+                  aria-valuemin={CUSTOM_PANEL_MIN_HEIGHT_FRACTION * 100}
+                  aria-valuemax={CUSTOM_PANEL_MAX_HEIGHT_FRACTION * 100}
+                  aria-valuenow={Math.round(composerViewportFraction * 100)}
+                  tabIndex={0}
+                  onMouseDown={handleComposerViewportResizeStart}
+                  onDoubleClick={handleComposerViewportResizeReset}
+                  onKeyDown={handleComposerViewportResizeKeyDown}
                 />
               )}
               <QueuedMessagesTraySlot sessionId={activeSessionId} />
@@ -841,33 +909,22 @@ export function App(): React.ReactElement {
                     empty, so there is never a phantom box. */}
                 <Dock sessionId={activeSessionId} />
               </div>
-              {/* Composer and the extension dialog share the same flex
-                slot: the dialog replaces the composer when a question is
-                pending, so they are never both visible. The dialog
-                intentionally does not block the rest of the UI — the
-                transcript above stays scrollable, the header (model +
-                thinking level) stays clickable, and the diff viewer
-                (Cmd+G) still works while the question is open. */}
-              {/* Composer, extension dialogs, custom panels, and built-in
-                  pickers all share the same flex slot: whichever is active
-                  replaces the composer, so they are never both visible.
-                  Priority: extension dialogs (block pi) > custom panels >
-                  built-in pickers (/model, /fork, /resume) > composer.
-                  None block the rest of the UI — the transcript above
-                  stays scrollable, the header stays clickable, and the
-                  diff viewer (Cmd+G) still works while any is open. */}
-              {/* Composer, extension dialogs, custom panels, the unified-TUI
-                  panel, and built-in pickers all share the same flex slot:
+              {/* Composer, extension dialogs, custom panels, Shell Turns, the
+                  unified-TUI panel, and built-in pickers share the same slot:
                   whichever is active replaces the composer, so they are never
                   both visible. Priority: extension dialogs (block pi) > custom
-                  panels > unified TUI (factory setWidget, live — unless the
-                  user has flipped the header's UnifiedViewToggle to "Chat",
-                  in which case the Composer shows while the TUI stays ready) >
-                  built-in pickers (/model, /fork, /resume) > composer. */}
+                  panels > live Shell Turn > unified TUI (factory setWidget,
+                  live unless its header toggle is on Input) > built-in
+                  pickers (/model, /fork, /resume) > composer. The Dock remains
+                  above this slot, so widgets keep their established layout. */}
               {hasPendingDialog ? (
                 <ExtensionDialogHost sessionId={activeSessionId} />
               ) : hasOpenPanel ? (
                 <CustomPanelHost sessionId={activeSessionId} />
+              ) : shellViewportVisible ? (
+                <ShellTerminalHost sessionId={activeSessionId} requestAttach={requestAttach} />
+              ) : shellViewportPending ? (
+                <Composer sessionId={activeSessionId} suspended />
               ) : hasUnifiedPanel ? (
                 <>
                   {/* Keep xterm mounted while native Input is selected. A

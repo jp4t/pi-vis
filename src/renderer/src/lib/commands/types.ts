@@ -29,7 +29,7 @@ export type ComposerAction =
       deliveryMode?: "steer" | "followUp";
     }
   // Bash: "!" runs normally, "!!" runs with excludeFromContext (TUI parity).
-  | { kind: "bash"; command: string; excludeFromContext: boolean }
+  | { kind: "bash"; command: string; excludeFromContext: boolean; editorText: string }
   // Built-in slash commands. Each variant carries the exact parsed argument
   // shape TUI would extract; executeAction turns them into RPC calls.
   | { kind: "model"; search?: string }

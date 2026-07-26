@@ -22,6 +22,29 @@ interface Folders {
   historyLog: string;
 }
 
+interface IpcLogEntry {
+  channel?: string;
+  payload?: {
+    sessionId?: string;
+    intentId?: string;
+    expectedOwner?: {
+      hostInstanceId: string;
+      sessionEpoch: number;
+    };
+    intent?: {
+      kind?: string;
+      command?: string;
+    };
+  };
+}
+
+interface HostMessageLogEntry {
+  type?: string;
+  executionId?: string;
+  sequence?: number;
+  accepted?: boolean;
+}
+
 async function makeFolders(): Promise<Folders> {
   const settingsDir = fs.realpathSync(fs.mkdtempSync(join(os.tmpdir(), "pivis-e2e-cmds-")));
   return {
@@ -99,6 +122,20 @@ function countJsonlFiles(root: string): number {
   return jsonlFiles(root).length;
 }
 
+function readJsonLines<T>(file: string): T[] {
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, "utf8")
+    .split("\n")
+    .flatMap((line) => {
+      try {
+        return line ? [JSON.parse(line) as T] : [];
+      } catch {
+        return [];
+      }
+    });
+}
+
 test.describe("Slash commands", () => {
   test.beforeAll(() => {
     fs.chmodSync(FAKE_PI, 0o755);
@@ -130,6 +167,375 @@ test.describe("Slash commands", () => {
     rmrf(folders.settingsDir);
     rmrf(folders.workspaceDir);
     rmrf(folders.piSessionsDir);
+  });
+
+  test("Shell drafts replace Composer chrome, retain attachments, and settle as compact turns", async () => {
+    test.setTimeout(60_000);
+    const folders = await makeFolders();
+    const { app, window } = await launchApp(folders);
+
+    try {
+      await window.getByRole("button", { name: "New session" }).click();
+      await expect(window.locator(".session-header__model-btn")).toContainText(
+        "Fake Model [fake]",
+        { timeout: 15_000 },
+      );
+
+      const composer = window.locator(".composer__textarea");
+      const stagedFile = join(folders.workspaceDir, "kept-shell-attachment.txt");
+      fs.writeFileSync(stagedFile, "retained attachment\n");
+      await window.locator(".composer__file-input").setInputFiles(stagedFile);
+      await expect(window.locator(".composer__attachment-item--file")).toHaveCount(1);
+
+      await composer.fill("!");
+      await expect(window.locator(".composer__shell-prefix")).toHaveText("!");
+      await expect(window.locator(".composer__attach-btn")).toHaveCount(0);
+      await expect(window.locator(".composer__attachment-item")).toHaveCount(0);
+      await expect(window.locator(".composer__shell-guidance")).toHaveCount(0);
+      await composer.press("Enter");
+      await expect(composer).toHaveValue("!");
+      await expect(composer).toBeFocused();
+      await expect(composer).toHaveAttribute("aria-invalid", "true");
+      await expect(window.getByText("Type a shell command.", { exact: true })).toHaveCount(0);
+
+      await window.evaluate(() => {
+        const testWindow = window as unknown as {
+          __fastShellViewportMounts?: number;
+          __fastShellViewportObserver?: MutationObserver;
+        };
+        testWindow.__fastShellViewportMounts = 0;
+        testWindow.__fastShellViewportObserver = new MutationObserver((records) => {
+          for (const record of records) {
+            for (const node of record.addedNodes) {
+              if (
+                node instanceof Element &&
+                (node.matches(".shell-terminal") || node.querySelector(".shell-terminal"))
+              ) {
+                testWindow.__fastShellViewportMounts =
+                  (testWindow.__fastShellViewportMounts ?? 0) + 1;
+              }
+            }
+          }
+        });
+        testWindow.__fastShellViewportObserver.observe(document.body, {
+          childList: true,
+          subtree: true,
+        });
+      });
+      await composer.fill("!!instant-shell");
+      await composer.press("Enter");
+      await expect(
+        window.locator(".shell-turn").filter({ hasText: "instant-shell" }),
+      ).toContainText("bash output for instant-shell", { timeout: 10_000 });
+      expect(
+        await window.evaluate(() => {
+          const testWindow = window as unknown as {
+            __fastShellViewportMounts?: number;
+            __fastShellViewportObserver?: MutationObserver;
+          };
+          testWindow.__fastShellViewportObserver?.disconnect();
+          return testWindow.__fastShellViewportMounts ?? 0;
+        }),
+      ).toBe(0);
+      await expect(window.locator(".shell-terminal")).toHaveCount(0);
+
+      await composer.fill("!!test-interactive-shell");
+      await expect(window.locator(".composer__shell-prefix")).toHaveText("!!");
+      await composer.press("Enter");
+
+      const terminal = window.locator(".shell-terminal");
+      await expect(terminal).toBeVisible({ timeout: 10_000 });
+      await expect(terminal).toHaveAccessibleName("Active Shell Turn, context excluded");
+      await expect(window.locator(".composer__textarea")).toHaveCount(0);
+      await expect(terminal.locator(".shell-terminal__header")).toHaveCount(0);
+      await expect(terminal.locator(".shell-terminal__footer")).toHaveCount(0);
+      await expect(terminal).not.toContainText("Not in Pi context");
+      await expect(terminal).not.toContainText("Ctrl+C interrupts");
+      await expect(
+        terminal.getByRole("button", { name: /(?:Interrupt|Force stop) shell command/ }),
+      ).toHaveCount(0);
+      await expect(window.getByRole("separator", { name: /Resize shell terminal/ })).toBeVisible();
+      const liveCardStyle = await terminal.evaluate((element) => {
+        const reference = document.createElement("div");
+        reference.className = "custom-panel unified-panel";
+        const referenceMount = document.createElement("div");
+        referenceMount.className = "custom-panel__xterm";
+        reference.append(referenceMount);
+        document.body.append(reference);
+        const actual = getComputedStyle(element);
+        const expected = getComputedStyle(reference);
+        const actualMount = getComputedStyle(
+          element.querySelector<HTMLElement>(".shell-terminal__xterm")!,
+        );
+        const actualViewport = getComputedStyle(
+          element.querySelector<HTMLElement>(".xterm-viewport")!,
+        );
+        const mountRect = element
+          .querySelector<HTMLElement>(".shell-terminal__xterm")!
+          .getBoundingClientRect();
+        const viewportElement = element.querySelector<HTMLElement>(".shell-terminal__viewport")!;
+        const viewportRect = viewportElement.getBoundingClientRect();
+        const xtermViewport = element.querySelector<HTMLElement>(".xterm-viewport")!;
+        const sessionRect = element.closest<HTMLElement>(".app__session")!.getBoundingClientRect();
+        const expectedMount = getComputedStyle(referenceMount);
+        const result = {
+          card: {
+            margin: actual.margin,
+            backgroundColor: actual.backgroundColor,
+            borderColor: actual.borderColor,
+            borderRadius: actual.borderRadius,
+          },
+          reference: {
+            margin: expected.margin,
+            backgroundColor: expected.backgroundColor,
+            borderColor: expected.borderColor,
+            borderRadius: expected.borderRadius,
+          },
+          paddingInline: [actualMount.paddingLeft, actualMount.paddingRight],
+          referencePaddingInline: [expectedMount.paddingLeft, expectedMount.paddingRight],
+          viewportBackgroundColor: actualViewport.backgroundColor,
+          boxShadow: actual.boxShadow,
+          borderLeftColor: actual.borderLeftColor,
+          borderRightColor: actual.borderRightColor,
+          terminalRight: mountRect.right,
+          viewportRight: viewportRect.right,
+          viewportHeight: viewportRect.height,
+          sessionHeight: sessionRect.height,
+          scrollHeight: xtermViewport.scrollHeight,
+          scrollClientHeight: xtermViewport.clientHeight,
+        };
+        reference.remove();
+        return result;
+      });
+      expect(liveCardStyle.card).toEqual(liveCardStyle.reference);
+      expect(liveCardStyle.paddingInline).toEqual(liveCardStyle.referencePaddingInline);
+      expect(liveCardStyle.viewportBackgroundColor).toBe(liveCardStyle.card.backgroundColor);
+      expect(liveCardStyle.boxShadow).toBe("none");
+      expect(liveCardStyle.borderLeftColor).toBe(liveCardStyle.borderRightColor);
+      expect(Math.abs(liveCardStyle.terminalRight - liveCardStyle.viewportRight)).toBeLessThan(0.2);
+      expect(liveCardStyle.viewportHeight).toBeGreaterThan(liveCardStyle.sessionHeight * 0.35);
+      expect(liveCardStyle.viewportHeight).toBeLessThanOrEqual(
+        liveCardStyle.sessionHeight * 0.5 + 12,
+      );
+      expect(liveCardStyle.scrollHeight).toBeLessThanOrEqual(liveCardStyle.scrollClientHeight + 1);
+
+      const terminalInput = terminal.locator(".xterm-helper-textarea");
+      await terminalInput.evaluate((element) => (element as HTMLTextAreaElement).focus());
+      await window.keyboard.type("Ada");
+      await window.keyboard.press("Enter");
+
+      await expect(terminal).toHaveCount(0, { timeout: 10_000 });
+      const settled = window.locator(".shell-turn").filter({ hasText: "test-interactive-shell" });
+      await expect(settled).toBeVisible();
+      await expect(settled).toHaveAccessibleName("You, Shell, context excluded, exit 0");
+      await expect(settled.locator(".shell-turn__prefix")).toHaveText("!!");
+      await expect(settled.locator(".shell-turn__command")).toHaveText("test-interactive-shell");
+      await expect(settled).toContainText("Hello, Ada");
+      await expect(settled).not.toContainText("You · Shell");
+      await expect(settled).not.toContainText("Context excluded");
+      await expect(settled.getByRole("button", { name: "Copy command" })).toHaveCount(0);
+      await expect(settled.getByRole("button", { name: "Copy output" })).toBeVisible();
+      await expect(window.locator(".composer__textarea")).toBeFocused();
+      await expect(window.locator(".composer__attachment-item--file")).toHaveCount(1);
+      const disclosure = settled.getByRole("button", { name: /Shell Turn details/ });
+      await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+      await disclosure.click();
+      await expect(disclosure).toBeFocused();
+      await expect(disclosure).toHaveAttribute("aria-expanded", "false");
+      await expect(settled.locator(".shell-turn__output-section")).toHaveCount(0);
+      await expect(settled.getByRole("button", { name: "Copy output" })).toBeVisible();
+      await disclosure.click();
+      await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+      await expect(settled).toContainText("Hello, Ada");
+    } finally {
+      await app.close();
+      rmrf(folders.settingsDir);
+      rmrf(folders.workspaceDir);
+      rmrf(folders.piSessionsDir);
+    }
+  });
+
+  test("live Shell Turns restore without a Composer flash or stealing focus on background completion", async () => {
+    test.setTimeout(90_000);
+    const folders = await makeFolders();
+    const ipcLog = join(folders.settingsDir, "shell-switch-ipc.log");
+    const hostLog = join(folders.settingsDir, "shell-switch-host.log");
+    const { app, window } = await launchApp(folders, {
+      PIVIS_TEST_IPC_INVOCATION_LOG: ipcLog,
+      PIVIS_TEST_HOST_MESSAGE_LOG: hostLog,
+      PIVIS_TEST_BACKGROUND_SHELL_DELAY_MS: "4000",
+    });
+
+    try {
+      await window.getByRole("button", { name: "New session" }).click();
+      await expect(window.locator(".session-header__model-btn")).toContainText(
+        "Fake Model [fake]",
+        { timeout: 15_000 },
+      );
+
+      const composer = window.locator(".composer__textarea");
+      await composer.fill("/name Shell A");
+      await composer.press("Enter");
+      await expect(window.locator(".session-header__name-btn")).toContainText("Shell A");
+
+      await composer.fill("!!test-interactive-shell");
+      await composer.press("Enter");
+      const terminal = window.locator(".shell-terminal");
+      await expect(terminal).toBeVisible({ timeout: 10_000 });
+      await expect(terminal).toHaveAttribute("aria-busy", "false", { timeout: 15_000 });
+
+      const findShellEnvelope = (): IpcLogEntry | undefined =>
+        readJsonLines<IpcLogEntry>(ipcLog).find(
+          (entry) =>
+            entry.channel === "session.dispatchIntent" &&
+            entry.payload?.intent?.kind === "runBash" &&
+            entry.payload.intent.command === "test-interactive-shell",
+        );
+      await expect.poll(() => findShellEnvelope()).toBeTruthy();
+      const shellEnvelope = findShellEnvelope()?.payload;
+      if (!shellEnvelope?.sessionId || !shellEnvelope.intentId || !shellEnvelope.expectedOwner) {
+        throw new Error("Shell dispatch did not expose an owner-bound E2E identity");
+      }
+      const shellExecutionId = shellEnvelope.intentId;
+
+      await window.getByRole("button", { name: "New session" }).click();
+      await expect(composer).toBeVisible();
+      await expect(window.locator(".session-header__model-btn")).toContainText(
+        "Fake Model [fake]",
+        { timeout: 15_000 },
+      );
+      await expect(composer).toBeEnabled();
+      await composer.fill("/name Shell B");
+      await composer.press("Enter");
+      await expect(window.locator(".session-header__name-btn")).toContainText("Shell B", {
+        timeout: 15_000,
+      });
+      const retainedFile = join(folders.workspaceDir, "retained-session-b.txt");
+      fs.writeFileSync(retainedFile, "keep session B alive across the switch\n");
+      await window.locator(".composer__file-input").setInputFiles(retainedFile);
+      await expect(window.locator(".composer__attachment-item--file")).toHaveCount(1);
+
+      const shellARow = window.locator(".sidebar__session").filter({ hasText: "Shell A" });
+      await expect(shellARow).toBeVisible();
+      await expect(terminal).toHaveCount(0);
+      const hostLogBoundary = readJsonLines<HostMessageLogEntry>(hostLog).length;
+      await window.evaluate(() => {
+        const trackedWindow = window as unknown as {
+          __pivisShellComposerFlashed?: boolean;
+          __pivisShellComposerObserver?: MutationObserver;
+        };
+        trackedWindow.__pivisShellComposerObserver?.disconnect();
+        trackedWindow.__pivisShellComposerFlashed = false;
+        trackedWindow.__pivisShellComposerObserver = new MutationObserver((records) => {
+          for (const record of records) {
+            for (const node of record.addedNodes) {
+              if (
+                node instanceof Element &&
+                (node.matches(".composer__textarea") || node.querySelector(".composer__textarea"))
+              ) {
+                trackedWindow.__pivisShellComposerFlashed = true;
+              }
+            }
+          }
+        });
+        trackedWindow.__pivisShellComposerObserver.observe(
+          document.querySelector(".app__main") ?? document.body,
+          { childList: true, subtree: true },
+        );
+      });
+
+      await shellARow.click();
+      await expect(terminal).toBeVisible({ timeout: 10_000 });
+      await expect(window.locator(".composer__textarea")).toHaveCount(0);
+      await expect(terminal).toHaveAttribute("aria-busy", "false", { timeout: 15_000 });
+      const composerFlashed = await window.evaluate(async () => {
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+        });
+        const trackedWindow = window as unknown as {
+          __pivisShellComposerFlashed?: boolean;
+          __pivisShellComposerObserver?: MutationObserver;
+        };
+        trackedWindow.__pivisShellComposerObserver?.disconnect();
+        return trackedWindow.__pivisShellComposerFlashed === true;
+      });
+      expect(composerFlashed).toBe(false);
+
+      await terminal
+        .locator(".xterm-helper-textarea")
+        .evaluate((element) => (element as HTMLTextAreaElement).focus());
+      await window.keyboard.insertText("Ada");
+      await expect
+        .poll(() =>
+          readJsonLines<HostMessageLogEntry>(hostLog)
+            .slice(hostLogBoundary)
+            .some(
+              (entry) =>
+                entry.type === "shell_input_result" &&
+                entry.executionId === shellExecutionId &&
+                entry.accepted === true,
+            ),
+        )
+        .toBe(true);
+
+      const restorationEvents = readJsonLines<HostMessageLogEntry>(hostLog).slice(hostLogBoundary);
+      const acceptedAckIndex = restorationEvents.findIndex(
+        (entry) =>
+          entry.type === "shell_reconstruction_ack_result" &&
+          entry.executionId === shellExecutionId &&
+          entry.accepted === true,
+      );
+      const acceptedInputIndex = restorationEvents.findIndex(
+        (entry) =>
+          entry.type === "shell_input_result" &&
+          entry.executionId === shellExecutionId &&
+          entry.accepted === true,
+      );
+      expect(acceptedAckIndex).toBeGreaterThanOrEqual(0);
+      expect(acceptedInputIndex).toBeGreaterThan(acceptedAckIndex);
+
+      await window.keyboard.press("Enter");
+      await expect(terminal).toHaveCount(0, { timeout: 10_000 });
+      await expect(
+        window.locator(".shell-turn").filter({ hasText: "test-interactive-shell" }),
+      ).toContainText("Hello, Ada");
+      await expect(composer).toBeFocused();
+
+      await composer.fill("!!test-background-shell");
+      await composer.press("Enter");
+      await expect(terminal).toBeVisible({ timeout: 10_000 });
+      await expect(shellARow.locator(".status-dot--streaming")).toHaveCount(1);
+
+      const shellBRow = window.locator(".sidebar__session").filter({ hasText: "Shell B" });
+      await expect(shellBRow).toBeVisible();
+      await shellBRow.click();
+      await expect(terminal).toHaveCount(0);
+      await expect(window.locator(".session-header__name-btn")).toContainText("Shell B");
+      await expect(composer).toBeFocused();
+      await expect(window.locator(".composer__attachment-item--file")).toHaveCount(1);
+      await expect(shellARow.locator(".status-dot--streaming")).toHaveCount(1);
+
+      await expect(shellARow.locator(".status-dot--streaming")).toHaveCount(0, {
+        timeout: 10_000,
+      });
+      await expect(window.locator(".session-header__name-btn")).toContainText("Shell B");
+      await expect(composer).toBeFocused();
+      await expect(window.locator(".composer__attachment-item--file")).toHaveCount(1);
+
+      await shellARow.click();
+      await expect(
+        window.locator(".shell-turn").filter({ hasText: "test-background-shell" }),
+      ).toContainText("background shell complete");
+      await expect(
+        window.locator(".shell-turn").filter({ hasText: "test-interactive-shell" }),
+      ).toContainText("Hello, Ada");
+      await expect(terminal).toHaveCount(0);
+    } finally {
+      await app.close();
+      rmrf(folders.settingsDir);
+      rmrf(folders.workspaceDir);
+      rmrf(folders.piSessionsDir);
+    }
   });
 
   test("/name Foo updates the header without a user bubble (parity: pi emits session_info_changed)", async () => {

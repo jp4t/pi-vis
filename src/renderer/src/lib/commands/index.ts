@@ -3,6 +3,10 @@ export { BUILTIN_COMMANDS, BUILTIN_BY_NAME, UNSUPPORTED_TUI_COMMANDS } from "./b
 export type { BuiltinCommandDef } from "./builtins.js";
 export { parseComposerInput, type ParseContext } from "./parse.js";
 export {
+  classifyShellDraft,
+  type ShellDraft,
+} from "./shell-draft.js";
+export {
   InputNotConsumedError,
   executeAction,
   type ExecuteDeps,

@@ -287,7 +287,7 @@ test.describe("unified tool card disclosure", () => {
     await expect(card.locator("details")).toHaveCount(0);
   });
 
-  test("header regions preserve typographic adjacency and geometric alignment", async ({
+  test("tool-card header regions preserve typographic adjacency and geometric alignment", async ({
     page,
   }) => {
     await seedHistory(page, [
@@ -297,7 +297,9 @@ test.describe("unified tool card disclosure", () => {
         data: {
           toolCallId: "chrome-call",
           toolName: "chrome_tool",
-          input: { path: "chrome.txt" },
+          input: {
+            path: `/workspace/${"deeply-nested-directory/".repeat(12)}chrome.txt`,
+          },
           outputText: "chrome output",
           isError: false,
           isStreaming: false,
@@ -325,13 +327,15 @@ test.describe("unified tool card disclosure", () => {
     ]);
 
     const card = page.locator(".tool-card").filter({ hasText: "chrome_tool" });
-    const bashCard = page.locator(".tool-card").filter({ hasText: "git status --short" });
+    const shellTurn = page.locator(".shell-turn").filter({ hasText: "git status --short" });
     const customEntryCard = page.locator(".custom-entry .tool-card");
     const header = card.getByRole("button", { name: /^chrome_tool tool call details/u });
     const chevron = card.locator(".tool-card__chevron");
     const label = card.locator(".tool-card__name");
     await expect(header).toHaveAttribute("aria-expanded", "false");
     await expect(customEntryCard).toContainText("plan-mode-state");
+    await expect(shellTurn).toBeVisible();
+    await expect(shellTurn.locator(".tool-card")).toHaveCount(0);
 
     await page.evaluate(() => {
       const state = (
@@ -417,7 +421,7 @@ test.describe("unified tool card disclosure", () => {
         };
       });
 
-    const targets = [card, bashCard, customEntryCard, spinnerCard, subjectlessSpinnerCard];
+    const targets = [card, customEntryCard, spinnerCard, subjectlessSpinnerCard];
     const geometries = await Promise.all(targets.map((target) => headerGeometry(target)));
     for (const geometry of geometries) {
       expect(geometry.viewBoxDelta).toBe(0);
@@ -435,26 +439,20 @@ test.describe("unified tool card disclosure", () => {
         geometry.trailingRight === undefined ? ["1", "2"] : ["1", "2", "3"],
       );
     }
-    // Kind width is deliberately local. A shell prompt stays adjacent to its
-    // command even when unrelated cards use much longer identity labels.
-    expect(geometries[1].subjectLeft).toBeLessThan(geometries[2].subjectLeft);
-    expect(geometries[1].trailingRight).toBe(geometries[0].trailingRight);
+    expect(geometries[2].trailingRight).toBe(geometries[0].trailingRight);
     expect(geometries[3].trailingRight).toBe(geometries[0].trailingRight);
-    expect(geometries[4].trailingRight).toBe(geometries[0].trailingRight);
     await expect(chevron).toBeVisible();
     await expect(label).toBeVisible();
 
     // Narrowing may shrink only the subject. It must remain adjacent to its
     // local kind, preserve the state anchor, and delegate clipping to FadeText.
     await page.setViewportSize({ width: 720, height: 820 });
-    await expect(bashCard.locator(".tool-card__subject")).toHaveAttribute("data-overflow", "true");
-    const narrowBashGeometry = await headerGeometry(bashCard);
-    expect(Math.abs(narrowBashGeometry.adjacencyDelta)).toBeLessThanOrEqual(0.1);
-    expect(narrowBashGeometry.regionCenterDeltas.every((delta) => Math.abs(delta) <= 0.1)).toBe(
-      true,
-    );
+    await expect(card.locator(".tool-card__subject")).toHaveAttribute("data-overflow", "true");
+    const narrowGeometry = await headerGeometry(card);
+    expect(Math.abs(narrowGeometry.adjacencyDelta)).toBeLessThanOrEqual(0.1);
+    expect(narrowGeometry.regionCenterDeltas.every((delta) => Math.abs(delta) <= 0.1)).toBe(true);
     expect(
-      await bashCard
+      await card
         .locator(".tool-card__header")
         .evaluate((element) => element.scrollWidth - element.clientWidth),
     ).toBeLessThanOrEqual(1);
@@ -507,7 +505,9 @@ test.describe("unified tool card disclosure", () => {
     await expect(header).toHaveAttribute("aria-expanded", "false");
   });
 
-  test("errors and interruptions stay collapsed until the user opens them", async ({ page }) => {
+  test("agent errors stay collapsed while direct shell failures remain visible", async ({
+    page,
+  }) => {
     await seedHistory(page, [
       {
         id: "seeded-error-tool",
@@ -555,7 +555,6 @@ test.describe("unified tool card disclosure", () => {
 
     const seededCases = [
       page.locator(".tool-card").filter({ hasText: "seeded_error_tool" }),
-      page.locator(".tool-card").filter({ hasText: "failing-command-sentinel" }),
       page.locator(".tool-card").filter({ hasText: "interrupted_tool" }),
       page.locator(".tool-card").filter({ hasText: "Compaction failed" }),
     ];
@@ -563,6 +562,35 @@ test.describe("unified tool card disclosure", () => {
       await expect(card.locator(".tool-card__header")).toHaveAttribute("aria-expanded", "false");
       await expect(card.locator(".tool-card__body")).toHaveCount(0);
     }
+    const failedShell = page.locator(".shell-turn").filter({ hasText: "failing-command-sentinel" });
+    await expect(failedShell).toBeVisible();
+    await expect(failedShell).toHaveClass(/shell-turn--error/);
+    await expect(failedShell).toHaveAccessibleName("You, Shell, context included, exit 7");
+    await expect(failedShell).toContainText("FAILED BASH OUTPUT");
+    await expect(failedShell.locator(".tool-card__header")).toHaveCount(0);
+    const errorRailStyles = await page.evaluate(() => {
+      const extensionError = document.createElement("pre");
+      extensionError.className = "tool-card__extension-render tool-card__extension-render--error";
+      document.body.append(extensionError);
+      const shellStyle = getComputedStyle(
+        document.querySelector<HTMLElement>(".shell-turn--error")!,
+      );
+      const extensionStyle = getComputedStyle(extensionError);
+      const result = {
+        shellBoxShadow: shellStyle.boxShadow,
+        shellLeftBorder: shellStyle.borderLeftColor,
+        shellRightBorder: shellStyle.borderRightColor,
+        extensionBoxShadow: extensionStyle.boxShadow,
+        extensionLeftBorder: extensionStyle.borderLeftColor,
+        extensionRightBorder: extensionStyle.borderRightColor,
+      };
+      extensionError.remove();
+      return result;
+    });
+    expect(errorRailStyles.shellBoxShadow).toBe("none");
+    expect(errorRailStyles.shellLeftBorder).toBe(errorRailStyles.shellRightBorder);
+    expect(errorRailStyles.extensionBoxShadow).toBe("none");
+    expect(errorRailStyles.extensionLeftBorder).toBe(errorRailStyles.extensionRightBorder);
 
     await page.evaluate(() => {
       const state = (
@@ -626,17 +654,18 @@ test.describe("unified tool card disclosure", () => {
     await expect(card.locator(".tool-card__body")).toHaveCount(0);
   });
 
-  test("direct shell records expose the complete command, output, and execution metadata", async ({
+  test("direct shell records start expanded, collapse accessibly, and copy only exact output", async ({
     page,
   }) => {
     const command = "printf 'first line' && printf 'COMMAND FINAL SENTINEL'";
+    const output = "shell output\nSHELL OUTPUT FINAL SENTINEL";
     await seedHistory(page, [
       {
         id: "direct-bash",
         type: "bash",
         data: {
           command,
-          outputText: "shell output\nSHELL OUTPUT FINAL SENTINEL",
+          outputText: output,
           isStreaming: false,
           exitCode: 0,
           cancelled: false,
@@ -644,23 +673,341 @@ test.describe("unified tool card disclosure", () => {
           fullOutputPath: "/tmp/SHELL METADATA FINAL SENTINEL.log",
           excludeFromContext: true,
           timestamp: 1_786_000_000_000,
+          executionId: "direct-shell-execution",
+          pty: true,
+          startedAt: 1_786_000_000_000,
+          durationMs: 1_234,
+          normalization: "alternate_screen_final",
+          cwd: "/workspace/SHELL CWD SENTINEL",
+        },
+      },
+    ]);
+    await installClipboardSpy(page);
+
+    const turn = page.locator(".shell-turn").filter({ hasText: "COMMAND FINAL SENTINEL" });
+    await expect(turn).toBeVisible();
+    await expect(turn).toHaveAccessibleName("You, Shell, context excluded, exit 0");
+    await expect(turn.locator(".tool-card")).toHaveCount(0);
+    await expect(turn.locator(".shell-turn__prefix")).toHaveText("!!");
+    await expect(turn.locator(".shell-turn__command")).toHaveText(command);
+    await expect(turn.locator(".shell-turn__meta")).toContainText("exit 0");
+    await expect(turn.locator(".shell-turn__meta")).toContainText("1.2 s");
+    await expect(turn.locator(".shell-turn__meta")).not.toContainText("Context");
+    await expect(turn).not.toContainText("You · Shell");
+    await expect(turn).not.toContainText("$ ");
+    await expect(turn.locator(".tool-card__section-header")).toHaveCount(0);
+    await expect(turn.locator(".shell-turn__output")).toContainText("SHELL OUTPUT FINAL SENTINEL");
+    const details = turn.locator(".shell-turn__details");
+    await expect(details).toContainText("SHELL CWD SENTINEL");
+    await expect(details).not.toContainText("Normalized final full-screen snapshot");
+    await expect(details).toContainText("Output truncated");
+    await expect(details).toContainText("SHELL METADATA FINAL SENTINEL");
+
+    const disclosure = turn.getByRole("button", { name: /^Shell Turn details —/u });
+    const copyOutput = turn.getByRole("button", { name: "Copy output" });
+    const headerCopy = turn.locator(":scope > .shell-turn__header > .tool-card__copy");
+    await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    await expect(turn).toHaveClass(/shell-turn--open/);
+    await expect(turn.getByRole("button", { name: "Copy command" })).toHaveCount(0);
+    await expect(copyOutput).toHaveCount(1);
+    await expect(headerCopy).toHaveCount(1);
+    await expect(headerCopy).toHaveAttribute("aria-label", "Copy output");
+    const copyStatus = copyOutput.locator(".tool-card__copy-status");
+    await expect(copyStatus).toHaveCount(1);
+    await expect(copyStatus).toHaveCSS("opacity", "0");
+    await expect(copyStatus).toHaveCSS("width", "1px");
+    await expect(copyStatus).toHaveText("");
+    await expect(copyOutput.locator("svg")).toHaveCount(1);
+    await expect(turn.locator(".shell-turn__output-section button")).toHaveCount(0);
+
+    const shellStyle = await turn.evaluate((element) => {
+      const prefix = element.querySelector<HTMLElement>(".shell-turn__prefix");
+      const commandElement = element.querySelector<HTMLElement>(".shell-turn__command");
+      if (!prefix || !commandElement) throw new Error("Missing Shell Turn identity");
+      const turnStyle = getComputedStyle(element);
+      return {
+        boxShadow: turnStyle.boxShadow,
+        borderLeftColor: turnStyle.borderLeftColor,
+        borderRightColor: turnStyle.borderRightColor,
+        prefixFont: getComputedStyle(prefix).fontFamily,
+        commandFont: getComputedStyle(commandElement).fontFamily,
+        displayFontToken: getComputedStyle(document.documentElement)
+          .getPropertyValue("--font-display")
+          .trim(),
+        codeFontToken: getComputedStyle(document.documentElement)
+          .getPropertyValue("--font-code")
+          .trim(),
+      };
+    });
+    expect(shellStyle.boxShadow).toBe("none");
+    expect(shellStyle.borderLeftColor).toBe(shellStyle.borderRightColor);
+    expect(shellStyle.prefixFont.replaceAll('"', "")).toBe(
+      shellStyle.displayFontToken.replaceAll('"', ""),
+    );
+    expect(shellStyle.commandFont.replaceAll('"', "")).toBe(
+      shellStyle.codeFontToken.replaceAll('"', ""),
+    );
+
+    const pressedBackground = await page.evaluate(() => {
+      const probe = document.createElement("div");
+      probe.style.background = "var(--surface-inset)";
+      document.body.append(probe);
+      const background = getComputedStyle(probe).backgroundColor;
+      probe.remove();
+      return background;
+    });
+    await headerCopy.hover();
+    await page.mouse.down();
+    await expect
+      .poll(() => headerCopy.evaluate((element) => getComputedStyle(element).backgroundColor))
+      .toBe(pressedBackground);
+    await page.mouse.up();
+    await expect(headerCopy).toHaveAttribute("aria-label", "Copy output");
+    await expect(copyStatus).toHaveText("Copied");
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { __clipboardWrites?: Array<{ text: string }> })
+              .__clipboardWrites,
+        ),
+      )
+      .toEqual([{ text: output }]);
+
+    await disclosure.click();
+    await expect(disclosure).toBeFocused();
+    await expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    await expect(turn).not.toHaveClass(/shell-turn--open/);
+    await expect(turn.locator(".shell-turn__body")).toHaveCount(0);
+    await expect(turn.locator(".shell-turn__output-section")).toHaveCount(0);
+    await expect(turn.locator(".shell-turn__details")).toHaveCount(0);
+    await expect(turn.locator(".shell-turn__command")).toHaveText(command);
+    await expect(turn.locator(".shell-turn__meta")).toContainText("exit 0");
+    await expect(headerCopy).toBeVisible();
+
+    await headerCopy.click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { __clipboardWrites?: Array<{ text: string }> })
+              .__clipboardWrites,
+        ),
+      )
+      .toEqual([{ text: output }, { text: output }]);
+
+    await disclosure.click();
+    await expect(disclosure).toBeFocused();
+    await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    await expect(turn.locator(".shell-turn__output")).toContainText("SHELL OUTPUT FINAL SENTINEL");
+    await expect(turn.locator(".shell-turn__details")).toContainText("SHELL CWD SENTINEL");
+
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page
+      .getByRole("group", { name: "Transcript style" })
+      .getByRole("button", { name: "Compact" })
+      .click();
+    await page.keyboard.press("Escape");
+    await expect(turn).toBeVisible();
+    await expect(page.locator(".compact-transcript-group__summary")).toHaveCount(0);
+  });
+
+  test("live PTY replay stays out of the transcript until normalized settlement", async ({
+    page,
+  }) => {
+    await seedHistory(page, []);
+    await page.evaluate(() => {
+      const state = (
+        window as unknown as { __pivisStore: { getState: () => PreviewStoreState } }
+      ).__pivisStore.getState();
+      state.applyEvent(state.activeSessionId, {
+        type: "bash_execution_start",
+        id: "render-live-shell",
+        command: "interactive-command",
+        excludeFromContext: false,
+        pty: true,
+        startedAt: 1_786_000_000_000,
+        cwd: "/workspace/live",
+      });
+      state.applyEvent(state.activeSessionId, {
+        type: "bash_terminal_data",
+        id: "render-live-shell",
+        data: "\u001b[2J\u001b[HRAW PTY REPLAY MUST NOT SETTLE",
+        sequence: 1,
+        mode: "fullscreen",
+      });
+    });
+
+    await expect(page.locator(".shell-turn")).toHaveCount(0);
+    await expect(page.getByText("RAW PTY REPLAY MUST NOT SETTLE", { exact: false })).toHaveCount(0);
+
+    await page.evaluate(() => {
+      const state = (
+        window as unknown as { __pivisStore: { getState: () => PreviewStoreState } }
+      ).__pivisStore.getState();
+      state.applyEvent(state.activeSessionId, {
+        type: "bash_execution_end",
+        id: "render-live-shell",
+        command: "interactive-command",
+        output: "NORMALIZED SETTLED OUTPUT",
+        exitCode: 0,
+        cancelled: false,
+        excludeFromContext: false,
+        pty: true,
+        durationMs: 420,
+        normalization: "alternate_screen_final",
+      });
+    });
+
+    const settled = page.locator(".shell-turn").filter({ hasText: "interactive-command" });
+    await expect(settled).toBeVisible();
+    await expect(settled).toHaveAccessibleName("You, Shell, context included, exit 0");
+    await expect(settled.locator(".shell-turn__prefix")).toHaveText("!");
+    await expect(settled).toContainText("NORMALIZED SETTLED OUTPUT");
+    await expect(settled).not.toContainText("RAW PTY REPLAY MUST NOT SETTLE");
+    await expect(settled.locator(".shell-turn__meta")).toContainText("420 ms");
+    await expect(settled.locator(".shell-turn__meta")).not.toContainText("Context");
+    await expect(settled.locator(".shell-turn__details")).toHaveText("Cwd: /workspace/live");
+    await expect(settled).not.toContainText("Normalized final full-screen snapshot");
+    await expect(settled.getByRole("button", { name: "Copy output" })).toBeVisible();
+  });
+
+  test("settled shell interruption, no-output, and long-output modes remain inspectable", async ({
+    page,
+  }) => {
+    const longOutput = Array.from(
+      { length: 1_001 },
+      (_, index) => `shell-long-${String(index + 1).padStart(4, "0")}`,
+    ).join("\n");
+    await seedHistory(page, [
+      {
+        id: "cancelled-shell",
+        type: "bash",
+        data: {
+          command: "sleep 60",
+          outputText: "Interrupted by user",
+          isStreaming: false,
+          exitCode: 130,
+          cancelled: true,
+          signal: "SIGINT",
+          durationMs: 85,
+          excludeFromContext: false,
+          pty: true,
+        },
+      },
+      {
+        id: "interrupted-shell",
+        type: "bash",
+        data: {
+          command: "orphaned-process",
+          outputText: "",
+          isStreaming: false,
+          interrupted: true,
+          durationMs: 125,
+          excludeFromContext: true,
+          pty: true,
+        },
+      },
+      {
+        id: "empty-shell",
+        type: "bash",
+        data: {
+          command: "true",
+          outputText: "",
+          isStreaming: false,
+          exitCode: 0,
+          durationMs: 2,
+          excludeFromContext: false,
+          pty: true,
+        },
+      },
+      {
+        id: "failed-shell",
+        type: "bash",
+        data: {
+          command: "missing-command",
+          outputText: "[Shell execution failed: spawn failed]",
+          isStreaming: false,
+          errorMessage: "spawn failed",
+          durationMs: 4,
+          excludeFromContext: false,
+          pty: true,
+        },
+      },
+      {
+        id: "long-shell",
+        type: "bash",
+        data: {
+          command: "generate 1001 lines",
+          outputText: longOutput,
+          isStreaming: false,
+          exitCode: 0,
+          excludeFromContext: true,
+          pty: true,
         },
       },
     ]);
 
-    const card = page.locator(".tool-card").filter({ hasText: "COMMAND FINAL SENTINEL" });
-    const header = card.getByRole("button", { name: /^shell command details — /u });
-    await expect(card.locator(".tool-card__body")).toHaveCount(0);
-    await header.click();
+    const cancelled = page.locator(".shell-turn").filter({ hasText: "sleep 60" });
+    await expect(cancelled).toHaveAccessibleName("You, Shell, context included, cancelled");
+    await expect(cancelled).toHaveClass(/shell-turn--cancelled/);
+    await expect(cancelled.locator(".shell-turn__prefix")).toHaveText("!");
+    await expect(cancelled).toContainText("Interrupted by user");
+    await expect(cancelled.locator(".shell-turn__meta")).toContainText("85 ms");
+    await expect(cancelled.locator(".shell-turn__meta")).not.toContainText("Context");
+    await expect(cancelled.locator(".shell-turn__meta")).toContainText("SIGINT");
 
-    await expect(section(card, "Command")).toContainText(command);
-    await expect(card.locator(".tool-card__output-panel")).toContainText(
-      "SHELL OUTPUT FINAL SENTINEL",
-    );
-    const metadata = section(card, "Execution metadata");
-    await expect(metadata).toContainText("SHELL METADATA FINAL SENTINEL");
-    await expect(metadata).toContainText('"truncated": true');
-    await expect(metadata).toContainText('"excludeFromContext": true');
+    const interrupted = page.locator(".shell-turn").filter({ hasText: "orphaned-process" });
+    await expect(interrupted).toHaveAccessibleName("You, Shell, context excluded, interrupted");
+    await expect(interrupted).toHaveClass(/shell-turn--interrupted/);
+    await expect(interrupted.locator(".shell-turn__prefix")).toHaveText("!!");
+    await expect(interrupted.locator(".shell-turn__meta")).toContainText("125 ms");
+    await expect(interrupted.locator(".shell-turn__meta")).not.toContainText("Context");
+
+    const empty = page.locator(".shell-turn").filter({ hasText: "true" });
+    await expect(empty).toHaveAccessibleName("You, Shell, context included, exit 0");
+    await expect(empty.locator(".shell-turn__prefix")).toHaveText("!");
+    await expect(empty.locator(":scope > .shell-turn__header")).toHaveCount(1);
+    await expect(empty.locator(":scope > :not(.shell-turn__header)")).toHaveCount(0);
+    await expect(empty.locator(".shell-turn__summary")).toBeVisible();
+    await expect(empty.getByRole("button", { name: /^Shell Turn details —/u })).toHaveCount(0);
+    await expect(empty.getByRole("button", { name: "Copy output" })).toHaveCount(0);
+    await expect(empty.locator("[aria-expanded]")).toHaveCount(0);
+    await expect(empty.locator(".shell-turn__output-section")).toHaveCount(0);
+
+    const failed = page.locator(".shell-turn").filter({ hasText: "missing-command" });
+    await expect(failed).toHaveAccessibleName("You, Shell, context included, failed");
+    await expect(failed).toHaveClass(/shell-turn--error/);
+    await expect(failed).toContainText("[Shell execution failed: spawn failed]");
+
+    const long = page.locator(".shell-turn").filter({ hasText: "generate 1001 lines" });
+    const longDisclosure = long.getByRole("button", { name: /^Shell Turn details —/u });
+    await expect(long.locator(".shell-turn__prefix")).toHaveText("!!");
+    await expect(long.locator(".tool-card__section-header")).toHaveCount(0);
+    await expect(longDisclosure).toHaveAttribute("aria-expanded", "true");
+    await expect(long.getByRole("button", { name: "Copy output" })).toHaveCount(1);
+    let region = long.getByRole("region", { name: "Shell output (1,001 lines)" });
+    await expect(region).toBeVisible();
+    await expect(region).toHaveAttribute("tabindex", "0");
+    await expect(long.locator(".tool-card__output-line").first()).toContainText("shell-long-0001");
+    await expect.poll(() => long.locator(".tool-card__output-line").count()).toBeLessThan(100);
+
+    await longDisclosure.click();
+    await expect(longDisclosure).toHaveAttribute("aria-expanded", "false");
+    await expect(long.locator(".shell-turn__body")).toHaveCount(0);
+    await expect(region).toHaveCount(0);
+    await expect(long.locator(".tool-card__output-line")).toHaveCount(0);
+
+    await longDisclosure.click();
+    await expect(longDisclosure).toHaveAttribute("aria-expanded", "true");
+    region = long.getByRole("region", { name: "Shell output (1,001 lines)" });
+    await expect(region).toBeVisible();
+    await expect(long.locator(".tool-card__output-line").first()).toContainText("shell-long-0001");
+    await region.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+      element.dispatchEvent(new Event("scroll"));
+    });
+    await expect(long.locator(".tool-card__output-line").last()).toContainText("shell-long-1001");
   });
 
   test("wide and tall payloads use one native scroll owner while prose wraps", async ({ page }) => {

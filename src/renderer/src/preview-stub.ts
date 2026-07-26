@@ -91,6 +91,7 @@ const previewHooks = {
   },
   /** Log of every panel input string sent to `session.panelInput`. */
   panelInputLog: [] as string[],
+  shellInputLog: [] as string[],
   /** Grid reports from panel sizing, used by overflow convergence tests. */
   panelResizeLog: [] as Array<{
     panelId: number | undefined;
@@ -1980,6 +1981,18 @@ const stub = {
         previewHooks.panelInputLog.push(String(input.data ?? ""));
         return { acknowledgedThrough: input.sequence ?? 0 };
       }
+      case "session.shellInput": {
+        const input = req as { data?: unknown; sequence?: number };
+        previewHooks.shellInputLog.push(String(input.data ?? ""));
+        return {
+          accepted: true,
+          acknowledgedThrough: input.sequence ?? 0,
+        };
+      }
+      case "session.shellResize":
+      case "session.shellReconstructionAck":
+      case "session.shellSignal":
+        return { accepted: true };
       case "session.panelResize": {
         // Mirror the host's fullRender-on-resize: re-emit the panel's frame so
         // the content re-lays-out top-anchored into the new grid (see

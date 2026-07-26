@@ -250,12 +250,26 @@ export const BashExecutionStartEventSchema = z.object({
   id: z.string(),
   command: z.string(),
   excludeFromContext: z.boolean().optional(),
+  pty: z.boolean().optional(),
+  startedAt: z.number().optional(),
+  cwd: z.string().optional(),
+  cols: z.number().int().positive().optional(),
+  rows: z.number().int().positive().optional(),
 });
 
 export const BashExecutionUpdateEventSchema = z.object({
   type: z.literal("bash_execution_update"),
   id: z.string().optional(),
   delta: z.string(),
+});
+
+/** Raw, transient PTY bytes for a live user-owned Shell Turn. */
+export const BashTerminalDataEventSchema = z.object({
+  type: z.literal("bash_terminal_data"),
+  id: z.string(),
+  data: z.string(),
+  sequence: z.number().int().positive().optional(),
+  mode: z.enum(["compact", "fullscreen"]).optional(),
 });
 
 export const BashExecutionEndEventSchema = z.object({
@@ -269,6 +283,10 @@ export const BashExecutionEndEventSchema = z.object({
   fullOutputPath: z.string().optional(),
   excludeFromContext: z.boolean().optional(),
   errorMessage: z.string().optional(),
+  pty: z.boolean().optional(),
+  durationMs: z.number().nonnegative().optional(),
+  signal: z.string().optional(),
+  normalization: z.enum(["terminal_buffer", "alternate_screen_final"]).optional(),
 });
 
 export const ThinkingLevelChangedEventSchema = z.object({
@@ -342,6 +360,7 @@ const KnownPiEventSchema = z.discriminatedUnion("type", [
   SummarizationRetryFinishedEventSchema,
   BashExecutionStartEventSchema,
   BashExecutionUpdateEventSchema,
+  BashTerminalDataEventSchema,
   BashExecutionEndEventSchema,
   ThinkingLevelChangedEventSchema,
   EntryAppendedEventSchema,

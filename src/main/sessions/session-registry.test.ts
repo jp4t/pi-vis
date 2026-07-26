@@ -1118,7 +1118,13 @@ describe("SessionRegistry direct AgentSession authority", () => {
         intentId: "stale-generation",
         rendererGeneration: 1,
         expectedOwner: { hostInstanceId, sessionEpoch },
-        intent: { kind: "runBash", command: "pwd" },
+        intent: {
+          kind: "runBash",
+          command: "pwd",
+          excludeFromContext: false,
+          editorRevision: 1,
+          editorText: "!pwd",
+        },
       }),
     ).resolves.toEqual({
       status: "not_admitted",
@@ -1131,7 +1137,13 @@ describe("SessionRegistry direct AgentSession authority", () => {
         intentId: "stale-owner",
         rendererGeneration: 2,
         expectedOwner: { hostInstanceId: "retired-host", sessionEpoch },
-        intent: { kind: "runBash", command: "pwd" },
+        intent: {
+          kind: "runBash",
+          command: "pwd",
+          excludeFromContext: false,
+          editorRevision: 1,
+          editorText: "!pwd",
+        },
       }),
     ).resolves.toEqual({
       status: "not_admitted",
@@ -1154,7 +1166,13 @@ describe("SessionRegistry direct AgentSession authority", () => {
       intentId,
       rendererGeneration: record._rendererGeneration,
       expectedOwner: { hostInstanceId, sessionEpoch },
-      intent: { kind: "runBash", command: "pwd" },
+      intent: {
+        kind: "runBash",
+        command: "pwd",
+        excludeFromContext: false,
+        editorRevision: 1,
+        editorText: "!pwd",
+      },
     });
 
     record.availability = "unavailable";
@@ -3900,5 +3918,96 @@ describe("SessionRegistry direct AgentSession authority", () => {
       h.registry.sendPanelInput(id, ...runtimeIdentity(record), 7, 1, 1, "a"),
     ).rejects.toThrow("host rejected input");
     expect(record._panelInputSequence.get(7)).toBe(0);
+  });
+
+  it("owner-fences Shell Turn input and counts only an accepted host mutation", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const record = h.registry.getSession(id)!;
+    const owner = runtimeIdentity(record);
+    const mutationSequence = record._mutationSequence;
+    const input = vi.spyOn(record.proc!, "sendShellInput").mockResolvedValue({
+      accepted: true,
+      acknowledgedThrough: 1,
+    });
+
+    await expect(
+      h.registry.sendShellInput(id, ...owner, "shell-1", 1, "answer\n"),
+    ).resolves.toEqual({ accepted: true, acknowledgedThrough: 1 });
+    expect(input).toHaveBeenCalledWith("shell-1", 1, "answer\n");
+    expect(record._mutationSequence).toBe(mutationSequence + 1);
+
+    await expect(
+      h.registry.sendShellInput(id, "stale-host", owner[1], "shell-1", 2, "stale"),
+    ).resolves.toEqual({ accepted: false, acknowledgedThrough: 0 });
+    expect(input).toHaveBeenCalledOnce();
+    h.registry.stopAll();
+  });
+
+  it("discards a Shell Turn acknowledgement that crosses an owner epoch", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const record = h.registry.getSession(id)!;
+    const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+    let resolveInput!: (result: {
+      accepted: boolean;
+      acknowledgedThrough: number;
+    }) => void;
+    record.proc!.sendShellInput = vi.fn(
+      () =>
+        new Promise<{ accepted: boolean; acknowledgedThrough: number }>((resolve) => {
+          resolveInput = resolve;
+        }),
+    );
+
+    const pending = h.registry.sendShellInput(
+      id,
+      hostInstanceId,
+      sessionEpoch,
+      "shell-1",
+      1,
+      "answer\n",
+    );
+    await vi.waitFor(() => expect(record.proc!.sendShellInput).toHaveBeenCalledOnce());
+    record.proc!.sessionEpoch = sessionEpoch + 1;
+    record.snapshot = { ...record.snapshot!, sessionEpoch: sessionEpoch + 1 };
+    resolveInput({ accepted: true, acknowledgedThrough: 1 });
+
+    await expect(pending).resolves.toEqual({ accepted: false, acknowledgedThrough: 0 });
+    h.registry.stopAll();
+  });
+
+  it("owner-fences Shell Turn resize, reconstruction, and termination controls", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const record = h.registry.getSession(id)!;
+    const owner = runtimeIdentity(record);
+    const resize = vi.spyOn(record.proc!, "sendShellResize").mockResolvedValue(true);
+    const acknowledge = vi
+      .spyOn(record.proc!, "acknowledgeShellReconstruction")
+      .mockResolvedValue(true);
+    const signal = vi.spyOn(record.proc!, "sendShellSignal").mockResolvedValue(true);
+
+    await expect(h.registry.resizeShell(id, ...owner, "shell-1", 3, 100, 40)).resolves.toEqual({
+      accepted: true,
+    });
+    await expect(
+      h.registry.acknowledgeShellReconstruction(id, ...owner, "shell-1", 3, 8),
+    ).resolves.toEqual({ accepted: true });
+    await expect(h.registry.signalShell(id, ...owner, "shell-1", "interrupt")).resolves.toEqual({
+      accepted: true,
+    });
+    expect(resize).toHaveBeenCalledWith("shell-1", 3, 100, 40);
+    expect(acknowledge).toHaveBeenCalledWith("shell-1", 3, 8);
+    expect(signal).toHaveBeenCalledWith("shell-1", "interrupt");
+
+    await expect(
+      h.registry.signalShell(id, "stale-host", owner[1], "shell-1", "kill"),
+    ).resolves.toEqual({ accepted: false });
+    expect(signal).toHaveBeenCalledOnce();
+    h.registry.stopAll();
   });
 });

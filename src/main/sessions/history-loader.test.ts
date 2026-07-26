@@ -540,6 +540,293 @@ describe("entriesToTranscript (pure helper used by /tree navigate)", () => {
     ]);
   });
 
+  it("rehydrates Shell Turn provenance and completion metadata around Pi's canonical bash message", async () => {
+    const blocks = await entriesToTranscript([
+      {
+        type: "custom",
+        id: "shell-start",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        customType: "pivis.shell_turn_start",
+        data: {
+          version: 1,
+          executionId: "shell-1",
+          command: "npm init",
+          excludeFromContext: true,
+          startedAt: 1_700_000_001_000,
+          cwd: "/workspace",
+          pty: true,
+        },
+      },
+      {
+        type: "message",
+        id: "shell-result",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        message: {
+          role: "bashExecution",
+          command: "npm init",
+          output: "package name: demo",
+          exitCode: 0,
+          cancelled: false,
+          excludeFromContext: true,
+          timestamp: 1_700_000_002_000,
+        },
+      },
+      {
+        type: "custom",
+        id: "shell-complete",
+        timestamp: "2024-01-01T00:00:03.000Z",
+        customType: "pivis.shell_turn_complete",
+        data: {
+          version: 1,
+          executionId: "shell-1",
+          durationMs: 625,
+          signal: "SIGINT",
+          normalization: "terminal_buffer",
+        },
+      },
+    ]);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      id: "shell-result",
+      type: "bash",
+      data: {
+        executionId: "shell-1",
+        command: "npm init",
+        outputText: "package name: demo",
+        exitCode: 0,
+        excludeFromContext: true,
+        pty: true,
+        startedAt: 1_700_000_001_000,
+        cwd: "/workspace",
+        durationMs: 625,
+        signal: "SIGINT",
+        normalization: "terminal_buffer",
+      },
+    });
+  });
+
+  it("marks an orphaned Shell Turn interrupted without claiming an unrelated bash message", async () => {
+    const blocks = await entriesToTranscript([
+      {
+        type: "custom",
+        id: "orphan-start",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        customType: "pivis.shell_turn_start",
+        data: {
+          executionId: "shell-orphan",
+          command: "vim package.json",
+          excludeFromContext: false,
+          startedAt: 1_700_000_001_000,
+          cwd: "/workspace",
+          pty: true,
+        },
+      },
+      {
+        type: "message",
+        id: "agent-bash",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        message: {
+          role: "bashExecution",
+          command: "git status",
+          output: "clean",
+          exitCode: 0,
+          timestamp: 1_700_000_002_000,
+        },
+      },
+    ]);
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toMatchObject({
+      id: "interrupted-shell-orphan",
+      type: "bash",
+      data: {
+        executionId: "shell-orphan",
+        command: "vim package.json",
+        isStreaming: false,
+        interrupted: true,
+        pty: true,
+        cwd: "/workspace",
+      },
+    });
+    expect(blocks[1]).toMatchObject({
+      id: "agent-bash",
+      type: "bash",
+      data: { command: "git status", executionId: undefined },
+    });
+  });
+
+  it("correlates repeated commands by exact completion id without letting an orphan steal the result", async () => {
+    const blocks = await entriesToTranscript([
+      {
+        type: "custom",
+        id: "old-start",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        customType: "pivis.shell_turn_start",
+        data: {
+          executionId: "shell-old",
+          command: "pwd",
+          excludeFromContext: false,
+          startedAt: 1_700_000_001_000,
+          cwd: "/old",
+          pty: true,
+        },
+      },
+      {
+        type: "custom",
+        id: "new-start",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        customType: "pivis.shell_turn_start",
+        data: {
+          executionId: "shell-new",
+          command: "pwd",
+          excludeFromContext: false,
+          startedAt: 1_700_000_002_000,
+          cwd: "/new",
+          pty: true,
+        },
+      },
+      {
+        type: "message",
+        id: "new-result",
+        timestamp: "2024-01-01T00:00:03.000Z",
+        message: {
+          role: "bashExecution",
+          command: "pwd",
+          output: "/new\n",
+          exitCode: 0,
+          timestamp: 1_700_000_003_000,
+        },
+      },
+      {
+        type: "custom",
+        id: "new-complete",
+        timestamp: "2024-01-01T00:00:04.000Z",
+        customType: "pivis.shell_turn_complete",
+        data: {
+          executionId: "shell-new",
+          durationMs: 20,
+          normalization: "terminal_buffer",
+        },
+      },
+    ]);
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toMatchObject({
+      id: "interrupted-shell-old",
+      type: "bash",
+      data: {
+        executionId: "shell-old",
+        command: "pwd",
+        cwd: "/old",
+        interrupted: true,
+      },
+    });
+    expect(blocks[1]).toMatchObject({
+      id: "new-result",
+      type: "bash",
+      data: {
+        executionId: "shell-new",
+        command: "pwd",
+        outputText: "/new\n",
+        cwd: "/new",
+        durationMs: 20,
+      },
+    });
+  });
+
+  it("does not assign an identical agent bash command to an orphan without a completion marker", async () => {
+    const blocks = await entriesToTranscript([
+      {
+        type: "custom",
+        id: "orphan-start",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        customType: "pivis.shell_turn_start",
+        data: {
+          executionId: "shell-orphan",
+          command: "pwd",
+          excludeFromContext: false,
+          startedAt: 1_700_000_001_000,
+          cwd: "/workspace",
+          pty: true,
+        },
+      },
+      {
+        type: "message",
+        id: "agent-bash",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        message: {
+          role: "bashExecution",
+          command: "pwd",
+          output: "/workspace\n",
+          exitCode: 0,
+          timestamp: 1_700_000_002_000,
+        },
+      },
+    ]);
+
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toMatchObject({
+      id: "interrupted-shell-orphan",
+      type: "bash",
+      data: { executionId: "shell-orphan", interrupted: true },
+    });
+    expect(blocks[1]).toMatchObject({
+      id: "agent-bash",
+      type: "bash",
+      data: { executionId: undefined, command: "pwd" },
+    });
+  });
+
+  it("rehydrates a post-admission spawn failure as failed rather than interrupted", async () => {
+    const blocks = await entriesToTranscript([
+      {
+        type: "custom",
+        id: "failed-start",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        customType: "pivis.shell_turn_start",
+        data: {
+          executionId: "failed-shell",
+          command: "missing-command",
+          excludeFromContext: false,
+          startedAt: 1_700_000_001_000,
+          cwd: "/workspace",
+          pty: true,
+        },
+      },
+      {
+        type: "custom",
+        id: "failed-complete",
+        timestamp: "2024-01-01T00:00:02.000Z",
+        customType: "pivis.shell_turn_complete",
+        data: {
+          executionId: "failed-shell",
+          durationMs: 7,
+          interrupted: false,
+          errorMessage: "spawn failed",
+          normalization: "terminal_buffer",
+        },
+      },
+    ]);
+
+    expect(blocks).toEqual([
+      expect.objectContaining({
+        id: "failed-failed-shell",
+        type: "bash",
+        data: expect.objectContaining({
+          executionId: "failed-shell",
+          command: "missing-command",
+          outputText: "spawn failed",
+          isStreaming: false,
+          interrupted: false,
+          errorMessage: "spawn failed",
+          durationMs: 7,
+          normalization: "terminal_buffer",
+        }),
+      }),
+    ]);
+  });
+
   it("preserves public tool, bash, custom-message, and compaction payloads", async () => {
     const customEntryTimestamp = "2024-01-01T00:00:04.000Z";
     const blocks = await entriesToTranscript([

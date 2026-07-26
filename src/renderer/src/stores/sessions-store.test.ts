@@ -21,6 +21,7 @@ import {
   isPendingNewSessionActiveFor,
   isSessionAbortable,
   isSessionWorking,
+  liveShellPresentationFor,
   sessionCompactionActivity,
   sessionHasHistory,
   shouldShowWorkingIndicator,
@@ -5215,6 +5216,186 @@ describe("sessions store - authority intent projection", () => {
       state: "following",
       cursor: { transportSequence: 2 },
     });
+  });
+
+  it("installs a live Shell Turn keyframe before replaying newer PTY data", () => {
+    const snapshot = semanticSnapshot(1, {
+      sdk: {
+        isStreaming: false,
+        isIdle: false,
+        isCompacting: false,
+        isRetrying: false,
+        retryAttempt: 0,
+        isBashRunning: true,
+      },
+      activity: {
+        bash: {
+          kind: "bash",
+          state: "active",
+          intentId: "restored-shell",
+          command: "python",
+          startedAt: 1_786_000_000_100,
+          excludeFromContext: false,
+          pty: true,
+          inputReady: true,
+          terminalMode: "compact",
+        },
+      },
+    });
+    const attach = authorityAttach(snapshot);
+    attach.baseline.transcript.currentShellTurn = {
+      id: "restored-shell",
+      command: "python",
+      owner: snapshot.owner,
+      startedAt: 1_786_000_000_100,
+      cwd: "/workspace/restored",
+      excludeFromContext: false,
+      cols: 120,
+      rows: 30,
+      mode: "compact",
+      ansi: "\u001b[2J\u001b[H>>> ",
+      outputThroughSequence: 7,
+      reconstructionFenceToken: 2,
+      inputAcknowledgedThrough: 3,
+      resizeRevision: 2,
+      interruptRequestedAt: 1_786_000_000_500,
+      replayTruncated: true,
+    };
+    attach.replay = [
+      {
+        sessionId: SESSION_A,
+        rendererGeneration: 0,
+        publicationSequence: 1,
+        plane: "transcript",
+        owner: snapshot.owner,
+        payload: {
+          kind: "delta",
+          cursor: {
+            ...snapshot.owner,
+            transportSequence: 2,
+            snapshotSequence: snapshot.snapshotSequence,
+          },
+          liveTailCursor: "2",
+          entries: [
+            {
+              type: "bash_terminal_data",
+              id: "restored-shell",
+              data: "print('ready')\r\n",
+              sequence: 8,
+              mode: "fullscreen",
+            },
+          ],
+        },
+      },
+    ];
+
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+
+    const session = useSessionsStore.getState().sessions.get(SESSION_A)!;
+    expect(session.transcript.activeBashExecutionId).toBe("restored-shell");
+    expect(session.transcript.blocks).toHaveLength(1);
+    expect(session.transcript.blocks[0]).toMatchObject({
+      type: "bash",
+      data: {
+        executionId: "restored-shell",
+        command: "python",
+        terminalOutput: "\u001b[2J\u001b[H>>> ",
+        terminalReconstructionSequence: 7,
+        terminalReconstructionFenceToken: 2,
+        terminalOutputSequence: 8,
+        terminalOutputChunks: [{ sequence: 8, data: "print('ready')\r\n" }],
+        terminalOutputChunkChars: 16,
+        liveReplayTruncated: true,
+        terminalMode: "fullscreen",
+        inputAcknowledgedThrough: 3,
+        resizeRevision: 2,
+        interruptRequestedAt: 1_786_000_000_500,
+        pty: true,
+        isStreaming: true,
+        cwd: "/workspace/restored",
+      },
+    });
+    expect(session.authorityProjection?.transcript).toMatchObject({
+      state: "following",
+      cursor: { transportSequence: 2 },
+    });
+  });
+
+  it("retains only a matching live PTY presentation across a recoverable semantic fence", () => {
+    const snapshot = semanticSnapshot(1, {
+      sdk: {
+        isStreaming: false,
+        isIdle: false,
+        isCompacting: false,
+        isRetrying: false,
+        retryAttempt: 0,
+        isBashRunning: true,
+      },
+      activity: {
+        bash: {
+          kind: "bash",
+          state: "active",
+          intentId: "shell-presentation",
+          command: "python",
+          startedAt: 1_786_000_000_100,
+          pty: true,
+          inputReady: true,
+          terminalMode: "compact",
+        },
+      },
+    });
+    const attach = authorityAttach(snapshot);
+    attach.baseline.transcript.currentShellTurn = {
+      id: "shell-presentation",
+      command: "python",
+      owner: snapshot.owner,
+      startedAt: 1_786_000_000_100,
+      cols: 80,
+      rows: 8,
+      mode: "compact",
+      ansi: ">>> ",
+      outputThroughSequence: 1,
+      reconstructionFenceToken: 1,
+      inputAcknowledgedThrough: 0,
+      resizeRevision: 0,
+    };
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+
+    expect(
+      liveShellPresentationFor(useSessionsStore.getState().sessions.get(SESSION_A)),
+    ).toMatchObject({
+      executionId: "shell-presentation",
+      authoritative: true,
+    });
+
+    useSessionsStore
+      .getState()
+      .applyAuthorityPublication(semanticPublication(3, { ...snapshot, snapshotSequence: 3 }));
+    const fenced = useSessionsStore.getState().sessions.get(SESSION_A);
+    expect(fenced?.authorityProjection?.semantic.state).toBe("synchronizing");
+    expect(liveShellPresentationFor(fenced)).toMatchObject({
+      executionId: "shell-presentation",
+      authoritative: false,
+    });
+
+    useSessionsStore.getState().applyEvents(SESSION_A, [
+      {
+        type: "bash_execution_start",
+        id: "different-shell",
+        command: "node",
+        pty: true,
+      },
+    ]);
+    expect(
+      liveShellPresentationFor(useSessionsStore.getState().sessions.get(SESSION_A)),
+    ).toBeUndefined();
+
+    attach.baseline.publicationHighWatermark = 2;
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+    useSessionsStore.getState().markAuthorityUnavailable(SESSION_A, "transport_lost");
+    expect(
+      liveShellPresentationFor(useSessionsStore.getState().sessions.get(SESSION_A)),
+    ).toBeUndefined();
   });
 
   it("installs attach restoration atomically and retains byte-identical attachments", () => {

@@ -211,6 +211,27 @@ export class FakeHostProcess extends EventEmitter {
           data: { acknowledgedThrough: msg.sequence },
         });
       });
+    } else if (msg?.type === "shell_input" && this.initialized) {
+      queueMicrotask(() => {
+        this.emitWire({
+          type: "response",
+          id: msg.id,
+          success: true,
+          data: { accepted: true, acknowledgedThrough: msg.sequence },
+        });
+      });
+    } else if (
+      ["shell_resize", "shell_reconstruction_ack", "shell_signal"].includes(msg?.type) &&
+      this.initialized
+    ) {
+      queueMicrotask(() => {
+        this.emitWire({
+          type: "response",
+          id: msg.id,
+          success: true,
+          data: { accepted: true },
+        });
+      });
     } else if (msg?.type === "escape" && this.initialized) {
       queueMicrotask(() => {
         this.emitWire({
