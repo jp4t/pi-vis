@@ -1,5 +1,5 @@
 import { autoUpdater } from "electron";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({
   app: {
@@ -17,6 +17,11 @@ vi.mock("electron", () => ({
 import { buildAppUpdateFeedUrl, checkForAppUpdate, initAppUpdates } from "./app-updates.js";
 
 describe("buildAppUpdateFeedUrl", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
   it("builds the update.electronjs.org feed with platform and arch", () => {
     expect(
       buildAppUpdateFeedUrl({
@@ -30,6 +35,8 @@ describe("buildAppUpdateFeedUrl", () => {
   });
 
   it("does not overlap app-updater checks while one is in progress", () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    vi.stubEnv("PIVIS_DISABLE_APP_UPDATES", "");
     initAppUpdates(() => {});
     checkForAppUpdate();
     checkForAppUpdate();
