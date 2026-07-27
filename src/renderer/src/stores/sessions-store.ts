@@ -65,6 +65,7 @@ import {
   createRendererAuthorityState,
   reduceAuthorityAttach,
   reduceAuthorityPublication,
+  retireTransientNavigationOutcome,
   unavailableAuthority,
 } from "./authority-reducer.js";
 import { useChangelogStore } from "./changelog-store.js";
@@ -1394,6 +1395,11 @@ interface SessionsStore {
     outcome: Extract<IntentOutcome, { kind: "navigate" }>,
     history: TranscriptBlock[],
   ) => boolean;
+  consumeNavigationOutcome: (
+    sessionId: SessionId,
+    intentId: string,
+    owner: RuntimeIdentity,
+  ) => void;
   /** Rebuild presentation from persisted JSONL under history ownership and idle fences. */
   rehydrateHistory: (sessionId: SessionId) => Promise<void>;
   refreshHistoricalCacheMissNotices: (sessionId: SessionId) => Promise<void>;
@@ -2244,6 +2250,22 @@ const buildSessionsStore = (
       return { sessions };
     });
     return replaced;
+  },
+
+  consumeNavigationOutcome: (sessionId, intentId, owner) => {
+    set((state) => {
+      const current = state.sessions.get(sessionId);
+      if (!current?.authorityProjection) return {};
+      const authorityProjection = retireTransientNavigationOutcome(
+        current.authorityProjection,
+        intentId,
+        owner,
+      );
+      if (authorityProjection === current.authorityProjection) return {};
+      const sessions = new Map(state.sessions);
+      sessions.set(sessionId, { ...current, authorityProjection });
+      return { sessions };
+    });
   },
 
   rehydrateHistory: async (sessionId) => {

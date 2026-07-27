@@ -3824,6 +3824,38 @@ describe("state authority", () => {
         }),
       ),
     );
+    const successfulFrame = sendFrame.mock.calls
+      .map(([frame]) => frame)
+      .find((frame) =>
+        frame.records.some(
+          (record) =>
+            record.type === "intent_outcome" && record.outcome.intentId === "navigate-success",
+        ),
+      );
+    expect(
+      successfulFrame.terminalSnapshot.recentIntentOutcomes.find(
+        (outcome) => outcome.intentId === "navigate-success",
+      ),
+    ).toMatchObject({
+      result: { targetId: "target-a", summarized: true, leafId: "leaf-a" },
+    });
+    expect(
+      successfulFrame.terminalSnapshot.recentIntentOutcomes.find(
+        (outcome) => outcome.intentId === "navigate-success",
+      )?.result,
+    ).not.toHaveProperty("branch");
+    expect(
+      successfulFrame.terminalSnapshot.recentIntentOutcomes.find(
+        (outcome) => outcome.intentId === "navigate-success",
+      )?.result,
+    ).not.toHaveProperty("editorText");
+
+    const attachedAfterNavigation = await readyAttach(authority, 1);
+    const retainedNavigation = attachedAfterNavigation.operationJournal.find(
+      (record) =>
+        record.type === "intent_outcome" && record.outcome.intentId === "navigate-success",
+    );
+    expect(retainedNavigation?.outcome.result).not.toHaveProperty("branch");
 
     await authority.dispatchIntent(envelope("navigate-cancelled"), async () => ({
       targetId: "target-a",
@@ -3849,6 +3881,57 @@ describe("state authority", () => {
         .map(([frame]) => frame)
         .every((frame) => AuthorityFrameSchema.safeParse(frame).success),
     ).toBe(true);
+  });
+
+  it("does not repeat a large navigation branch in later semantic frames", async () => {
+    const sendFrame = vi.fn();
+    const { authority } = setup({}, { sendFrame });
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
+    const branch = [
+      {
+        id: "large-leaf",
+        type: "message",
+        timestamp: 1,
+        message: { role: "toolResult", content: "x".repeat(1024 * 1024) },
+      },
+    ];
+
+    await authority.dispatchIntent(
+      {
+        intentId: "navigate-large",
+        expectedOwner: owner,
+        intent: { kind: "navigate", targetId: "large-leaf" },
+      },
+      async () => ({ targetId: "large-leaf", leafId: "large-leaf", branch }),
+    );
+    await vi.waitFor(() =>
+      expect(
+        sendFrame.mock.calls.some(([frame]) =>
+          frame.records.some(
+            (record) =>
+              record.type === "intent_outcome" && record.outcome.intentId === "navigate-large",
+          ),
+        ),
+      ).toBe(true),
+    );
+
+    const liveOutcomeFrame = sendFrame.mock.calls
+      .map(([frame]) => frame)
+      .find((frame) =>
+        frame.records.some(
+          (record) =>
+            record.type === "intent_outcome" && record.outcome.intentId === "navigate-large",
+        ),
+      );
+    expect(Buffer.byteLength(JSON.stringify(liveOutcomeFrame))).toBeGreaterThan(1024 * 1024);
+
+    const laterFrame = authority.createSemanticFrame();
+    expect(Buffer.byteLength(JSON.stringify(laterFrame))).toBeLessThan(64 * 1024);
+    expect(
+      laterFrame.terminalSnapshot.recentIntentOutcomes.find(
+        (outcome) => outcome.intentId === "navigate-large",
+      )?.result,
+    ).toEqual({ targetId: "large-leaf", leafId: "large-leaf" });
   });
 
   it("settles admitted idle and queued submit intents exactly once with typed public evidence", async () => {

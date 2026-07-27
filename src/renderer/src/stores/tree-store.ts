@@ -54,16 +54,20 @@ function findNavigateOutcome(
   intentId: string,
   owner: RuntimeIdentity,
 ): NavigateOutcome | undefined {
-  return useSessionsStore
-    .getState()
-    .sessions.get(sessionId)
-    ?.authorityProjection?.authoritativeSnapshot?.recentIntentOutcomes.find(
-      (outcome): outcome is NavigateOutcome =>
-        outcome.kind === "navigate" &&
-        outcome.intentId === intentId &&
-        outcome.owner.hostInstanceId === owner.hostInstanceId &&
-        outcome.owner.sessionEpoch === owner.sessionEpoch,
-    );
+  const projection = useSessionsStore.getState().sessions.get(sessionId)?.authorityProjection;
+  const matches = (outcome: IntentOutcome): outcome is NavigateOutcome =>
+    outcome.kind === "navigate" &&
+    outcome.intentId === intentId &&
+    outcome.owner.hostInstanceId === owner.hostInstanceId &&
+    outcome.owner.sessionEpoch === owner.sessionEpoch;
+  // A complete branch crosses authority only in the terminal outcome record;
+  // retained snapshots intentionally keep bounded navigation metadata. Prefer
+  // the renderer-local one-shot payload, then fall back to terminal metadata
+  // for cancellation/failure outcomes that require no transcript replacement.
+  return (
+    projection?.transientNavigationOutcomes.find(matches) ??
+    projection?.authoritativeSnapshot?.recentIntentOutcomes.find(matches)
+  );
 }
 
 function treeViewOwns(sessionId: SessionId): boolean {
@@ -272,6 +276,10 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
         return;
       }
 
+      const consumeOutcome = () =>
+        useSessionsStore
+          .getState()
+          .consumeNavigationOutcome(sessionId, outcome.intentId, outcome.owner);
       let history: TranscriptBlock[];
       try {
         history = await window.pivis.invoke("session.transcriptForEntries", {
@@ -279,6 +287,7 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
           entries: outcome.result.branch,
         });
       } catch (err) {
+        consumeOutcome();
         if (treeViewOwns(sessionId) && observationIsCurrent(sessionId, observation)) {
           const message = describeIpcError(err);
           if (message) useSessionsStore.getState().addToast(sessionId, message, "error");
@@ -286,8 +295,15 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
         }
         return;
       }
-      if (!treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) return;
-      if (!useSessionsStore.getState().replaceTranscriptForNavigate(sessionId, outcome, history)) {
+      if (!treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) {
+        consumeOutcome();
+        return;
+      }
+      const replaced = useSessionsStore
+        .getState()
+        .replaceTranscriptForNavigate(sessionId, outcome, history);
+      consumeOutcome();
+      if (!replaced) {
         if (treeViewOwns(sessionId) && observationIsCurrent(sessionId, observation)) {
           set({ navigating: false });
         }

@@ -10,6 +10,7 @@ import {
   createRendererAuthorityState,
   reduceAuthorityAttach,
   reduceAuthorityPublication,
+  retireTransientNavigationOutcome,
 } from "./authority-reducer.js";
 
 const owner: RuntimeIdentity = { hostInstanceId: "host-a", sessionEpoch: 1 };
@@ -104,7 +105,10 @@ function baseline(highWatermark = 10): Extract<AuthorityAttachResponse, { status
   };
 }
 
-function semanticPublication(sequence: number, transportSequence = 2): RendererPublication {
+function semanticPublication(
+  sequence: number,
+  transportSequence = 2,
+): Extract<RendererPublication, { plane: "semantic" }> {
   return {
     sessionId: "session-a",
     rendererGeneration: 7,
@@ -129,6 +133,72 @@ describe("authority reducer", () => {
     expect(state.authoritativeSnapshot?.snapshotSequence).toBe(2);
     expect(state.lastSemanticFrame?.records).toEqual(frame(2).records);
     expect(state.recentRecords).toEqual(frame(2).records);
+  });
+
+  it("retains a one-shot navigation branch across later compact frames until consumed", () => {
+    const attached = reduceAuthorityAttach(createRendererAuthorityState(), baseline());
+    const navigation = {
+      intentId: "navigate-a",
+      owner,
+      kind: "navigate" as const,
+      state: "completed" as const,
+      result: {
+        targetId: "target-a",
+        leafId: "leaf-a",
+        editorText: "draft".repeat(64 * 1024),
+        branch: [
+          {
+            id: "leaf-a",
+            type: "message",
+            message: { role: "toolResult", content: "x".repeat(1024 * 1024) },
+          },
+        ],
+      },
+    };
+    const navigationFrame = frame(2);
+    navigationFrame.records = [{ type: "intent_outcome", outcome: navigation }];
+    navigationFrame.terminalSnapshot.recentIntentOutcomes = [
+      {
+        ...navigation,
+        result: { targetId: "target-a", leafId: "leaf-a" },
+      },
+    ];
+    const withNavigation = reduceAuthorityPublication(attached, {
+      ...semanticPublication(11),
+      payload: navigationFrame,
+    });
+    const compactPublication = semanticPublication(12, 3);
+    compactPublication.payload.terminalSnapshot.recentIntentOutcomes = [
+      {
+        ...navigation,
+        result: { targetId: "target-a", leafId: "leaf-a" },
+      },
+    ];
+    const afterCompactFrame = reduceAuthorityPublication(withNavigation, compactPublication);
+
+    expect(afterCompactFrame.transientNavigationOutcomes).toEqual([navigation]);
+    expect(
+      afterCompactFrame.authoritativeSnapshot?.recentIntentOutcomes[0]?.result,
+    ).not.toHaveProperty("branch");
+    expect(
+      retireTransientNavigationOutcome(afterCompactFrame, navigation.intentId, successor)
+        .transientNavigationOutcomes,
+    ).toEqual([navigation]);
+    const consumed = retireTransientNavigationOutcome(withNavigation, navigation.intentId, owner);
+    expect(consumed.transientNavigationOutcomes).toEqual([]);
+    const retainedProjection = JSON.stringify({
+      records: consumed.recentRecords,
+      frame: consumed.lastSemanticFrame,
+    });
+    expect(retainedProjection).not.toContain('"branch"');
+    expect(retainedProjection).not.toContain('"editorText"');
+    expect(retainedProjection.length).toBeLessThan(64 * 1024);
+
+    const reattach = baseline(12);
+    reattach.baseline.rendererGeneration = 8;
+    expect(reduceAuthorityAttach(afterCompactFrame, reattach).transientNavigationOutcomes).toEqual(
+      [],
+    );
   });
 
   it("requires a contiguous attach replay before calling any plane following", () => {
