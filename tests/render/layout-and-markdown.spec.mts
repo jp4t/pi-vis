@@ -272,6 +272,21 @@ test.describe("layout overflow and markdown separators", () => {
         })),
       )
       .toEqual({ start: 0, end: 0 });
+    await expect(prefix.locator(".composer__shell-prefix-caret")).toHaveCount(1);
+
+    const commandBounds = await textarea.boundingBox();
+    if (!commandBounds) throw new Error("shell textarea has no pointer geometry");
+    await page.mouse.click(commandBounds.x + 48, commandBounds.y + commandBounds.height / 2);
+    await expect
+      .poll(() =>
+        textarea.evaluate((element) => {
+          const input = element as HTMLTextAreaElement;
+          return input.selectionStart === input.selectionEnd && input.selectionStart > 2;
+        }),
+      )
+      .toBe(true);
+    await expect(prefix.locator(".composer__shell-prefix-caret")).toHaveCount(0);
+
     await page.mouse.move(prefixBounds.x + 1, prefixBounds.y + prefixBounds.height / 2);
     await page.mouse.down();
     await page.mouse.move(
