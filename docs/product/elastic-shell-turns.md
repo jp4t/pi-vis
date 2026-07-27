@@ -436,7 +436,11 @@ a reusable per-command terminal authority.
 Only Pi's public 0.82.1 surface may be used after the already-approved pinned
 private-registry lookup. The Shell Turn feature does not add another private Pi
 import. The packaged application keeps the SDK host and native PTY dependency
-unpacked, matching the existing host subprocess layout.
+unpacked, matching the existing host subprocess layout. Until the PTY dependency
+is migrated, its exact pinned package receives the repository-owned
+component-aware helper-path patch documented in
+`docs/architecture/runtime-services.md`; the final app must pass both packaged
+host- and main-resolution PTY smokes.
 
 The custom PTY operation closes over a host-owned terminal manager. It receives
 Pi's prefix-resolved command and session cwd, spawns one process group, routes

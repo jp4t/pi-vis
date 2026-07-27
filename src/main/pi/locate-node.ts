@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import path from "node:path";
 import { promisify } from "node:util";
 import { getSubprocessEnv } from "../auth.js";
 
@@ -108,7 +109,9 @@ export type HostExecDecision =
   /** No usable system Node on PATH → stay on Electron's bundled Node. */
   | "electron-node-no-system"
   /** System Node exists but is NOT newer than Electron's → stay on Electron's. */
-  | "electron-node-not-newer";
+  | "electron-node-not-newer"
+  /** Final-app PTY verification explicitly selected its plain-Node runtime. */
+  | "packaged-pty-test";
 
 /**
  * Decide which executable should run the SDK-host subprocess.
@@ -166,10 +169,30 @@ export function chooseHostExecPath(
  * Cached transitively via {@link resolveSystemNode} (one login-shell round-trip
  * per app lifetime).
  */
+export function resolvePackagedPtyHostExecOverride(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  // This pair is intentionally an opt-in E2E seam, not a general runtime
+  // override. The final-app verifier must force plain Node even when its Node
+  // version is equal to or older than Electron's; ordinary launches retain the
+  // strictly-newer production selection policy above.
+  if (env.PIVIS_TEST_PACKAGED_PTY_VERIFY !== "1") return undefined;
+  const execPath = env.PIVIS_TEST_HOST_EXEC_PATH;
+  if (!execPath || !path.isAbsolute(execPath)) {
+    throw new Error(
+      "PIVIS_TEST_PACKAGED_PTY_VERIFY requires an absolute PIVIS_TEST_HOST_EXEC_PATH",
+    );
+  }
+  return execPath;
+}
+
 export async function resolveHostExecPath(): Promise<{
   execPath: string | undefined;
   reason: HostExecDecision;
 }> {
+  const testExecPath = resolvePackagedPtyHostExecOverride();
+  if (testExecPath) return { execPath: testExecPath, reason: "packaged-pty-test" };
+
   const systemNode = await resolveSystemNode();
   const electronNode = process.versions.node; // the Node Electron was built with
   return chooseHostExecPath(systemNode, electronNode);

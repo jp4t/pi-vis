@@ -78,8 +78,9 @@ npm run release -- --patch --generate-notes --dry-run
 ```
 
 The command bumps `package.json`/`package-lock.json`, runs typecheck, lint, unit
-tests, and E2E tests, builds signed/notarized artifacts, verifies codesigning,
-Gatekeeper acceptance, and notarization stapling, commits the version bump, tags
+tests, and E2E tests, builds signed/notarized artifacts, runs the final packaged
+PTY smoke through both the plain-Node SDK-host and Electron-main resolution paths,
+verifies codesigning, Gatekeeper acceptance, and notarization stapling, commits the version bump, tags
 `vX.Y.Z`, pushes the tag, and creates the GitHub Release with the zip and dmg
 assets. Public GitHub Releases require release notes: create and commit a curated notes
 file under `docs/releases/vX.Y.Z.md`, then pass `--notes-file <path>`
@@ -94,7 +95,9 @@ has already passed verification.
 
 The automated suite (`typecheck`, `lint`, `test`, `test:render`, `test:e2e`) is
 run by `npm run release`; its Electron lane includes the isolated, repository-pinned
-Pi 0.82.1 SDK-host compatibility journeys described in `docs/testing.md`. Two
+Pi 0.82.1 SDK-host compatibility journeys described in `docs/testing.md`. The
+subsequent `dist` step also runs `verify:packaged-pty` against the completed app;
+it must not be skipped or replaced by a repository-tree native smoke. Two
 behavior contracts are NOT covered by that suite and MUST be verified manually
 before publishing:
 

@@ -57,6 +57,10 @@ export function pinnedPiBinary(): string {
 
 export interface RealSdkFixtureOptions {
   providerBaseUrl?: string;
+  /** Final packaged executable; omitted for the normal repository-build suite. */
+  executablePath?: string;
+  /** Plain Node forced only for the final packaged PTY host journey. */
+  packagedHostExecPath?: string;
   /** Configure Pi's built-in llama.cpp provider through the production piEnv path. */
   llamaServerBaseUrl?: string;
   extensionFiles?: string[];
@@ -94,7 +98,7 @@ export interface RealSdkLaunch {
 }
 
 export interface RealSdkFixture {
-  readonly piBinary: string;
+  readonly piBinary: string | undefined;
   readonly dirs: RealSdkDirectories;
   readonly providerBaseUrl?: string;
   launch: () => Promise<RealSdkLaunch>;
@@ -198,6 +202,8 @@ function cleanEnvironment(
     "PIVIS_TEST_AUTHORITY_BUFFER_LIMIT",
     "PIVIS_TEST_IPC_INVOCATION_LOG",
     "PIVIS_TEST_REAL_HOST_CONTROL",
+    "PIVIS_TEST_PACKAGED_PTY_VERIFY",
+    "PIVIS_TEST_HOST_EXEC_PATH",
     "LLAMA_BASE_URL",
     "LLAMA_API_KEY",
   ]) {
@@ -226,11 +232,20 @@ function cleanEnvironment(
       ? { PIVIS_TEST_IPC_INVOCATION_LOG: options.ipcInvocationLog }
       : {}),
     ...(options.realHostControl ? { PIVIS_TEST_REAL_HOST_CONTROL: "1" } : {}),
+    ...(options.packagedHostExecPath
+      ? {
+          PIVIS_TEST_PACKAGED_PTY_VERIFY: "1",
+          PIVIS_TEST_HOST_EXEC_PATH: options.packagedHostExecPath,
+        }
+      : {}),
   };
 }
 
 export function createRealSdkFixture(options: RealSdkFixtureOptions = {}): RealSdkFixture {
-  const piBinary = pinnedPiBinary();
+  // A packaged journey must prove that production resolution finds the Pi copy
+  // inside app.asar.unpacked; only repository-build E2E uses the source-tree
+  // settings override.
+  const piBinary = options.executablePath ? undefined : pinnedPiBinary();
   const dirs = makeDirectories(options.workspaceDir);
   copyExtensions(dirs.agent, options.extensionFiles ?? []);
   if (options.providerBaseUrl) {
@@ -257,7 +272,7 @@ export function createRealSdkFixture(options: RealSdkFixtureOptions = {}): RealS
   fs.writeFileSync(
     join(dirs.settings, "settings.json"),
     JSON.stringify({
-      piBinaryPath: piBinary,
+      ...(piBinary ? { piBinaryPath: piBinary } : {}),
       workspaceOrder: [dirs.workspace],
       fonts: {
         display: { sizePx: 14 },
@@ -275,7 +290,8 @@ export function createRealSdkFixture(options: RealSdkFixtureOptions = {}): RealS
     providerBaseUrl: options.providerBaseUrl,
     launch: async () => {
       const app = await launchElectron({
-        args: [APP_ENTRY],
+        ...(options.executablePath ? { executablePath: options.executablePath } : {}),
+        args: options.executablePath ? [] : [APP_ENTRY],
         env: cleanEnvironment(dirs, options),
       });
       const output: string[] = [];

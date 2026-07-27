@@ -25,6 +25,7 @@ import {
   chooseHostExecPath,
   clearNodeLocationCache,
   compareNodeVersions,
+  resolvePackagedPtyHostExecOverride,
   resolveSystemNode,
 } from "./locate-node.js";
 
@@ -138,6 +139,29 @@ describe("compareNodeVersions", () => {
     // "9.0.0" must be LOWER than "10.0.0" — lexicographic compare would get this wrong.
     expect(compareNodeVersions("9.0.0", "10.0.0")).toBe(-1);
     expect(compareNodeVersions("22.5.0", "22.10.0")).toBe(-1);
+  });
+});
+
+describe("resolvePackagedPtyHostExecOverride", () => {
+  it("is inert without the explicit final-app verifier gate", () => {
+    expect(
+      resolvePackagedPtyHostExecOverride({ PIVIS_TEST_HOST_EXEC_PATH: process.execPath }),
+    ).toBeUndefined();
+  });
+
+  it("forces an absolute plain-Node executable only for the packaged PTY verifier", () => {
+    expect(
+      resolvePackagedPtyHostExecOverride({
+        PIVIS_TEST_PACKAGED_PTY_VERIFY: "1",
+        PIVIS_TEST_HOST_EXEC_PATH: process.execPath,
+      }),
+    ).toBe(process.execPath);
+    expect(() =>
+      resolvePackagedPtyHostExecOverride({
+        PIVIS_TEST_PACKAGED_PTY_VERIFY: "1",
+        PIVIS_TEST_HOST_EXEC_PATH: "node",
+      }),
+    ).toThrow("requires an absolute PIVIS_TEST_HOST_EXEC_PATH");
   });
 });
 
