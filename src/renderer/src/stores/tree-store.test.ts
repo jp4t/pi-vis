@@ -465,6 +465,17 @@ describe("tree-store — navigateTo", () => {
       kind: "navigate" as const,
       ...(result ? { result } : {}),
     };
+    const retainedOutcome = {
+      ...outcome,
+      ...(result
+        ? {
+            result: {
+              targetId: result.targetId,
+              ...(result.leafId !== undefined ? { leafId: result.leafId } : {}),
+            },
+          }
+        : {}),
+    };
     useSessionsStore.getState().applyAuthorityPublication({
       sessionId: SESSION_A,
       rendererGeneration: 0,
@@ -479,7 +490,7 @@ describe("tree-store — navigateTo", () => {
         terminalSnapshot: {
           ...prior,
           snapshotSequence: prior.snapshotSequence + 1,
-          recentIntentOutcomes: [...prior.recentIntentOutcomes, outcome],
+          recentIntentOutcomes: [...prior.recentIntentOutcomes, retainedOutcome],
         },
       },
     } as RendererPublication);
@@ -547,6 +558,10 @@ describe("tree-store — navigateTo", () => {
     publishNavigateOutcome(intentId, "completed", { targetId: "u1", leafId: "u1", branch: [] });
     await navigation;
     expect(useTreeStore.getState()).toMatchObject({ open: false, navigating: false, leafId: "u1" });
+    expect(
+      useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+        ?.transientNavigationOutcomes,
+    ).toEqual([]);
   });
 
   it("replaces the transcript from a completed same-owner branch, including an empty branch", async () => {

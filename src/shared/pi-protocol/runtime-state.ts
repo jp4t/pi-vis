@@ -1043,7 +1043,10 @@ export const NavigateIntentResultSchema = z
     editorText: z.string().optional(),
     /** Null when navigation leaves the session at its root. */
     leafId: z.string().nullable().optional(),
-    /** Serializable active root-to-leaf branch, using the tree response entry wire shape. */
+    /**
+     * One-shot live terminal-record payload. Retained semantic snapshots and
+     * operation-journal replay deliberately omit this complete branch.
+     */
     branch: z.array(SessionTreeEntrySchema).optional(),
   })
   .strict();

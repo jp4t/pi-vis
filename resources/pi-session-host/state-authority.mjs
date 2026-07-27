@@ -1470,6 +1470,23 @@ export function createStateAuthority({
     }
   }
 
+  // Navigation's complete in-memory branch is a one-shot presentation payload.
+  // Retaining it in the dispatched-intent ledger or operation journal would
+  // copy the whole branch into every later semantic snapshot. Keep only the
+  // bounded terminal fact there; the live intent_outcome record still carries
+  // the branch exactly once for the renderer that requested navigation.
+  function retainedIntentOutcome(outcome) {
+    const retained = structuredClone(outcome);
+    if (retained?.kind === "navigate" && retained.result) {
+      delete retained.result.branch;
+      // The terminal semantic snapshot already owns the revisioned editor.
+      // Duplicating restored editor text in retained operation evidence serves
+      // no recovery purpose and can be independently large.
+      delete retained.result.editorText;
+    }
+    return retained;
+  }
+
   function predecessorTerminalSnapshot(outcome) {
     const base = structuredClone(transition?.priorSemanticSnapshot);
     if (!base) return undefined;
@@ -1481,7 +1498,7 @@ export function createStateAuthority({
     base.activeIntents = base.activeIntents.filter((item) => item.intentId !== outcome.intentId);
     base.recentIntentOutcomes = [
       ...base.recentIntentOutcomes.filter((item) => item.intentId !== outcome.intentId),
-      structuredClone(outcome),
+      retainedIntentOutcome(outcome),
     ].slice(-Math.max(1, Number(recentOutcomeCapacity) || 1));
     return base;
   }
@@ -1523,7 +1540,8 @@ export function createStateAuthority({
       ...(normalizedResult === undefined ? {} : { result: normalizedResult }),
       ...(error ? { error } : {}),
     };
-    entry.outcome = outcome;
+    const retainedOutcome = retainedIntentOutcome(outcome);
+    entry.outcome = retainedOutcome;
     if (
       entry.observedOperationId &&
       owner.hostInstanceId === hostInstanceId &&
@@ -1548,7 +1566,7 @@ export function createStateAuthority({
       appendOperation({
         journalType: "intent_outcome",
         owner: structuredClone(owner),
-        outcome: structuredClone(outcome),
+        outcome: structuredClone(retainedOutcome),
       });
     }
     // Rebinding changes the child epoch before runtime.newSession/fork return.
