@@ -48,6 +48,7 @@ import {
   type TransitionBatch,
 } from "@shared/pi-protocol/runtime-state.js";
 import { z } from "zod";
+import { appendDiagnostic } from "../diagnostics.js";
 import { TestFaultInjector } from "./test-fault-injector.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -518,6 +519,10 @@ export class SessionHost extends EventEmitter {
       const line = chunk.toString("utf8");
       this.stderrLog.push(line);
       if (this.stderrLog.length > 500) this.stderrLog.shift();
+      appendDiagnostic("session-host", "stderr", line.trimEnd(), {
+        pid: this.proc.pid,
+        sessionFile: this.sessionFile,
+      });
     });
 
     this.proc.on("message", (msg: HostWireMessage) => {
@@ -552,11 +557,21 @@ export class SessionHost extends EventEmitter {
       const diagnostic = this.diagnosticError(
         `Host process exited with code ${code}${signal ? ` (signal ${signal})` : ""}`,
       );
+      appendDiagnostic("session-host", "process-exit", diagnostic, {
+        pid: this.proc.pid,
+        sessionFile: this.sessionFile,
+        exitCode: code,
+        signal,
+      });
       this.rejectAllPending(diagnostic);
       this.emit("exit", code, signal, diagnostic);
     });
 
     this.proc.on("error", (err) => {
+      appendDiagnostic("session-host", "process-error", err, {
+        pid: this.proc.pid,
+        sessionFile: this.sessionFile,
+      });
       if (this.startupReject) {
         this.startupReject(err);
         this.startupReject = null;
@@ -575,6 +590,11 @@ export class SessionHost extends EventEmitter {
     if (canonicalSessionFile) initMsg.canonicalSessionFile = canonicalSessionFile;
     if (validatedRuntimeResumeState) initMsg.runtimeResumeState = validatedRuntimeResumeState;
 
+    appendDiagnostic("session-host", "process-start", undefined, {
+      pid: this.proc.pid,
+      sessionFile: this.sessionFile,
+      workspacePath,
+    });
     this.sendChildMessage(initMsg);
 
     this.armStartupTimer();

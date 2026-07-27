@@ -1150,6 +1150,13 @@ process.on("disconnect", () => {
     });
 });
 
+// Observe fatal exceptions without changing Node's default crash behavior.
+// Main persists this stderr stream to diagnostics.log; the explicit monitor
+// also preserves a trace if an extension installs its own uncaught handler.
+process.on("uncaughtExceptionMonitor", (error, origin) => {
+  console.error(`[pi-session-host] Uncaught exception (${origin}):`, error);
+});
+
 process.on("unhandledRejection", (reason) => {
   console.error("[pi-session-host] Unhandled rejection:", reason);
 });

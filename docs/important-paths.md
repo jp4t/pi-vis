@@ -19,6 +19,8 @@
 | `tests/fixtures/fake-pi.mjs` | Version/update test executable; not a session runtime. |
 | `~/.pi/agent/sessions/` | Persisted session JSONL history. |
 | `~/Library/Application Support/pi-vis/settings.json` | Pi-Vis settings. |
+| `<userData>/diagnostics.log` | Rotating main, renderer, Electron-child, and SDK-host error diagnostics; the previous file is `diagnostics.log.1`. |
+| `<crashDumps>/` | Local Electron Crashpad minidumps for native process crashes; uploads are disabled. |
 | `<userData>/session-search/v1/` | Disposable private SQLite search index; JSONL remains authoritative. |
 | `tests/e2e/electron-launch.mts` | Electron E2E launcher and cleanup integration. |
 | `RELEASING.md` | Packaging, signing, and release instructions. |

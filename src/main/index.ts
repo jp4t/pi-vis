@@ -1,6 +1,19 @@
-import fs from "node:fs";
 import path from "node:path";
-import { BrowserWindow, app, dialog, powerMonitor, screen, session, shell } from "electron";
+import {
+  BrowserWindow,
+  app,
+  crashReporter,
+  dialog,
+  powerMonitor,
+  screen,
+  session,
+  shell,
+} from "electron";
+import {
+  appendDiagnostic,
+  configureDiagnosticLogging,
+  installMainProcessDiagnosticHandlers,
+} from "./diagnostics.js";
 import {
   initIpc,
   refreshBackgroundUpdateChecks,
@@ -51,23 +64,10 @@ function openExternalLink(url: string): void {
 }
 
 function logRendererRecovery(diagnostic: RendererRecoveryDiagnostic): void {
-  console.error(`[Pi-Vis] ${diagnostic.event}`, {
+  appendDiagnostic("renderer", diagnostic.event, diagnostic.message, {
     reason: diagnostic.reason,
     exitCode: diagnostic.exitCode,
-    ...(diagnostic.message ? { message: diagnostic.message } : {}),
   });
-  try {
-    fs.appendFileSync(
-      path.join(app.getPath("userData"), "diagnostics.log"),
-      `[${new Date().toISOString()}] ${diagnostic.event} ${JSON.stringify({
-        reason: diagnostic.reason,
-        exitCode: diagnostic.exitCode,
-        ...(diagnostic.message ? { message: diagnostic.message } : {}),
-      })}\n`,
-    );
-  } catch {
-    // Crash diagnostics are best effort and must never destabilize main.
-  }
 }
 
 // Playwright's Electron launcher passes --remote-debugging-port=0 as a
@@ -90,6 +90,32 @@ if (process.env["PIVIS_TEST_REMOTE_DEBUGGING_PORT"]) {
 if (process.env["PIVIS_SETTINGS_DIR"]) {
   app.setPath("userData", process.env["PIVIS_SETTINGS_DIR"]);
 }
+
+const diagnosticsFile = path.join(app.getPath("userData"), "diagnostics.log");
+configureDiagnosticLogging(diagnosticsFile);
+installMainProcessDiagnosticHandlers();
+appendDiagnostic("main", "process-start", undefined, {
+  version: app.getVersion(),
+  platform: process.platform,
+  arch: process.arch,
+  pid: process.pid,
+  packaged: app.isPackaged,
+});
+try {
+  // Native Electron/Chromium crashes cannot provide a JavaScript stack. Keep
+  // local Crashpad dumps alongside the text diagnostics instead of uploading
+  // them, so hard renderer/GPU/main crashes still leave inspectable evidence.
+  crashReporter.start({ companyName: "Pi-Vis", productName: "Pi-Vis", uploadToServer: false });
+  appendDiagnostic("main", "crash-reporter-started", undefined, {
+    crashDumps: app.getPath("crashDumps"),
+  });
+} catch (error) {
+  console.error("Failed to start the local crash reporter:", error);
+}
+
+app.on("child-process-gone", (_event, details) => {
+  appendDiagnostic("electron-child", "process-gone", details);
+});
 
 // Single-instance lock: prevent multiple main processes. Packaged E2E may run
 // beside a developer instance and uses an isolated userData directory.
@@ -150,6 +176,20 @@ if (!hasSingleInstanceLock) {
         sandbox: false,
         contextIsolation: true,
       },
+    });
+
+    win.webContents.on("console-message", (details) => {
+      if (details.level !== "error") return;
+      appendDiagnostic("renderer", "console.error", details.message, {
+        source: details.sourceId,
+        line: details.lineNumber,
+      });
+    });
+    win.webContents.on("preload-error", (_event, preloadPath, error) => {
+      appendDiagnostic("renderer", "preload-error", error, { preloadPath });
+    });
+    win.on("unresponsive", () => {
+      appendDiagnostic("renderer", "window-unresponsive");
     });
 
     // A renderer refresh abandons generation-fenced UI custody while the SDK
