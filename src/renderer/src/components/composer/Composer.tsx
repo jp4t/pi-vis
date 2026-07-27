@@ -2712,6 +2712,7 @@ export function Composer({ sessionId, suspended = false }: ComposerProps): React
                 onKeyDown={handleKeyDown}
                 onSelect={handleTextareaSelection}
                 onFocus={handleTextareaSelection}
+                onPointerUp={handleTextareaSelection}
                 onBlur={() =>
                   setTextareaSelection((selection) => ({ ...selection, focused: false }))
                 }
