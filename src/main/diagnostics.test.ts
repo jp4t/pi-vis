@@ -1,8 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { DiagnosticLog, formatDiagnosticArguments } from "./diagnostics.js";
+import { inspect } from "node:util";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  DiagnosticLog,
+  createDiagnosticConsoleError,
+  formatDiagnosticArguments,
+} from "./diagnostics.js";
 
 const tempDirs: string[] = [];
 
@@ -49,5 +54,57 @@ describe("DiagnosticLog", () => {
     expect(formatted).toContain("failure:");
     expect(formatted).toContain("Error: broken");
     expect(formatted).toContain("diagnostics.test.ts");
+  });
+
+  it("does not execute custom inspectors while persisting console arguments", () => {
+    const file = tempLogPath();
+    const log = new DiagnosticLog(file);
+    let customInspectCalls = 0;
+    const customInspect = () => {
+      customInspectCalls++;
+      throw new Error("custom inspector must not run");
+    };
+    const detail = {
+      label: "provider failure",
+      [inspect.custom]: customInspect,
+    };
+    const original = vi.fn();
+    const wrapped = createDiagnosticConsoleError(original, (args) => {
+      log.write("main", "console.error", formatDiagnosticArguments(args));
+    });
+
+    expect(() => wrapped("failure:", detail)).not.toThrow();
+
+    expect(customInspectCalls).toBe(0);
+    expect(original).toHaveBeenCalledTimes(1);
+    expect(original.mock.calls[0]?.[0]).toBe("failure:");
+    expect(original.mock.calls[0]?.[1]).toBe(detail);
+    expect(fs.readFileSync(file, "utf8")).toContain("provider failure");
+  });
+
+  it("falls back safely when an Error stack getter throws", () => {
+    const error = new Error("stack unavailable");
+    Object.defineProperty(error, "stack", {
+      configurable: true,
+      get: () => {
+        throw new Error("stack getter exploded");
+      },
+    });
+
+    expect(formatDiagnosticArguments([error])).toBe("Error: stack unavailable");
+  });
+
+  it("always calls the original console error when diagnostic persistence throws", () => {
+    const original = vi.fn();
+    const persist = vi.fn(() => {
+      throw new Error("diagnostics unavailable");
+    });
+    const wrapped = createDiagnosticConsoleError(original, persist);
+    const detail = { message: "still report this" };
+
+    expect(() => wrapped("failure:", detail)).not.toThrow();
+
+    expect(persist).toHaveBeenCalledWith(["failure:", detail]);
+    expect(original).toHaveBeenCalledWith("failure:", detail);
   });
 });

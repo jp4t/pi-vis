@@ -1038,7 +1038,7 @@ describe("setupCommandBridge — target intent dispatch", () => {
   it("records admission separately from terminal outcomes for every child-owned intent kind", async () => {
     let editor = { revision: 0, text: "", attachments: [] };
     const shellController = makeShellController();
-    const { session, runtime, send, dispatchIntent } = setup(undefined, {
+    const { session, runtime, send, dispatchIntent, authority } = setup(undefined, {
       createShellController: vi.fn(() => shellController),
       uiState: makeUiState({
         editorSnapshot: () => editor,
@@ -1108,6 +1108,14 @@ describe("setupCommandBridge — target intent dispatch", () => {
           }),
         ),
       );
+      if (kind === "navigate") {
+        expect(
+          authority.acknowledgeNavigationPresentation(`intent-${kind}`, {
+            hostInstanceId: "test-host",
+            sessionEpoch: 0,
+          }),
+        ).toBe(true);
+      }
     }
 
     expect(session.compact).toHaveBeenCalledWith("brief");
@@ -1867,7 +1875,7 @@ describe("setupCommandBridge — target intent dispatch", () => {
       acceptEditorSubmission: () => false,
       applyEditorPatch,
     };
-    const { dispatchIntent } = setup(
+    const { dispatchIntent, authority } = setup(
       { navigateTree, sessionManager: { getLeafId, getBranch } },
       { sendFrame, uiState },
     );
@@ -1907,6 +1915,12 @@ describe("setupCommandBridge — target intent dispatch", () => {
       text: "restored draft",
       attachments: [],
     });
+    expect(
+      authority.acknowledgeNavigationPresentation("navigate-success", {
+        hostInstanceId: "test-host",
+        sessionEpoch: 0,
+      }),
+    ).toBe(true);
 
     await expect(dispatchIntent(envelope("navigate-cancelled"))).resolves.toMatchObject({
       status: "admitted",

@@ -979,6 +979,14 @@ process.on("message", async (msg) => {
         runtimeAuthority?.acknowledgeRestoration(msg.restorationId);
         break;
 
+      case "navigation_presentation_ack": {
+        const acknowledged =
+          runtimeAuthority?.acknowledgeNavigationPresentation(msg.intentId, msg.expectedOwner) ===
+          true;
+        send({ type: "response", id: msg.id, success: true, data: { acknowledged } });
+        break;
+      }
+
       case "renderer_detached":
         dialogResolver?.cancelAll?.();
         // Keep host-side public pi-tui instances alive across renderer reload.

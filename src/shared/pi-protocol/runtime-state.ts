@@ -1050,6 +1050,24 @@ export const NavigateIntentResultSchema = z
     branch: z.array(SessionTreeEntrySchema).optional(),
   })
   .strict();
+/**
+ * Child-retained presentation evidence for a completed navigation.
+ *
+ * The semantic outcome stays compact, while this full branch remains
+ * attach-recoverable until the renderer acknowledges the exact owner/intent.
+ */
+export const NavigationPresentationSchema = z
+  .object({
+    intentId: NonEmptyIdSchema,
+    owner: RuntimeIdentitySchema,
+    targetId: NonEmptyIdSchema,
+    summarized: z.boolean().optional(),
+    /** Null when navigation leaves the session at its root. */
+    leafId: z.string().nullable(),
+    branch: z.array(SessionTreeEntrySchema),
+  })
+  .strict();
+export type NavigationPresentation = z.infer<typeof NavigationPresentationSchema>;
 export const SetModelIntentResultSchema = z
   .object({ provider: z.string(), modelId: NonEmptyIdSchema })
   .strict();
@@ -1543,6 +1561,12 @@ export const AuthorityAttachBaselineSchema = z
     operationJournal: z.array(OperationJournalRecordSchema),
     /** Unacknowledged review custody is baseline state, not a lossy event. */
     restorations: z.array(QueueRestorationRecordSchema),
+    /**
+     * Full navigation branches retained by the child until an exact-owner
+     * renderer acknowledgement. Optional only for wire compatibility with
+     * older children; current children always emit the field.
+     */
+    pendingNavigationPresentations: z.array(NavigationPresentationSchema).optional(),
     transcript: TranscriptPresentationBaselineSchema,
     extensionUi: ExtensionUiPresentationBaselineSchema,
     panels: z.array(PanelPresentationBaselineSchema),
@@ -1613,6 +1637,28 @@ export const AuthorityAttachBaselineSchema = z
           message: "following panel baseline cursor belongs to a different owner",
         });
       }
+    }
+    const navigationPresentationKeys = new Set<string>();
+    for (const [index, presentation] of (baseline.pendingNavigationPresentations ?? []).entries()) {
+      if (
+        presentation.owner.hostInstanceId !== baseline.owner.hostInstanceId ||
+        presentation.owner.sessionEpoch !== baseline.owner.sessionEpoch
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["pendingNavigationPresentations", index, "owner"],
+          message: "navigation presentation belongs to a different owner",
+        });
+      }
+      const key = `${presentation.owner.hostInstanceId}:${presentation.owner.sessionEpoch}:${presentation.intentId}`;
+      if (navigationPresentationKeys.has(key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["pendingNavigationPresentations", index, "intentId"],
+          message: "navigation presentations must be unique per owner and intent",
+        });
+      }
+      navigationPresentationKeys.add(key);
     }
     let previousJournalSequence = -1;
     for (const [index, journal] of baseline.operationJournal.entries()) {

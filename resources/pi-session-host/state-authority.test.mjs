@@ -3856,6 +3856,32 @@ describe("state authority", () => {
         record.type === "intent_outcome" && record.outcome.intentId === "navigate-success",
     );
     expect(retainedNavigation?.outcome.result).not.toHaveProperty("branch");
+    expect(attachedAfterNavigation.pendingNavigationPresentations).toEqual([
+      {
+        intentId: "navigate-success",
+        owner,
+        targetId: "target-a",
+        summarized: true,
+        leafId: "leaf-a",
+        branch: [{ id: "root-a", type: "message", timestamp: 1 }],
+      },
+    ]);
+    expect((await readyAttach(authority, 2)).pendingNavigationPresentations).toEqual(
+      attachedAfterNavigation.pendingNavigationPresentations,
+    );
+    expect(
+      authority.acknowledgeNavigationPresentation("navigate-success", {
+        hostInstanceId: "host-1",
+        sessionEpoch: 1,
+      }),
+    ).toBe(false);
+    expect(authority.acknowledgeNavigationPresentation("other-intent", owner)).toBe(false);
+    expect((await readyAttach(authority, 3)).pendingNavigationPresentations).toHaveLength(1);
+    expect(authority.acknowledgeNavigationPresentation("navigate-success", owner)).toBe(true);
+    // A lost response is safe to retry: the exact owner/intent tombstone is
+    // idempotent, while unknown IDs above remain false.
+    expect(authority.acknowledgeNavigationPresentation("navigate-success", owner)).toBe(true);
+    expect((await readyAttach(authority, 4)).pendingNavigationPresentations).toEqual([]);
 
     await authority.dispatchIntent(envelope("navigate-cancelled"), async () => ({
       targetId: "target-a",
@@ -3881,6 +3907,293 @@ describe("state authority", () => {
         .map(([frame]) => frame)
         .every((frame) => AuthorityFrameSchema.safeParse(frame).success),
     ).toBe(true);
+    expect((await readyAttach(authority, 5)).pendingNavigationPresentations).toEqual([]);
+  });
+
+  it("captures navigation presentation before drain and fences custody and later intents", async () => {
+    const navigationGate = deferred();
+    const { authority, session } = setup();
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
+    const navigationEnvelope = {
+      intentId: "navigate-before-drain",
+      expectedOwner: owner,
+      intent: { kind: "navigate", targetId: "leaf-after-navigation" },
+    };
+
+    await expect(
+      authority.dispatchIntent(navigationEnvelope, (_intent, executionOwner) => ({
+        deferredOutcome: authority.runNavigation(async () => {
+          await navigationGate.promise;
+          const evidence = {
+            targetId: "leaf-after-navigation",
+            leafId: "leaf-after-navigation",
+            branch: [{ id: "leaf-after-navigation", type: "message", timestamp: 1 }],
+          };
+          authority.captureNavigationPresentation(
+            navigationEnvelope.intentId,
+            executionOwner,
+            evidence,
+          );
+          return evidence;
+        }),
+      })),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() => expect(authority.snapshot().hostFacts.navigation).toBe(true));
+
+    await expect(authority.submit(makeRequest("held-behind-navigation"))).resolves.toMatchObject({
+      disposition: "in_custody",
+    });
+    navigationGate.resolve();
+    await vi.waitFor(async () =>
+      expect((await readyAttach(authority, 6)).pendingNavigationPresentations).toHaveLength(1),
+    );
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    // The exact retry remains a dedupe receipt, while a different mutation is
+    // refused before it can enter the child ledger or call its executor.
+    await expect(authority.dispatchIntent(navigationEnvelope, vi.fn())).resolves.toMatchObject({
+      status: "duplicate",
+    });
+    const laterExecute = vi.fn();
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "later-thinking",
+          expectedOwner: owner,
+          intent: { kind: "setThinking", level: "high" },
+        },
+        laterExecute,
+      ),
+    ).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "later-thinking",
+      reason: "busy",
+    });
+    expect(laterExecute).not.toHaveBeenCalled();
+
+    expect(authority.acknowledgeNavigationPresentation(navigationEnvelope.intentId, owner)).toBe(
+      true,
+    );
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
+  });
+
+  it("fences non-submit mutation dispatch from active navigation before presentation capture", async () => {
+    const navigationGate = deferred();
+    const { authority, session } = setup();
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
+    const navigationEnvelope = {
+      intentId: "navigate-active-fence",
+      expectedOwner: owner,
+      intent: { kind: "navigate", targetId: "leaf-active-fence" },
+    };
+
+    await expect(
+      authority.dispatchIntent(navigationEnvelope, () => ({
+        deferredOutcome: authority.runNavigation(() => navigationGate.promise),
+      })),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() => expect(authority.snapshot().hostFacts.navigation).toBe(true));
+
+    // Exact retries remain deduplicated even while the original navigation is
+    // active, but a distinct mutation is refused before ledger admission.
+    await expect(authority.dispatchIntent(navigationEnvelope, vi.fn())).resolves.toMatchObject({
+      status: "duplicate",
+    });
+    const mutationExecute = vi.fn();
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "thinking-during-active-navigation",
+          expectedOwner: owner,
+          intent: { kind: "setThinking", level: "high" },
+        },
+        mutationExecute,
+      ),
+    ).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "thinking-during-active-navigation",
+      reason: "busy",
+    });
+    expect(mutationExecute).not.toHaveBeenCalled();
+
+    // Submit is the sole exception: its executor re-enters admit(), which
+    // transfers the exact prompt into navigation custody without calling Pi.
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "submit-during-active-navigation",
+          expectedOwner: owner,
+          intent: {
+            kind: "submit",
+            editorRevision: 1,
+            text: "held during active navigation",
+            images: [],
+            requestedMode: "followUp",
+            surface: "composer",
+          },
+        },
+        (intent) =>
+          authority.submit(
+            {
+              intentId: "submit-during-active-navigation",
+              expectedHostId: owner.hostInstanceId,
+              expectedEpoch: owner.sessionEpoch,
+              ...intent,
+            },
+            true,
+          ),
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() => expect(authority.snapshot().hostFacts.custodyCount).toBe(1));
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    navigationGate.resolve({ targetId: "leaf-active-fence", cancelled: true });
+    await vi.waitFor(() => expect(authority.snapshot().hostFacts.navigation).toBe(false));
+  });
+
+  it("rechecks queued mutation execution after navigation captures presentation custody", async () => {
+    const { authority } = setup();
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
+    const navigationEnvelope = {
+      intentId: "navigate-before-queued-executor",
+      expectedOwner: owner,
+      intent: { kind: "navigate", targetId: "leaf-before-queued-executor" },
+    };
+    const queuedExecute = vi.fn(() => ({ level: "high" }));
+
+    // Reserve both receipts in one turn, before the scheduler opens
+    // runNavigation. The second receipt is therefore admitted, but its
+    // serialized executor must recheck the barrier established by the first.
+    const navigationReceipt = authority.dispatchIntent(
+      navigationEnvelope,
+      (_intent, executionOwner) => ({
+        deferredOutcome: authority.runNavigation(async () => {
+          const evidence = {
+            targetId: "leaf-before-queued-executor",
+            leafId: "leaf-before-queued-executor",
+            branch: [{ id: "leaf-before-queued-executor", type: "message", timestamp: 1 }],
+          };
+          authority.captureNavigationPresentation(
+            navigationEnvelope.intentId,
+            executionOwner,
+            evidence,
+          );
+          return evidence;
+        }),
+      }),
+    );
+    const queuedReceipt = authority.dispatchIntent(
+      {
+        intentId: "queued-behind-navigation",
+        expectedOwner: owner,
+        intent: { kind: "setThinking", level: "high" },
+      },
+      queuedExecute,
+    );
+
+    await expect(navigationReceipt).resolves.toMatchObject({ status: "admitted" });
+    await expect(queuedReceipt).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() =>
+      expect(
+        authority
+          .createSemanticFrame()
+          .terminalSnapshot.recentIntentOutcomes.find(
+            (outcome) => outcome.intentId === "queued-behind-navigation",
+          ),
+      ).toMatchObject({
+        kind: "setThinking",
+        state: "rejected",
+        error: "Navigation is active or awaiting presentation acknowledgement",
+      }),
+    );
+    expect(queuedExecute).not.toHaveBeenCalled();
+    expect((await readyAttach(authority, 7)).pendingNavigationPresentations).toHaveLength(1);
+    expect(authority.acknowledgeNavigationPresentation(navigationEnvelope.intentId, owner)).toBe(
+      true,
+    );
+  });
+
+  it("retains compact navigation outcomes while tiny-capacity submit custody is pending", async () => {
+    const { authority, session } = setup({}, { dispatchedIntentCapacity: 2 });
+    const owner = { hostInstanceId: "host-1", sessionEpoch: 0 };
+    const navigationIntentId = "navigate-capacity-escrow";
+
+    await authority.dispatchIntent(
+      {
+        intentId: navigationIntentId,
+        expectedOwner: owner,
+        intent: { kind: "navigate", targetId: "leaf-capacity-escrow" },
+      },
+      async () => ({
+        targetId: "leaf-capacity-escrow",
+        leafId: "leaf-capacity-escrow",
+        branch: [{ id: "leaf-capacity-escrow", type: "message", timestamp: 1 }],
+      }),
+    );
+    await vi.waitFor(async () =>
+      expect((await readyAttach(authority, 8)).pendingNavigationPresentations).toHaveLength(1),
+    );
+
+    const dispatchSubmit = (intentId) =>
+      authority.dispatchIntent(
+        {
+          intentId,
+          expectedOwner: owner,
+          intent: {
+            kind: "submit",
+            editorRevision: 1,
+            text: intentId,
+            images: [],
+            requestedMode: "followUp",
+            surface: "composer",
+          },
+        },
+        (intent) =>
+          authority.submit(
+            {
+              intentId,
+              expectedHostId: owner.hostInstanceId,
+              expectedEpoch: owner.sessionEpoch,
+              ...intent,
+            },
+            true,
+          ),
+      );
+
+    await expect(dispatchSubmit("capacity-custody-one")).resolves.toMatchObject({
+      status: "admitted",
+    });
+    await vi.waitFor(() => expect(authority.snapshot().hostFacts.custodyCount).toBe(1));
+    expect(session.prompt).not.toHaveBeenCalled();
+
+    // The navigation terminal fact is not available for capacity eviction:
+    // rejecting later ingress is safer than orphaning its full branch escrow.
+    await expect(dispatchSubmit("capacity-custody-two")).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "capacity-custody-two",
+      reason: "invalid",
+      invalidReason: "capacity",
+    });
+    const attach = await readyAttach(authority, 9);
+    expect(attach.pendingNavigationPresentations).toMatchObject([
+      { intentId: navigationIntentId, owner },
+    ]);
+    expect(
+      attach.semantic.snapshot.recentIntentOutcomes.find(
+        (outcome) => outcome.intentId === navigationIntentId,
+      ),
+    ).toMatchObject({
+      kind: "navigate",
+      state: "completed",
+      result: {
+        targetId: "leaf-capacity-escrow",
+        leafId: "leaf-capacity-escrow",
+      },
+    });
+    expect(AuthorityAttachBaselineSchema.safeParse(attach).success).toBe(true);
+
+    expect(authority.acknowledgeNavigationPresentation(navigationIntentId, owner)).toBe(true);
+    await vi.waitFor(() => expect(session.prompt).toHaveBeenCalledTimes(1));
   });
 
   it("does not repeat a large navigation branch in later semantic frames", async () => {
@@ -4303,6 +4616,8 @@ describe("state authority", () => {
     authority.observeEvent({ type: "compaction_start" });
     session.isCompacting = false;
     authority.snapshot();
+    navigation.resolve();
+    await navigating;
     await authority.dispatchIntent(
       {
         intentId: "outcome-intent",
@@ -4318,8 +4633,6 @@ describe("state authority", () => {
     );
     authority.settleObservedOperation("bash", bashId, { intentId: "bash-intent" });
     authority.settleCompactionInvocation("compact-intent");
-    navigation.resolve();
-    await navigating;
 
     const first = await readyAttach(authority, 11);
     const second = await readyAttach(authority, 12);

@@ -11,6 +11,9 @@ Load only the documentation relevant to the change.
 - Pi release compatibility, the pinned runtime, or private-Pi import policy:
   `docs/compatibility/pi-0.82.1.md`, `docs/architecture/runtime-services.md`,
   and `docs/decisions/0006-pinned-llama-private-extension-exception.md`.
+- Crash diagnostics, rotating diagnostic logs, renderer/main/SDK-host error capture,
+  or Crashpad: `docs/architecture/processes-and-ipc.md`,
+  `docs/important-paths.md`, and `docs/testing.md`.
 - Tests, fault injection, fixtures, or verification: `docs/testing.md`.
 - Paths and persisted locations: `docs/important-paths.md`.
 - Workspace saved-session search, its worker/index, result context, or search UI: `docs/architecture/session-search.md`, `docs/decisions/0002-workspace-session-search.md`, `docs/architecture/sidebar-shell-layout.md`, and `docs/ui-conventions.md`; also read `docs/testing.md` for corpus and gates.

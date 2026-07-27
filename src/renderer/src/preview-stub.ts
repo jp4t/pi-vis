@@ -1246,7 +1246,11 @@ function outcomeFor(
         result: { trusted: state === "completed", persisted: state === "completed" },
       };
     case "navigate":
-      return { ...base, kind: "navigate", result: { targetId: intent.targetId } };
+      return {
+        ...base,
+        kind: "navigate",
+        result: { targetId: intent.targetId, leafId: intent.targetId, branch: [] },
+      };
     case "setModel":
       return {
         ...base,
@@ -1895,6 +1899,8 @@ const stub = {
       case "session.close":
         return { closed: true };
       case "session.acknowledgeRestoration":
+        return { acknowledged: true };
+      case "session.acknowledgeNavigationPresentation":
         return { acknowledged: true };
       case "session.editorPatch": {
         const patch = req as {

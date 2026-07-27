@@ -10,7 +10,7 @@ import {
   createRendererAuthorityState,
   reduceAuthorityAttach,
   reduceAuthorityPublication,
-  retireTransientNavigationOutcome,
+  retireNavigationPresentation,
 } from "./authority-reducer.js";
 
 const owner: RuntimeIdentity = { hostInstanceId: "host-a", sessionEpoch: 1 };
@@ -135,7 +135,7 @@ describe("authority reducer", () => {
     expect(state.recentRecords).toEqual(frame(2).records);
   });
 
-  it("retains a one-shot navigation branch across later compact frames until consumed", () => {
+  it("retains navigation presentation across compact frames and gap recovery until ack", () => {
     const attached = reduceAuthorityAttach(createRendererAuthorityState(), baseline());
     const navigation = {
       intentId: "navigate-a",
@@ -154,6 +154,13 @@ describe("authority reducer", () => {
           },
         ],
       },
+    };
+    const presentation = {
+      intentId: navigation.intentId,
+      owner,
+      targetId: "target-a",
+      leafId: "leaf-a",
+      branch: navigation.result.branch,
     };
     const navigationFrame = frame(2);
     navigationFrame.records = [{ type: "intent_outcome", outcome: navigation }];
@@ -176,16 +183,16 @@ describe("authority reducer", () => {
     ];
     const afterCompactFrame = reduceAuthorityPublication(withNavigation, compactPublication);
 
-    expect(afterCompactFrame.transientNavigationOutcomes).toEqual([navigation]);
+    expect(afterCompactFrame.pendingNavigationPresentations).toEqual([presentation]);
     expect(
       afterCompactFrame.authoritativeSnapshot?.recentIntentOutcomes[0]?.result,
     ).not.toHaveProperty("branch");
     expect(
-      retireTransientNavigationOutcome(afterCompactFrame, navigation.intentId, successor)
-        .transientNavigationOutcomes,
-    ).toEqual([navigation]);
-    const consumed = retireTransientNavigationOutcome(withNavigation, navigation.intentId, owner);
-    expect(consumed.transientNavigationOutcomes).toEqual([]);
+      retireNavigationPresentation(afterCompactFrame, navigation.intentId, successor)
+        .pendingNavigationPresentations,
+    ).toEqual([presentation]);
+    const consumed = retireNavigationPresentation(withNavigation, navigation.intentId, owner);
+    expect(consumed.pendingNavigationPresentations).toEqual([]);
     const retainedProjection = JSON.stringify({
       records: consumed.recentRecords,
       frame: consumed.lastSemanticFrame,
@@ -194,11 +201,14 @@ describe("authority reducer", () => {
     expect(retainedProjection).not.toContain('"editorText"');
     expect(retainedProjection.length).toBeLessThan(64 * 1024);
 
-    const reattach = baseline(12);
+    const gapped = reduceAuthorityPublication(afterCompactFrame, semanticPublication(14, 4));
+    expect(gapped.semantic.state).toBe("synchronizing");
+    const reattach = baseline(14);
     reattach.baseline.rendererGeneration = 8;
-    expect(reduceAuthorityAttach(afterCompactFrame, reattach).transientNavigationOutcomes).toEqual(
-      [],
-    );
+    reattach.baseline.pendingNavigationPresentations = [presentation];
+    expect(reduceAuthorityAttach(gapped, reattach).pendingNavigationPresentations).toEqual([
+      presentation,
+    ]);
   });
 
   it("requires a contiguous attach replay before calling any plane following", () => {

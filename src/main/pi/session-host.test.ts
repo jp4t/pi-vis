@@ -180,6 +180,23 @@ describe("SessionHost", () => {
     });
   });
 
+  it("round-trips exact-owner navigation presentation acknowledgement", async () => {
+    fake.emitReady("0.82.1");
+    await host.waitForReady();
+    const owner = { hostInstanceId: fake.hostInstanceId, sessionEpoch: fake.sessionEpoch };
+
+    await expect(host.acknowledgeNavigationPresentation("navigate-a", owner)).resolves.toBe(true);
+    await expect(
+      host.acknowledgeNavigationPresentation("navigate-a", {
+        ...owner,
+        sessionEpoch: owner.sessionEpoch + 1,
+      }),
+    ).resolves.toBe(false);
+    expect(
+      fake.sent.filter((message) => message.type === "navigation_presentation_ack"),
+    ).toHaveLength(2);
+  });
+
   it("rejects a pending authority attach immediately when transport fencing starts", async () => {
     fake.emitReady("0.80.6");
     await host.waitForReady();

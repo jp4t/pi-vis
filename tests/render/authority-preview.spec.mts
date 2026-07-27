@@ -136,3 +136,23 @@ test("preview implements owner-bound query/intent frames without legacy commands
   });
   expect(result.legacy).toBeUndefined();
 });
+
+test("preview completes sequential conversation-tree navigations", async ({ page }) => {
+  await page.goto("/");
+  const composer = page.locator(".composer__textarea");
+  await expect(composer).toBeEnabled({ timeout: 20_000 });
+
+  const navigateTo = async (rowText: string): Promise<void> => {
+    await composer.fill("/tree");
+    await composer.press("Enter");
+    const tree = page.locator(".tree-viewer");
+    await expect(tree).toBeVisible();
+    const row = tree.locator(".tree-viewer__row").filter({ hasText: rowText });
+    await expect(row).toBeVisible();
+    await row.dblclick();
+    await expect(tree).toBeHidden();
+  };
+
+  await navigateTo("Fix the config loader.");
+  await navigateTo("Let me try relative paths instead.");
+});

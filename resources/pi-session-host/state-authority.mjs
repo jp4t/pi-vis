@@ -122,6 +122,11 @@ export function createStateAuthority({
   const custody = [];
   const activeIntents = new Map();
   const restorations = new Map();
+  // Completed navigation branches are presentation custody, not semantic
+  // history. Keep them child-owned until the exact renderer owner/intent
+  // acknowledges successful transcript conversion and installation.
+  const pendingNavigationPresentations = new Map();
+  const acknowledgedNavigationPresentations = new Set();
   // Pi's public prompt preflight can await extension input while an existing
   // turn is streaming. Bare Escape advances this generation synchronously;
   // any prompt that has not reached its successful preflight callback is
@@ -758,10 +763,20 @@ export function createStateAuthority({
     };
   }
 
+  function dispatchedIntentCanBeRetired(key, entry) {
+    return (
+      (entry.outcome || entry.admissionRejected) &&
+      // Renderer reconciliation requires the compact terminal navigation fact
+      // alongside its full presentation escrow. Keep both halves until the
+      // exact owner/intent acknowledgement retires the branch.
+      !pendingNavigationPresentations.has(key)
+    );
+  }
+
   function pruneDispatchedIntents() {
     const capacity = Math.max(1, Number(dispatchedIntentCapacity) || 1);
     const terminal = [...dispatchedIntents.entries()]
-      .filter(([, entry]) => entry.outcome || entry.admissionRejected)
+      .filter(([key, entry]) => dispatchedIntentCanBeRetired(key, entry))
       .sort(
         ([, a], [, b]) =>
           (a.recordSequence ?? Number.POSITIVE_INFINITY) -
@@ -1470,21 +1485,89 @@ export function createStateAuthority({
     }
   }
 
-  // Navigation's complete in-memory branch is a one-shot presentation payload.
-  // Retaining it in the dispatched-intent ledger or operation journal would
-  // copy the whole branch into every later semantic snapshot. Keep only the
-  // bounded terminal fact there; the live intent_outcome record still carries
-  // the branch exactly once for the renderer that requested navigation.
+  // Retaining a complete navigation branch in the dispatched-intent ledger or
+  // operation journal would copy it into every later semantic snapshot. Keep
+  // only the bounded terminal fact there; the child-owned presentation escrow
+  // carries the branch across attach until an exact acknowledgement.
   function retainedIntentOutcome(outcome) {
-    const retained = structuredClone(outcome);
-    if (retained?.kind === "navigate" && retained.result) {
-      delete retained.result.branch;
+    if (outcome?.kind === "navigate" && outcome.result) {
+      // Remove large fields before cloning so compact retention never creates
+      // a second temporary copy of the complete branch.
+      const compact = { ...outcome, result: { ...outcome.result } };
+      delete compact.result.branch;
       // The terminal semantic snapshot already owns the revisioned editor.
       // Duplicating restored editor text in retained operation evidence serves
       // no recovery purpose and can be independently large.
-      delete retained.result.editorText;
+      delete compact.result.editorText;
+      return structuredClone(compact);
     }
-    return retained;
+    return structuredClone(outcome);
+  }
+
+  function captureNavigationPresentation(intentId, owner, result, ready = false) {
+    const branch = normalizedTreeBranch(result?.branch);
+    if (
+      typeof intentId !== "string" ||
+      owner?.hostInstanceId !== hostInstanceId ||
+      owner?.sessionEpoch !== sessionEpoch ||
+      !branch ||
+      (typeof result?.leafId !== "string" && result?.leafId !== null) ||
+      typeof result?.targetId !== "string" ||
+      result.targetId.length === 0
+    ) {
+      return false;
+    }
+    const key = intentOwnerKey(owner, intentId);
+    acknowledgedNavigationPresentations.delete(key);
+    pendingNavigationPresentations.set(key, {
+      intentId,
+      owner: structuredClone(owner),
+      targetId: result.targetId,
+      ...(typeof result.summarized === "boolean" ? { summarized: result.summarized } : {}),
+      leafId: result.leafId,
+      branch,
+      // Provisional custody closes the post-navigation drain race, but attach
+      // exposes it only after the terminal semantic outcome is committed.
+      ready,
+    });
+    noteMutation();
+    return true;
+  }
+
+  function acknowledgeNavigationPresentation(intentId, expectedOwner) {
+    if (
+      typeof intentId !== "string" ||
+      expectedOwner?.hostInstanceId !== hostInstanceId ||
+      expectedOwner?.sessionEpoch !== sessionEpoch
+    ) {
+      return false;
+    }
+    const key = intentOwnerKey(expectedOwner, intentId);
+    const presentation = pendingNavigationPresentations.get(key);
+    if (!presentation) return acknowledgedNavigationPresentations.has(key);
+    if (
+      presentation.owner.hostInstanceId !== expectedOwner.hostInstanceId ||
+      presentation.owner.sessionEpoch !== expectedOwner.sessionEpoch ||
+      presentation.ready !== true
+    ) {
+      return false;
+    }
+    pendingNavigationPresentations.delete(key);
+    acknowledgedNavigationPresentations.add(key);
+    while (acknowledgedNavigationPresentations.size > 128) {
+      acknowledgedNavigationPresentations.delete(
+        acknowledgedNavigationPresentations.values().next().value,
+      );
+    }
+    noteMutation();
+    scheduleCustodyDrain();
+    return true;
+  }
+
+  function navigationMutationBlocked(intent) {
+    return (
+      intent?.kind !== "submit" && (navigationDepth > 0 || pendingNavigationPresentations.size > 0)
+    );
   }
 
   function predecessorTerminalSnapshot(outcome) {
@@ -1540,6 +1623,32 @@ export function createStateAuthority({
       ...(normalizedResult === undefined ? {} : { result: normalizedResult }),
       ...(error ? { error } : {}),
     };
+    if (
+      kind === "navigate" &&
+      state === "completed" &&
+      Array.isArray(normalizedResult?.branch) &&
+      (typeof normalizedResult.leafId === "string" || normalizedResult.leafId === null) &&
+      owner.hostInstanceId === hostInstanceId &&
+      owner.sessionEpoch === sessionEpoch
+    ) {
+      const provisional = pendingNavigationPresentations.get(key);
+      if (
+        provisional &&
+        provisional.targetId === normalizedResult.targetId &&
+        provisional.leafId === normalizedResult.leafId
+      ) {
+        pendingNavigationPresentations.set(key, {
+          ...provisional,
+          ...(typeof normalizedResult.summarized === "boolean"
+            ? { summarized: normalizedResult.summarized }
+            : {}),
+          ready: true,
+        });
+        noteMutation();
+      } else {
+        captureNavigationPresentation(intentId, owner, normalizedResult, true);
+      }
+    }
     const retainedOutcome = retainedIntentOutcome(outcome);
     entry.outcome = retainedOutcome;
     if (
@@ -2051,7 +2160,10 @@ export function createStateAuthority({
       });
     }
 
-    if ((compactionBarrierOpen() || navigationDepth > 0) && !fromCustody) {
+    if (
+      (compactionBarrierOpen() || navigationDepth > 0 || pendingNavigationPresentations.size > 0) &&
+      !fromCustody
+    ) {
       const custodyId = crypto.randomUUID();
       custody.push({
         custodyId,
@@ -2445,6 +2557,7 @@ export function createStateAuthority({
       activeIntents.size > 0 ||
       custody.length > 0 ||
       promptFence !== null ||
+      pendingNavigationPresentations.size > 0 ||
       compactionBarrierOpen() ||
       navigationDepth > 0 ||
       activeOperation("command") !== undefined ||
@@ -2532,6 +2645,13 @@ export function createStateAuthority({
       }
       return Promise.resolve({ status: "duplicate", intentId, owner: structuredClone(owner) });
     }
+    // Submission execution immediately re-enters admit(), which transfers it
+    // into navigation custody without calling Pi. Every other mutation is
+    // refused from the moment navigation starts until presentation
+    // acknowledgement.
+    if (navigationMutationBlocked(intent)) {
+      return Promise.resolve({ status: "not_admitted", intentId, reason: "busy" });
+    }
     if (intent.kind === "runBash" && !shellIntentMatchesEditor(intent)) {
       return Promise.resolve({ status: "not_admitted", intentId, reason: "stale_editor" });
     }
@@ -2547,9 +2667,13 @@ export function createStateAuthority({
     // succeed, so a pre-start child failure cannot clear the editor draft.
     const intentCapacity = Math.max(1, Number(dispatchedIntentCapacity) || 1);
     // Make room only by retiring already-settled receipts; unsettled work is
-    // never silently forgotten merely to admit another intent.
+    // never silently forgotten merely to admit another intent. A completed
+    // navigation with presentation custody is likewise non-retirable because
+    // attach reconciliation still needs its compact terminal fact.
     const terminal = [...dispatchedIntents.entries()]
-      .filter(([, entry]) => entry.outcome || entry.admissionRejected)
+      .filter(([terminalKey, terminalEntry]) =>
+        dispatchedIntentCanBeRetired(terminalKey, terminalEntry),
+      )
       .sort(
         ([, a], [, b]) =>
           (a.recordSequence ?? Number.POSITIVE_INFINITY) -
@@ -2723,6 +2847,16 @@ export function createStateAuthority({
           });
           return;
         }
+        // The receipt can be reserved before an earlier navigation job opens
+        // its barrier. Recheck in the serialized execution slot so that job
+        // cannot cross either active navigation or post-navigation
+        // presentation custody after admission.
+        if (navigationMutationBlocked(intent)) {
+          settleDispatchedIntent(intentId, owner, intent.kind, "rejected", {
+            message: "Navigation is active or awaiting presentation acknowledgement",
+          });
+          return;
+        }
         if (intent.kind === "invokeCommand") {
           entry.observedOperationId = observedOperation("command", "invoking", {
             intentId,
@@ -2793,6 +2927,7 @@ export function createStateAuthority({
     if (
       compactionBarrierOpen() ||
       navigationDepth > 0 ||
+      pendingNavigationPresentations.size > 0 ||
       hasCancelledAdmissionFence() ||
       custody.length === 0
     ) {
@@ -2803,6 +2938,7 @@ export function createStateAuthority({
       custody.length > 0 &&
       !compactionBarrierOpen() &&
       navigationDepth === 0 &&
+      pendingNavigationPresentations.size === 0 &&
       !hasCancelledAdmissionFence()
     ) {
       if (!session.isStreaming && promptFence) {
@@ -2846,6 +2982,7 @@ export function createStateAuthority({
     if (
       compactionBarrierOpen() ||
       navigationDepth > 0 ||
+      pendingNavigationPresentations.size > 0 ||
       hasCancelledAdmissionFence() ||
       custody.length === 0
     ) {
@@ -3861,6 +3998,8 @@ export function createStateAuthority({
     navigationDepth = 0;
     directDeliveryIntentId = null;
     activeObservedOperations.clear();
+    pendingNavigationPresentations.clear();
+    acknowledgedNavigationPresentations.clear();
     resetQueueIdentity();
   }
 
@@ -3949,6 +4088,7 @@ export function createStateAuthority({
       custody.length > 0 ||
       promptFence !== null ||
       navigationDepth > 0 ||
+      pendingNavigationPresentations.size > 0 ||
       compactionBarrierOpen();
     const pendingOtherIntent = [...dispatchedIntents.values()].some(
       (entry) => !entry.outcome && !entry.admissionRejected && entry.kind !== kind,
@@ -4085,6 +4225,19 @@ export function createStateAuthority({
           // it. Attach therefore carries the durable child-owned custody, even
           // when its original frame was emitted while no renderer was attached.
           restorations: [...restorations.values()].map((item) => structuredClone(item)),
+          // A successful navigation owns its exact post-navigation branch
+          // until the renderer confirms conversion and transcript install.
+          pendingNavigationPresentations: [...pendingNavigationPresentations.values()]
+            .filter(
+              (item) =>
+                item.ready === true &&
+                item.owner.hostInstanceId === owner.hostInstanceId &&
+                item.owner.sessionEpoch === owner.sessionEpoch,
+            )
+            .map((item) => {
+              const { ready: _ready, ...presentation } = item;
+              return structuredClone(presentation);
+            }),
           transcript: {
             sync: { state: "following", cursor: transcriptCursor },
             persistedHistoryCursor: transcriptPresentation.persistedHistoryCursor,
@@ -4197,7 +4350,8 @@ export function createStateAuthority({
         fatalAdmissionFence ||
         activeIntents.size > 0 ||
         custody.length > 0 ||
-        promptFence !== null
+        promptFence !== null ||
+        pendingNavigationPresentations.size > 0
       );
     },
     canReplaceFromIntent(intentId) {
@@ -4209,6 +4363,7 @@ export function createStateAuthority({
         custody.length === 0 &&
         submitting <= 1 &&
         unresolvedAdmissions === 0 &&
+        pendingNavigationPresentations.size === 0 &&
         !compactionBarrierOpen() &&
         navigationDepth === 0 &&
         !session.isCompacting &&
@@ -4243,6 +4398,7 @@ export function createStateAuthority({
     failureEscrow,
     requestEscape,
     runNavigation,
+    captureNavigationPresentation,
     beginTransition,
     adoptSession,
     commitTransition,
@@ -4262,6 +4418,7 @@ export function createStateAuthority({
     acknowledgeRestoration(id) {
       if (restorations.delete(id)) noteMutation();
     },
+    acknowledgeNavigationPresentation,
     stop() {
       stopped = true;
     },

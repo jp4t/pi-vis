@@ -68,6 +68,8 @@ beforeEach(() => {
     summarizeOnSwitch: false,
     foldedIds: new Set<string>(),
     navigating: false,
+    viewerGeneration: 0,
+    navigationGeneration: 0,
   });
   useSessionsStore.setState({
     workspaces: new Map(),
@@ -291,79 +293,120 @@ describe("tree-store — open / refresh", () => {
     expect(useTreeStore.getState().phase).toBe("ready");
   });
 
-  it("ignores a deferred predecessor response after successor replacement", async () => {
-    let resolveTree: (value: unknown) => void = () => {};
-    const deferredTree = new Promise<unknown>((resolve) => {
-      resolveTree = resolve;
+  it("ignores an old refresh after closing and reopening the same session viewer", async () => {
+    let resolveFirstTree!: (value: unknown) => void;
+    const firstTree = new Promise<unknown>((resolve) => {
+      resolveFirstTree = resolve;
     });
-    nextResponse = async (channel) =>
-      channel === "child.transport" ? deferredTree : { success: false };
+    let treeRequests = 0;
+    nextResponse = async (channel) => {
+      if (channel !== "child.transport") return { success: false };
+      treeRequests++;
+      if (treeRequests === 1) return firstTree;
+      return { success: true, data: { nodes: [], leafId: "reopened-leaf" } };
+    };
 
-    const opening = useTreeStore.getState().openTreeForSession(SESSION_A);
-    await Promise.resolve();
-
-    const owner = { hostInstanceId: "tree-host-successor", sessionEpoch: 2 };
-    const cursor = { ...owner, transportSequence: 1, snapshotSequence: 1 };
-    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, {
-      status: "ready",
-      baseline: {
-        sessionId: SESSION_A,
-        rendererGeneration: 0,
-        owner,
-        semantic: {
-          sync: { state: "following", cursor },
-          snapshot: {
-            owner,
-            snapshotSequence: 1,
-            capturedAt: Date.now(),
-            sdk: {
-              isStreaming: false,
-              isIdle: true,
-              isCompacting: false,
-              isRetrying: false,
-              retryAttempt: 0,
-              isBashRunning: false,
-            },
-            activity: {},
-            queues: { steering: [], followUp: [], steeringIntentIds: [], followUpIntentIds: [] },
-            custody: [],
-            editor: { revision: 0, text: "", attachments: [] },
-            activeIntents: [],
-            recentIntentOutcomes: [],
-            recentObservedOperations: [],
-            operationJournalLowWatermark: 0,
-            operationJournalHighWatermark: 0,
-            operationJournalTruncated: false,
-            model: null,
-            thinkingLevel: "off",
-            catalog: { notifications: [], statuses: {}, widgets: {}, capabilityDiagnostics: [] },
-          },
-        },
-        operationJournal: [],
-        transcript: {
-          sync: { state: "following", cursor },
-          persistedHistoryCursor: null,
-          liveTailCursor: null,
-          overlapBoundary: null,
-        },
-        extensionUi: {
-          sync: { state: "following", cursor },
-          notifications: [],
-          statuses: {},
-          widgets: {},
-          dialogs: [],
-        },
-        panels: [],
-        restorations: [],
-        publicationHighWatermark: 1,
-      },
-      replay: [],
+    const firstOpening = useTreeStore.getState().openTreeForSession(SESSION_A);
+    await vi.waitFor(() => expect(treeRequests).toBe(1));
+    useTreeStore.getState().closeViewer();
+    await useTreeStore.getState().openTreeForSession(SESSION_A);
+    expect(useTreeStore.getState()).toMatchObject({
+      open: true,
+      phase: "ready",
+      leafId: "reopened-leaf",
     });
 
-    resolveTree({ success: true, data: { nodes: [], leafId: null } });
-    await opening;
-    expect(useTreeStore.getState().phase).toBe("loading");
+    resolveFirstTree({ success: true, data: { nodes: [], leafId: "obsolete-leaf" } });
+    await firstOpening;
+    expect(useTreeStore.getState()).toMatchObject({
+      open: true,
+      phase: "ready",
+      leafId: "reopened-leaf",
+    });
   });
+
+  it.each(["resolved", "rejected"] as const)(
+    "ignores a deferred predecessor %s response after successor replacement",
+    async (settlement) => {
+      let resolveTree: (value: unknown) => void = () => {};
+      let rejectTree: (reason: Error) => void = () => {};
+      const deferredTree = new Promise<unknown>((resolve, reject) => {
+        resolveTree = resolve;
+        rejectTree = reject;
+      });
+      nextResponse = async (channel) =>
+        channel === "child.transport" ? deferredTree : { success: false };
+
+      const opening = useTreeStore.getState().openTreeForSession(SESSION_A);
+      await Promise.resolve();
+
+      const owner = { hostInstanceId: "tree-host-successor", sessionEpoch: 2 };
+      const cursor = { ...owner, transportSequence: 1, snapshotSequence: 1 };
+      useSessionsStore.getState().applyAuthorityAttach(SESSION_A, {
+        status: "ready",
+        baseline: {
+          sessionId: SESSION_A,
+          rendererGeneration: 0,
+          owner,
+          semantic: {
+            sync: { state: "following", cursor },
+            snapshot: {
+              owner,
+              snapshotSequence: 1,
+              capturedAt: Date.now(),
+              sdk: {
+                isStreaming: false,
+                isIdle: true,
+                isCompacting: false,
+                isRetrying: false,
+                retryAttempt: 0,
+                isBashRunning: false,
+              },
+              activity: {},
+              queues: { steering: [], followUp: [], steeringIntentIds: [], followUpIntentIds: [] },
+              custody: [],
+              editor: { revision: 0, text: "", attachments: [] },
+              activeIntents: [],
+              recentIntentOutcomes: [],
+              recentObservedOperations: [],
+              operationJournalLowWatermark: 0,
+              operationJournalHighWatermark: 0,
+              operationJournalTruncated: false,
+              model: null,
+              thinkingLevel: "off",
+              catalog: { notifications: [], statuses: {}, widgets: {}, capabilityDiagnostics: [] },
+            },
+          },
+          operationJournal: [],
+          transcript: {
+            sync: { state: "following", cursor },
+            persistedHistoryCursor: null,
+            liveTailCursor: null,
+            overlapBoundary: null,
+          },
+          extensionUi: {
+            sync: { state: "following", cursor },
+            notifications: [],
+            statuses: {},
+            widgets: {},
+            dialogs: [],
+          },
+          panels: [],
+          restorations: [],
+          publicationHighWatermark: 1,
+        },
+        replay: [],
+      });
+
+      if (settlement === "resolved") {
+        resolveTree({ success: true, data: { nodes: [], leafId: null } });
+      } else {
+        rejectTree(new Error("predecessor unavailable"));
+      }
+      await opening;
+      expect(useTreeStore.getState().phase).toBe("loading");
+    },
+  );
 
   it("get_tree capability rejection → phase 'unsupported' with the friendly message (review S2)", async () => {
     // An installed SDK without the public tree capability may return an
@@ -550,6 +593,9 @@ describe("tree-store — navigateTo", () => {
         };
       }
       if (channel === "session.transcriptForEntries") return [];
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
       return { success: false };
     };
     const { navigation, intentId } = await startNavigate();
@@ -560,8 +606,50 @@ describe("tree-store — navigateTo", () => {
     expect(useTreeStore.getState()).toMatchObject({ open: false, navigating: false, leafId: "u1" });
     expect(
       useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
-        ?.transientNavigationOutcomes,
+        ?.pendingNavigationPresentations,
     ).toEqual([]);
+  });
+
+  it("continues navigation presentation after the tree overlay closes", async () => {
+    useSessionsStore
+      .getState()
+      .seedHistory(SESSION_A, [
+        { id: "old", type: "user", data: { role: "user", content: "old branch" } },
+      ]);
+    nextResponse = async (channel) => {
+      if (channel === "session.dispatchIntent") {
+        return {
+          status: "admitted",
+          intentId: "ignored",
+          owner: { hostInstanceId: "tree-host", sessionEpoch: 1 },
+        };
+      }
+      if (channel === "session.transcriptForEntries") return [];
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      return { success: false };
+    };
+    const { navigation, intentId } = await startNavigate();
+    useTreeStore.getState().closeViewer();
+    publishNavigateOutcome(intentId, "completed", {
+      targetId: "u1",
+      leafId: "u1",
+      branch: [],
+    });
+
+    await navigation;
+    await vi.waitFor(() =>
+      expect(
+        useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+          ?.pendingNavigationPresentations,
+      ).toEqual([]),
+    );
+    expect(useSessionsStore.getState().sessions.get(SESSION_A)?.transcript.blocks).toEqual([]);
+    expect(useTreeStore.getState()).toMatchObject({ open: false, navigating: false });
+    expect(calls.some((call) => call.channel === "session.acknowledgeNavigationPresentation")).toBe(
+      true,
+    );
   });
 
   it("replaces the transcript from a completed same-owner branch, including an empty branch", async () => {
@@ -582,6 +670,9 @@ describe("tree-store — navigateTo", () => {
         };
       }
       if (channel === "session.transcriptForEntries") return [];
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
       return { success: false };
     };
     const { navigation, intentId } = await startNavigate();
@@ -590,8 +681,64 @@ describe("tree-store — navigateTo", () => {
 
     const session = useSessionsStore.getState().sessions.get(SESSION_A);
     expect(session?.transcript.archivedBlockCount).toBe(0);
-    expect(session?.historyGeneration).toBe(historyGeneration);
+    expect(session?.historyGeneration).toBe((historyGeneration ?? 0) + 1);
     expect(useTreeStore.getState()).toMatchObject({ open: false, leafId: null, selectedId: null });
+  });
+
+  it("does not let an old conversion close a reopened viewer for the same session", async () => {
+    let resolveConversion!: (history: unknown[]) => void;
+    const conversion = new Promise<unknown[]>((resolve) => {
+      resolveConversion = resolve;
+    });
+    nextResponse = async (channel, payload) => {
+      if (channel === "session.dispatchIntent") {
+        return {
+          status: "admitted",
+          intentId: "ignored",
+          owner: { hostInstanceId: "tree-host", sessionEpoch: 1 },
+        };
+      }
+      if (channel === "session.transcriptForEntries") return conversion;
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      const command = (payload as { command?: { type?: string } }).command;
+      if (channel === "child.transport" && command?.type === "get_tree") {
+        return { success: true, data: { nodes: [], leafId: "reopened-leaf" } };
+      }
+      return { success: false };
+    };
+    const { navigation, intentId } = await startNavigate();
+    publishNavigateOutcome(intentId, "completed", {
+      targetId: "u1",
+      leafId: "u1",
+      branch: [],
+    });
+    await vi.waitFor(() =>
+      expect(calls.some((call) => call.channel === "session.transcriptForEntries")).toBe(true),
+    );
+
+    useTreeStore.getState().closeViewer();
+    await useTreeStore.getState().openTreeForSession(SESSION_A);
+    expect(useTreeStore.getState()).toMatchObject({
+      open: true,
+      phase: "ready",
+      leafId: "reopened-leaf",
+    });
+
+    resolveConversion([]);
+    await navigation;
+    await vi.waitFor(() =>
+      expect(
+        useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+          ?.pendingNavigationPresentations,
+      ).toEqual([]),
+    );
+    expect(useTreeStore.getState()).toMatchObject({
+      open: true,
+      phase: "ready",
+      leafId: "reopened-leaf",
+    });
   });
 
   it.each(["cancelled", "failed", "outcome_unknown"] as const)(
@@ -636,6 +783,9 @@ describe("tree-store — navigateTo", () => {
         };
       }
       if (channel === "session.transcriptForEntries") return [];
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
       return { success: false };
     };
     const { navigation, intentId } = await startNavigate();
@@ -708,6 +858,50 @@ describe("tree-store — setLabel", () => {
     await useTreeStore.getState().setLabel("u1", undefined);
 
     expect((received as { label?: unknown } | null)?.label).toBeUndefined();
+  });
+
+  it("does not refresh a reopened same-session viewer from an old label request", async () => {
+    nextResponse = async (channel) =>
+      channel === "child.transport"
+        ? { success: true, data: { nodes: [], leafId: "initial-leaf" } }
+        : { success: false };
+    await useTreeStore.getState().openTreeForSession(SESSION_A);
+
+    let resolveLabel!: (value: unknown) => void;
+    const labelReceipt = new Promise<unknown>((resolve) => {
+      resolveLabel = resolve;
+    });
+    let reopenedTreeRequests = 0;
+    nextResponse = async (channel) => {
+      if (channel === "session.dispatchIntent") return labelReceipt;
+      if (channel === "child.transport") {
+        reopenedTreeRequests++;
+        return { success: true, data: { nodes: [], leafId: "reopened-leaf" } };
+      }
+      return { success: false };
+    };
+
+    const labeling = useTreeStore.getState().setLabel("u1", "checkpoint");
+    await vi.waitFor(() =>
+      expect(calls.some((call) => call.channel === "session.dispatchIntent")).toBe(true),
+    );
+    useTreeStore.getState().closeViewer();
+    await useTreeStore.getState().openTreeForSession(SESSION_A);
+    expect(reopenedTreeRequests).toBe(1);
+
+    resolveLabel({
+      status: "admitted",
+      intentId: "stale-label",
+      owner: { hostInstanceId: "tree-host", sessionEpoch: 1 },
+    });
+    await labeling;
+
+    expect(reopenedTreeRequests).toBe(1);
+    expect(useTreeStore.getState()).toMatchObject({
+      open: true,
+      phase: "ready",
+      leafId: "reopened-leaf",
+    });
   });
 });
 

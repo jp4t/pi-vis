@@ -7,7 +7,6 @@
 // installed pi lacks session.sessionManager.getTree() / session.navigateTree().
 
 import type { SessionId } from "@shared/ids.js";
-import type { TranscriptBlock } from "@shared/ipc-contract.js";
 import type { FlatTreeNode, GetTreeData, SessionTreeNode } from "@shared/pi-protocol/responses.js";
 import type {
   AuthorityCursor,
@@ -60,19 +59,34 @@ function findNavigateOutcome(
     outcome.intentId === intentId &&
     outcome.owner.hostInstanceId === owner.hostInstanceId &&
     outcome.owner.sessionEpoch === owner.sessionEpoch;
-  // A complete branch crosses authority only in the terminal outcome record;
-  // retained snapshots intentionally keep bounded navigation metadata. Prefer
-  // the renderer-local one-shot payload, then fall back to terminal metadata
-  // for cancellation/failure outcomes that require no transcript replacement.
+  // Terminal semantic metadata settles the viewer request. The complete branch
+  // is separate child-owned presentation custody reconciled by sessions-store.
+  return projection?.authoritativeSnapshot?.recentIntentOutcomes.find(matches);
+}
+
+interface TreeViewerOwnership {
+  sessionId: SessionId;
+  viewerGeneration: number;
+}
+
+interface TreeViewOwnership extends TreeViewerOwnership {
+  navigationGeneration: number;
+}
+
+function treeViewerOwns(ownership: TreeViewerOwnership): boolean {
+  const tree = useTreeStore.getState();
   return (
-    projection?.transientNavigationOutcomes.find(matches) ??
-    projection?.authoritativeSnapshot?.recentIntentOutcomes.find(matches)
+    tree.open &&
+    tree.sessionId === ownership.sessionId &&
+    tree.viewerGeneration === ownership.viewerGeneration
   );
 }
 
-function treeViewOwns(sessionId: SessionId): boolean {
-  const tree = useTreeStore.getState();
-  return tree.open && tree.sessionId === sessionId;
+function treeViewOwns(ownership: TreeViewOwnership): boolean {
+  return (
+    treeViewerOwns(ownership) &&
+    useTreeStore.getState().navigationGeneration === ownership.navigationGeneration
+  );
 }
 
 /** Wait for framed terminal evidence; dispatch receipts only prove admission. */
@@ -80,8 +94,9 @@ function waitForNavigateOutcome(
   sessionId: SessionId,
   intentId: string,
   observation: TreeObservation,
+  ownership: TreeViewOwnership,
 ): Promise<NavigateOutcome | undefined> {
-  const valid = () => treeViewOwns(sessionId) && observationIsCurrent(sessionId, observation);
+  const valid = () => treeViewOwns(ownership) && observationIsCurrent(sessionId, observation);
   if (!valid()) return Promise.resolve(undefined);
   const immediate = findNavigateOutcome(sessionId, intentId, observation.owner);
   if (immediate) return Promise.resolve(immediate);
@@ -133,6 +148,10 @@ interface TreeStore {
   summarizeOnSwitch: boolean;
   foldedIds: Set<string>;
   navigating: boolean;
+  /** Invalidates every continuation owned by a closed or replaced viewer. */
+  viewerGeneration: number;
+  /** Distinguishes multiple navigation requests within one viewer instance. */
+  navigationGeneration: number;
 
   // Actions ────────────────────────────────────────────────────────────
 
@@ -173,30 +192,37 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
   summarizeOnSwitch: false,
   foldedIds: new Set<string>(),
   navigating: false,
+  viewerGeneration: 0,
+  navigationGeneration: 0,
 
   openTreeForSession: async (sessionId) => {
-    set({
+    set((state) => ({
       open: true,
       sessionId,
       phase: "loading",
       errorMessage: null,
       nodes: [],
       leafId: null,
-      // reset viewer-local UI state so the overlay opens fresh each time.
+      // Reset viewer-local UI state and invalidate every continuation from a
+      // prior instance, including a close/reopen of this same session.
       filterMode: "default",
       search: "",
       selectedId: null,
       foldedIds: new Set<string>(),
       navigating: false,
-    });
+      viewerGeneration: state.viewerGeneration + 1,
+      navigationGeneration: state.navigationGeneration + 1,
+    }));
     await get().refresh();
   },
 
   closeViewer: () => {
-    set({
+    set((state) => ({
       open: false,
       navigating: false,
-    });
+      viewerGeneration: state.viewerGeneration + 1,
+      navigationGeneration: state.navigationGeneration + 1,
+    }));
   },
 
   setFilterMode: (mode) => {
@@ -244,7 +270,10 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
     }
 
     const intentId = crypto.randomUUID();
-    set({ navigating: true });
+    const viewerGeneration = get().viewerGeneration;
+    const navigationGeneration = get().navigationGeneration + 1;
+    const ownership = { sessionId, viewerGeneration, navigationGeneration };
+    set({ navigating: true, navigationGeneration });
     try {
       const receipt = await dispatchSessionIntent(
         sessionId,
@@ -256,7 +285,7 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
         observation,
         intentId,
       );
-      if (!treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) return;
+      if (!treeViewOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       if (receipt.status === "not_admitted") {
         useSessionsStore.getState().addToast(sessionId, "Failed to request branch switch", "error");
         set({ navigating: false });
@@ -265,46 +294,32 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
 
       // Receipt status is deliberately not completion evidence, including
       // delivery_unknown. Wait for the matching owner-bound terminal frame.
-      const outcome = await waitForNavigateOutcome(sessionId, intentId, observation);
-      if (!outcome || !treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) {
+      const outcome = await waitForNavigateOutcome(sessionId, intentId, observation, ownership);
+      if (!outcome || !treeViewOwns(ownership) || !observationIsCurrent(sessionId, observation)) {
         return;
       }
-      if (outcome.state !== "completed" || !Array.isArray(outcome.result?.branch)) {
+      if (
+        outcome.state !== "completed" ||
+        !outcome.result ||
+        (typeof outcome.result.leafId !== "string" && outcome.result.leafId !== null)
+      ) {
         // Cancellation, failure, and unknown settlement leave the currently
         // visible branch intact. The overlay remains available to retry.
         set({ navigating: false });
         return;
       }
 
-      const consumeOutcome = () =>
-        useSessionsStore
-          .getState()
-          .consumeNavigationOutcome(sessionId, outcome.intentId, outcome.owner);
-      let history: TranscriptBlock[];
-      try {
-        history = await window.pivis.invoke("session.transcriptForEntries", {
-          sessionId,
-          entries: outcome.result.branch,
-        });
-      } catch (err) {
-        consumeOutcome();
-        if (treeViewOwns(sessionId) && observationIsCurrent(sessionId, observation)) {
-          const message = describeIpcError(err);
-          if (message) useSessionsStore.getState().addToast(sessionId, message, "error");
-          set({ navigating: false });
-        }
-        return;
-      }
-      if (!treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) {
-        consumeOutcome();
-        return;
-      }
-      const replaced = useSessionsStore
+      const reconciled = await useSessionsStore
         .getState()
-        .replaceTranscriptForNavigate(sessionId, outcome, history);
-      consumeOutcome();
-      if (!replaced) {
-        if (treeViewOwns(sessionId) && observationIsCurrent(sessionId, observation)) {
+        .reconcileNavigationPresentations(sessionId, {
+          intentId: outcome.intentId,
+          owner: outcome.owner,
+        });
+      if (!reconciled) {
+        if (treeViewOwns(ownership) && observationIsCurrent(sessionId, observation)) {
+          useSessionsStore
+            .getState()
+            .addToast(sessionId, "Failed to present the selected branch; try again.", "error");
           set({ navigating: false });
         }
         return;
@@ -312,7 +327,7 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
       // Only a successful complete presentation baseline permits the viewer
       // state to advance or close. Editor text remains solely in the terminal
       // semantic projection; navigation evidence never injects it directly.
-      if (!treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) return;
+      if (!treeViewOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       set({
         leafId: outcome.result.leafId ?? null,
         selectedId: outcome.result.leafId ?? null,
@@ -320,7 +335,7 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
         open: false,
       });
     } catch (err) {
-      if (!treeViewOwns(sessionId) || !observationIsCurrent(sessionId, observation)) return;
+      if (!treeViewOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       const message = describeIpcError(err);
       if (message) useSessionsStore.getState().addToast(sessionId, message, "error");
       set({ navigating: false });
@@ -328,8 +343,11 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
   },
 
   setLabel: async (targetId, label) => {
-    const sessionId = get().sessionId;
+    const viewer = get();
+    const sessionId = viewer.sessionId;
     if (!sessionId) return;
+    const ownership = { sessionId, viewerGeneration: viewer.viewerGeneration };
+    if (!treeViewerOwns(ownership)) return;
     const observation = currentObservation(sessionId);
     if (!observation) {
       useSessionsStore.getState().addToast(sessionId, "Session runtime is unavailable", "warning");
@@ -347,22 +365,25 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
         },
         observation,
       );
-      if (!observationIsCurrent(sessionId, observation) || get().sessionId !== sessionId) return;
+      if (!treeViewerOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       if (receipt.status === "not_admitted" || receipt.status === "delivery_unknown") {
         useSessionsStore.getState().addToast(sessionId, "Failed to set label", "error");
         return;
       }
       await get().refresh();
     } catch (err) {
-      if (!observationIsCurrent(sessionId, observation) || get().sessionId !== sessionId) return;
+      if (!treeViewerOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       const message = describeIpcError(err);
       if (message) useSessionsStore.getState().addToast(sessionId, message, "error");
     }
   },
 
   refresh: async () => {
-    const sessionId = get().sessionId;
+    const viewer = get();
+    const sessionId = viewer.sessionId;
     if (!sessionId) return;
+    const ownership = { sessionId, viewerGeneration: viewer.viewerGeneration };
+    if (!treeViewerOwns(ownership)) return;
     const observation = currentObservation(sessionId);
     if (!observation) {
       set({ phase: "error", errorMessage: "Session runtime is unavailable" });
@@ -372,7 +393,7 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
     try {
       const result = await querySession(sessionId, { type: "get_tree" }, observation);
       // The viewer moved on; leave whatever it is showing now untouched.
-      if (!observationIsCurrent(sessionId, observation) || get().sessionId !== sessionId) return;
+      if (!treeViewerOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       if (result.status !== "ok") {
         // A typed lifecycle result must not strand the overlay in "loading":
         // nothing else re-runs refresh while the phase stays loading. The
@@ -395,6 +416,7 @@ export const useTreeStore = create<TreeStore>((set, get) => ({
       // overlay recovers when the session is ready again and `/tree` retries
       // refresh.
       const errorMessage = describeIpcError(err) ?? "Session is busy; retry in a moment.";
+      if (!treeViewerOwns(ownership) || !observationIsCurrent(sessionId, observation)) return;
       set({ phase: "error", errorMessage });
       return;
     }

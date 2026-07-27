@@ -427,6 +427,27 @@ describe("Composer autocomplete and authority intents", () => {
     composer.unmount();
   });
 
+  it("synchronizes the mirrored shell-prefix caret on pointer release", () => {
+    const composer = mount();
+    const textarea = composer.textarea();
+    type(textarea, "!!ls");
+
+    act(() => {
+      textarea.blur();
+      textarea.setSelectionRange(0, 0);
+      textarea.focus();
+    });
+    expect(composer.container.querySelector(".composer__shell-prefix-caret")).not.toBeNull();
+
+    act(() => {
+      textarea.setSelectionRange(3, 3);
+      textarea.dispatchEvent(new Event("pointerup", { bubbles: true }));
+    });
+    expect(textarea.selectionStart).toBe(3);
+    expect(composer.container.querySelector(".composer__shell-prefix-caret")).toBeNull();
+    composer.unmount();
+  });
+
   it("rejects incomplete shell drafts without adding guidance or changing editor custody", () => {
     vi.useFakeTimers();
     const composer = mount();

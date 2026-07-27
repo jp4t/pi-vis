@@ -40,6 +40,7 @@ import {
   type LifecyclePermitOperation,
   type LifecyclePermitVerdict,
   LifecyclePermitVerdictSchema,
+  type RuntimeIdentity,
   type SessionRuntimeResumeState,
   SessionRuntimeResumeStateSchema,
   type SessionSubmission,
@@ -1710,6 +1711,20 @@ export class SessionHost extends EventEmitter {
   acknowledgeRestoration(restorationId: string): void {
     if (!this.proc.connected) return;
     this.sendChildMessage({ type: "restoration_ack", restorationId });
+  }
+
+  async acknowledgeNavigationPresentation(
+    intentId: string,
+    expectedOwner: RuntimeIdentity,
+  ): Promise<boolean> {
+    const response = await this.requestHost(
+      { type: "navigation_presentation_ack", intentId, expectedOwner },
+      2_000,
+    );
+    return (
+      response.success === true &&
+      (response.data as { acknowledged?: unknown } | undefined)?.acknowledged === true
+    );
   }
 
   sendUiResponse(responseJson: string): void {

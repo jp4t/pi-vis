@@ -1233,6 +1233,27 @@ export function initIpc(win: BrowserWindow): void {
   );
 
   ipcMain.handle(
+    "session.acknowledgeNavigationPresentation",
+    async (
+      _evt,
+      args: {
+        sessionId: SessionId;
+        intentId: string;
+        expectedOwner: { hostInstanceId: string; sessionEpoch: number };
+      },
+    ) => {
+      return {
+        acknowledged:
+          (await registry?.acknowledgeNavigationPresentation(
+            args.sessionId,
+            args.intentId,
+            args.expectedOwner,
+          )) ?? false,
+      };
+    },
+  );
+
+  ipcMain.handle(
     "session.escape",
     async (
       _evt,

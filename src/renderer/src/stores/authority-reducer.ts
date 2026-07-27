@@ -5,6 +5,7 @@ import type {
   AuthorityRecord,
   ExtensionUiPresentationBaseline,
   IntentOutcome,
+  NavigationPresentation,
   PanelPresentationBaseline,
   Plane,
   PlaneSync,
@@ -51,15 +52,15 @@ export interface RendererAuthorityState {
   panels: ReadonlyMap<string, AuthorityPanelProjection>;
   authoritativeSnapshot?: SemanticSnapshot | undefined;
   staleDiagnosticSnapshot?: SemanticSnapshot | undefined;
-  /** Latest atomic commit, with one-shot navigation payloads retained separately below. */
+  /** Latest atomic commit, with full navigation branches retained separately below. */
   lastSemanticFrame?: AuthorityFrame | undefined;
   recentRecords: readonly AuthorityRecord[];
   /**
-   * One-shot, renderer-local navigation payloads. The child intentionally
-   * omits complete branches from retained semantic snapshots, so a successful
-   * live outcome is kept here only until tree presentation consumes it.
+   * Renderer projection of child-owned navigation presentation custody.
+   * Attach baselines recover these full branches after detach or a publication
+   * gap; only an exact owner/intent acknowledgement retires them.
    */
-  transientNavigationOutcomes: readonly NavigationOutcome[];
+  pendingNavigationPresentations: readonly NavigationPresentation[];
   transcriptBaseline?: TranscriptPresentationBaseline | undefined;
   extensionUiBaseline?: ExtensionUiPresentationBaseline | undefined;
 }
@@ -133,24 +134,24 @@ export function createRendererAuthorityState(): RendererAuthorityState {
     extensionUi: synchronizing(undefined, ATTACH_REQUIRED),
     panels: new Map(),
     recentRecords: [],
-    transientNavigationOutcomes: [],
+    pendingNavigationPresentations: [],
   };
 }
 
-export function retireTransientNavigationOutcome(
+export function retireNavigationPresentation(
   state: RendererAuthorityState,
   intentId: string,
   owner: RuntimeIdentity,
 ): RendererAuthorityState {
-  const transientNavigationOutcomes = state.transientNavigationOutcomes.filter(
-    (outcome) =>
-      outcome.intentId !== intentId ||
-      outcome.owner.hostInstanceId !== owner.hostInstanceId ||
-      outcome.owner.sessionEpoch !== owner.sessionEpoch,
+  const pendingNavigationPresentations = state.pendingNavigationPresentations.filter(
+    (presentation) =>
+      presentation.intentId !== intentId ||
+      presentation.owner.hostInstanceId !== owner.hostInstanceId ||
+      presentation.owner.sessionEpoch !== owner.sessionEpoch,
   );
-  return transientNavigationOutcomes.length === state.transientNavigationOutcomes.length
+  return pendingNavigationPresentations.length === state.pendingNavigationPresentations.length
     ? state
-    : { ...state, transientNavigationOutcomes };
+    : { ...state, pendingNavigationPresentations };
 }
 
 /** Mark only the named presentation plane non-authoritative. */
@@ -262,7 +263,7 @@ function installBaseline(
     staleDiagnosticSnapshot: semanticFollowing ? undefined : baseline.semantic.snapshot,
     lastSemanticFrame: undefined,
     recentRecords: [],
-    transientNavigationOutcomes: [],
+    pendingNavigationPresentations: baseline.pendingNavigationPresentations ?? [],
     transcriptBaseline: baseline.transcript,
     extensionUiBaseline: baseline.extensionUi,
   };
@@ -319,6 +320,26 @@ function retainedAuthorityRecord(record: AuthorityRecord): AuthorityRecord {
   return { ...record, outcome: { ...record.outcome, result } };
 }
 
+function navigationPresentation(outcome: NavigationOutcome): NavigationPresentation | undefined {
+  const result = outcome.result;
+  if (
+    outcome.state !== "completed" ||
+    !result ||
+    !Array.isArray(result.branch) ||
+    (typeof result.leafId !== "string" && result.leafId !== null)
+  ) {
+    return undefined;
+  }
+  return {
+    intentId: outcome.intentId,
+    owner: outcome.owner,
+    targetId: result.targetId,
+    ...(typeof result.summarized === "boolean" ? { summarized: result.summarized } : {}),
+    leafId: result.leafId,
+    branch: result.branch,
+  };
+}
+
 function reduceSemantic(
   state: RendererAuthorityState,
   publication: Extract<RendererPublication, { plane: "semantic" }>,
@@ -354,32 +375,24 @@ function reduceSemantic(
       staleDiagnosticSnapshot: state.authoritativeSnapshot ?? frame.terminalSnapshot,
     };
   }
-  // Complete navigation branches are one-shot record payloads, not retained
-  // snapshot facts. Preserve at most two in renderer memory across subsequent
-  // compact semantic frames so an IPC receipt/frame race cannot hide the
-  // result before tree-store begins waiting. Tree presentation explicitly
-  // consumes the matching payload after conversion.
-  let transientNavigationOutcomes = [...state.transientNavigationOutcomes];
+  // A live frame is the fast path for the same child-owned presentation that
+  // attach can recover. Do not count-cap it locally: the child retains every
+  // unacknowledged branch and the renderer must mirror that custody exactly.
+  let pendingNavigationPresentations = [...state.pendingNavigationPresentations];
   for (const record of frame.records) {
-    if (
-      record.type !== "intent_outcome" ||
-      record.outcome.kind !== "navigate" ||
-      !Array.isArray(record.outcome.result?.branch)
-    ) {
-      continue;
-    }
-    transientNavigationOutcomes = transientNavigationOutcomes.filter(
-      (outcome) =>
-        outcome.intentId !== record.outcome.intentId ||
-        outcome.owner.hostInstanceId !== record.outcome.owner.hostInstanceId ||
-        outcome.owner.sessionEpoch !== record.outcome.owner.sessionEpoch,
+    if (record.type !== "intent_outcome" || record.outcome.kind !== "navigate") continue;
+    const presentation = navigationPresentation(record.outcome);
+    if (!presentation) continue;
+    pendingNavigationPresentations = pendingNavigationPresentations.filter(
+      (item) =>
+        item.intentId !== presentation.intentId ||
+        item.owner.hostInstanceId !== presentation.owner.hostInstanceId ||
+        item.owner.sessionEpoch !== presentation.owner.sessionEpoch,
     );
-    transientNavigationOutcomes.push(record.outcome);
+    pendingNavigationPresentations.push(presentation);
   }
-  transientNavigationOutcomes = transientNavigationOutcomes.slice(-2);
-  // Do not leave secondary references to one-shot branch/editor payloads in
-  // diagnostic frame fields. Tree presentation owns the sole complete copy
-  // above and explicit consumption can therefore release it immediately.
+  // Do not leave secondary references to branch/editor payloads in diagnostic
+  // frame fields. Presentation custody above owns the sole complete copy.
   const retainedRecords = frame.records.map(retainedAuthorityRecord);
   const retainedFrame = retainedRecords.some((record, index) => record !== frame.records[index])
     ? { ...frame, records: retainedRecords }
@@ -394,7 +407,7 @@ function reduceSemantic(
     staleDiagnosticSnapshot: undefined,
     lastSemanticFrame: retainedFrame,
     recentRecords: retainedRecords,
-    transientNavigationOutcomes,
+    pendingNavigationPresentations,
   };
 }
 

@@ -2772,6 +2772,42 @@ export class SessionRegistry {
     return acknowledged;
   }
 
+  async acknowledgeNavigationPresentation(
+    sessionId: SessionId,
+    intentId: string,
+    expectedOwner: RuntimeIdentity,
+  ): Promise<boolean> {
+    const record = this.sessions.get(sessionId);
+    const proc = record?.proc;
+    if (
+      !record ||
+      record._closing ||
+      !proc ||
+      proc.hostInstanceId !== expectedOwner.hostInstanceId ||
+      proc.sessionEpoch !== expectedOwner.sessionEpoch
+    ) {
+      return false;
+    }
+    this.markActivationVisitInteracted(record);
+    let acknowledged: boolean;
+    try {
+      acknowledged = await proc.acknowledgeNavigationPresentation(intentId, expectedOwner);
+    } catch (error) {
+      if (error instanceof HostRequestUnavailableError) return false;
+      throw error;
+    }
+    if (
+      this.sessions.get(sessionId) !== record ||
+      record._closing ||
+      record.proc !== proc ||
+      proc.hostInstanceId !== expectedOwner.hostInstanceId ||
+      proc.sessionEpoch !== expectedOwner.sessionEpoch
+    ) {
+      return false;
+    }
+    return acknowledged;
+  }
+
   claimUnifiedSubmit(
     sessionId: SessionId,
     id: string,

@@ -6427,7 +6427,56 @@ describe("sessions store - explicit search result open", () => {
 });
 
 describe("sessions store - tree navigation presentation", () => {
+  const navigationInvoke = vi.fn();
+  const owner = { hostInstanceId: "host-1", sessionEpoch: 1 };
+
+  function navigationOutcome(intentId: string, targetId: string, leafId: string | null) {
+    return {
+      intentId,
+      owner,
+      state: "completed" as const,
+      kind: "navigate" as const,
+      result: { targetId, leafId },
+    } satisfies Extract<IntentOutcome, { kind: "navigate" }>;
+  }
+
+  function navigationPresentation(intentId: string, targetId: string, leafId: string | null) {
+    return {
+      intentId,
+      owner,
+      targetId,
+      leafId,
+      branch: [{ id: targetId, type: "message" }],
+    };
+  }
+
+  function installNavigationAttach(
+    intentId: string,
+    targetId: string,
+    leafId: string | null = targetId,
+  ) {
+    const outcome = navigationOutcome(intentId, targetId, leafId);
+    const snapshot = semanticSnapshot(1, { recentIntentOutcomes: [outcome] });
+    const attach = authorityAttach(snapshot);
+    attach.baseline.pendingNavigationPresentations = [
+      navigationPresentation(intentId, targetId, leafId),
+    ];
+    useSessionsStore.getState().applyRuntimeState(SESSION_A, runtimeState(false));
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+    useSessionsStore.getState().setSessionStatus(SESSION_A, "ready");
+    return { outcome, presentation: attach.baseline.pendingNavigationPresentations[0]! };
+  }
+
   beforeEach(() => {
+    navigationInvoke.mockReset();
+    navigationInvoke.mockImplementation(async (channel: string) => {
+      if (channel === "session.transcriptForEntries") return [];
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    vi.stubGlobal("window", { pivis: { invoke: navigationInvoke } });
     useSessionsStore.setState({
       sessions: new Map(),
       workspaces: new Map(),
@@ -6435,79 +6484,359 @@ describe("sessions store - tree navigation presentation", () => {
       activeWorkspacePath: null,
     });
     useSessionsStore.getState().createSession(SESSION_A, WORKSPACE);
-    installAuthority(SESSION_A);
   });
 
-  it("replaces only the visible transcript from the exact completed navigate outcome", () => {
-    const store = useSessionsStore.getState();
-    store.seedHistory(SESSION_A, [
-      { id: "old", type: "user", data: { role: "user", content: "old branch" } },
+  afterEach(() => {
+    useSessionsStore.getState().removeSession(SESSION_A);
+    vi.unstubAllGlobals();
+  });
+
+  it("recovers an unacknowledged branch from a reload attach and acks after install", async () => {
+    useSessionsStore
+      .getState()
+      .seedHistory(SESSION_A, [
+        { id: "old", type: "user", data: { role: "user", content: "old branch" } },
+      ]);
+    const { presentation } = installNavigationAttach("reload-navigation", "reload-leaf", null);
+    const generation = useSessionsStore.getState().sessions.get(SESSION_A)?.historyGeneration;
+
+    await expect(
+      useSessionsStore.getState().reconcileNavigationPresentations(SESSION_A, {
+        intentId: presentation.intentId,
+        owner: presentation.owner,
+      }),
+    ).resolves.toBe(true);
+    expect(useSessionsStore.getState().sessions.get(SESSION_A)?.historyGeneration).toBe(
+      (generation ?? 0) + 1,
+    );
+    expect(
+      allTranscriptBlocks(useSessionsStore.getState().sessions.get(SESSION_A)?.transcript!),
+    ).toEqual([]);
+    expect(
+      useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+        ?.pendingNavigationPresentations,
+    ).toEqual([]);
+    expect(navigationInvoke).toHaveBeenCalledWith(
+      "session.acknowledgeNavigationPresentation",
+      expect.objectContaining({
+        sessionId: SESSION_A,
+        intentId: "reload-navigation",
+        expectedOwner: owner,
+      }),
+    );
+  });
+
+  it("fences a delayed persisted hydration when the in-memory branch is installed", async () => {
+    let resolveHistory!: (value: ReturnType<typeof loadedHistory>) => void;
+    let historyPayload: unknown;
+    navigationInvoke.mockImplementation((channel: string, payload: unknown) => {
+      if (channel === "session.loadHistory") {
+        historyPayload = payload;
+        return new Promise((resolve) => {
+          resolveHistory = resolve;
+        });
+      }
+      if (channel === "session.transcriptForEntries") {
+        return Promise.resolve([
+          {
+            id: "selected-branch",
+            type: "user",
+            data: { role: "user", content: "selected branch" },
+          },
+        ]);
+      }
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return Promise.resolve({ acknowledged: true });
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    installAuthority(SESSION_A);
+    useSessionsStore.setState((state) => {
+      const sessions = new Map(state.sessions);
+      const session = sessions.get(SESSION_A)!;
+      sessions.set(SESSION_A, {
+        ...session,
+        sessionFile: "/f/navigation.jsonl",
+        transcriptPresentationDirty: true,
+      });
+      return { sessions };
+    });
+
+    const hydration = useSessionsStore.getState().rehydrateHistory(SESSION_A);
+    await vi.waitFor(() =>
+      expect(navigationInvoke).toHaveBeenCalledWith(
+        "session.loadHistory",
+        expect.objectContaining({ expectedSessionFile: "/f/navigation.jsonl" }),
+      ),
+    );
+    const generationBeforeNavigation = useSessionsStore
+      .getState()
+      .sessions.get(SESSION_A)?.historyGeneration;
+
+    installNavigationAttach("hydration-navigation", "selected-leaf");
+    await vi.waitFor(() =>
+      expect(
+        useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+          ?.pendingNavigationPresentations,
+      ).toEqual([]),
+    );
+    resolveHistory(
+      loadedHistory(historyPayload, [
+        {
+          id: "persisted-old-leaf",
+          type: "user",
+          data: { role: "user", content: "old persisted leaf" },
+        },
+      ]),
+    );
+    await hydration;
+
+    const current = useSessionsStore.getState().sessions.get(SESSION_A)!;
+    expect(allTranscriptBlocks(current.transcript)).toEqual([
+      expect.objectContaining({ id: "selected-branch" }),
     ]);
-    const before = store.sessions.get(SESSION_A);
-    const snapshot = before?.authorityProjection?.authoritativeSnapshot;
+    expect(current).toMatchObject({
+      historyHydrating: false,
+      transcriptPresentationDirty: false,
+      historyGeneration: (generationBeforeNavigation ?? 0) + 1,
+    });
+    expect(current.historyHydrationToken).toBeUndefined();
+    expect(
+      navigationInvoke.mock.calls.filter(([channel]) => channel === "session.loadHistory"),
+    ).toHaveLength(1);
+  });
+
+  it("re-acks a stale pre-ack attach without reconverting over its replay", async () => {
+    let conversionAttempts = 0;
+    navigationInvoke.mockImplementation(async (channel: string) => {
+      if (channel === "session.transcriptForEntries") {
+        conversionAttempts++;
+        return [
+          {
+            id: "selected-branch",
+            type: "user",
+            data: { role: "user", content: "selected branch" },
+          },
+        ];
+      }
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    const { outcome, presentation } = installNavigationAttach(
+      "stale-attach-navigation",
+      "selected-leaf",
+    );
+    await vi.waitFor(() =>
+      expect(
+        useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+          ?.pendingNavigationPresentations,
+      ).toEqual([]),
+    );
+    expect(conversionAttempts).toBe(1);
+
+    // This baseline was serialized before the first acknowledgement but is
+    // delivered afterward. Its replay already contains work released by that
+    // acknowledgement, so reconverting the old branch would erase the event.
+    const staleAttach = authorityAttach(semanticSnapshot(2, { recentIntentOutcomes: [outcome] }));
+    staleAttach.baseline.pendingNavigationPresentations = [presentation];
+    staleAttach.replay = [
+      {
+        sessionId: SESSION_A,
+        rendererGeneration: 0,
+        publicationSequence: 1,
+        plane: "transcript",
+        owner,
+        payload: {
+          kind: "delta",
+          cursor: {
+            ...owner,
+            transportSequence: 2,
+            snapshotSequence: 2,
+          },
+          liveTailCursor: "2",
+          entries: [
+            {
+              type: "message_start",
+              message: { role: "user", content: "released after ack" },
+            },
+          ],
+        },
+      },
+    ];
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, staleAttach);
+
+    await vi.waitFor(() =>
+      expect(
+        useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+          ?.pendingNavigationPresentations,
+      ).toEqual([]),
+    );
+    expect(conversionAttempts).toBe(1);
+    expect(
+      allTranscriptBlocks(useSessionsStore.getState().sessions.get(SESSION_A)!.transcript),
+    ).toEqual([
+      expect.objectContaining({ id: "selected-branch" }),
+      expect.objectContaining({
+        type: "user",
+        data: expect.objectContaining({ content: "released after ack" }),
+      }),
+    ]);
+    expect(
+      navigationInvoke.mock.calls.filter(
+        ([channel]) => channel === "session.acknowledgeNavigationPresentation",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("does not schedule a retry after the owning session is removed", async () => {
+    let resolveAcknowledgement!: (value: { acknowledged: boolean }) => void;
+    navigationInvoke.mockImplementation((channel: string) => {
+      if (channel === "session.transcriptForEntries") return Promise.resolve([]);
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return new Promise((resolve) => {
+          resolveAcknowledgement = resolve;
+        });
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    installNavigationAttach("removed-navigation", "removed-leaf");
+    await vi.waitFor(() =>
+      expect(navigationInvoke).toHaveBeenCalledWith(
+        "session.acknowledgeNavigationPresentation",
+        expect.anything(),
+      ),
+    );
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    useSessionsStore.getState().removeSession(SESSION_A);
+    resolveAcknowledgement({ acknowledged: false });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(timeoutSpy).not.toHaveBeenCalled();
+    timeoutSpy.mockRestore();
+  });
+
+  it("retries a failed attach conversion without depending on the tree overlay", async () => {
+    let conversionAttempt = 0;
+    navigationInvoke.mockImplementation(async (channel: string) => {
+      if (channel === "session.transcriptForEntries") {
+        conversionAttempt++;
+        if (conversionAttempt === 1) throw new Error("temporary conversion failure");
+        return [{ id: "retried", type: "user", data: { role: "user", content: "retried" } }];
+      }
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    installNavigationAttach("retry-navigation", "retry-leaf");
+
+    await vi.waitFor(() => expect(conversionAttempt).toBe(2));
+    expect(
+      allTranscriptBlocks(useSessionsStore.getState().sessions.get(SESSION_A)?.transcript!),
+    ).toMatchObject([{ id: "retried" }]);
+    expect(
+      useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection
+        ?.pendingNavigationPresentations,
+    ).toEqual([]);
+  });
+
+  it("does not let a slower earlier conversion overwrite a newer navigation", async () => {
+    let resolveEarlier: (history: unknown[]) => void = () => {};
+    const earlier = new Promise<unknown[]>((resolve) => {
+      resolveEarlier = resolve;
+    });
+    navigationInvoke.mockImplementation(async (channel: string, payload: unknown) => {
+      if (channel === "session.transcriptForEntries") {
+        const entries = (payload as { entries: Array<{ id: string }> }).entries;
+        if (entries[0]?.id === "leaf-a") return earlier;
+        return [{ id: "newer", type: "user", data: { role: "user", content: "newer" } }];
+      }
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    const { outcome: firstOutcome } = installNavigationAttach("navigation-a", "leaf-a");
+    await vi.waitFor(() =>
+      expect(navigationInvoke).toHaveBeenCalledWith(
+        "session.transcriptForEntries",
+        expect.objectContaining({ entries: [{ id: "leaf-a", type: "message" }] }),
+      ),
+    );
+
+    const projection = useSessionsStore.getState().sessions.get(SESSION_A)?.authorityProjection;
+    const prior = projection?.authoritativeSnapshot;
     const cursor =
-      before?.authorityProjection?.semantic.state === "following"
-        ? before.authorityProjection.semantic.cursor
-        : undefined;
-    if (!snapshot || !cursor) throw new Error("missing authority baseline");
-    const outcome = {
-      intentId: "tree-navigation",
-      owner: snapshot.owner,
-      state: "completed" as const,
-      kind: "navigate" as const,
-      result: { targetId: "leaf", leafId: null, branch: [] },
-    } satisfies Extract<IntentOutcome, { kind: "navigate" }>;
+      projection?.semantic.state === "following" ? projection.semantic.cursor : undefined;
+    if (!prior || !cursor) throw new Error("missing navigation authority");
+    const secondOutcome = navigationOutcome("navigation-b", "leaf-b", "leaf-b");
+    const liveSecondOutcome = {
+      ...secondOutcome,
+      result: {
+        ...secondOutcome.result,
+        branch: [{ id: "leaf-b", type: "message" }],
+      },
+    };
     publishSemantic(
       SESSION_A,
       cursor.transportSequence + 1,
       {
-        ...snapshot,
-        snapshotSequence: snapshot.snapshotSequence + 1,
-        recentIntentOutcomes: [...snapshot.recentIntentOutcomes, outcome],
+        ...prior,
+        snapshotSequence: prior.snapshotSequence + 1,
+        recentIntentOutcomes: [firstOutcome, secondOutcome],
       },
-      [{ type: "intent_outcome", outcome }],
+      [{ type: "intent_outcome", outcome: liveSecondOutcome }],
     );
+    resolveEarlier([{ id: "slower", type: "user", data: { role: "user", content: "slower" } }]);
 
-    const generation = useSessionsStore.getState().sessions.get(SESSION_A)?.historyGeneration;
-    expect(useSessionsStore.getState().replaceTranscriptForNavigate(SESSION_A, outcome, [])).toBe(
-      true,
+    await vi.waitFor(() =>
+      expect(
+        allTranscriptBlocks(useSessionsStore.getState().sessions.get(SESSION_A)?.transcript!),
+      ).toMatchObject([{ id: "newer" }]),
     );
-    expect(useSessionsStore.getState().sessions.get(SESSION_A)?.historyGeneration).toBe(generation);
     expect(
       allTranscriptBlocks(useSessionsStore.getState().sessions.get(SESSION_A)?.transcript!),
-    ).toEqual([]);
+    ).not.toContainEqual(expect.objectContaining({ id: "slower" }));
+  });
 
-    // A later same-owner authority frame may clone the retained terminal
-    // outcome while branch conversion is in flight. The original result must
-    // still apply by its stable intent/owner/state evidence, not object identity.
-    useSessionsStore.setState((state) => {
-      const sessions = new Map(state.sessions);
-      const current = sessions.get(SESSION_A)!;
-      const projection = current.authorityProjection!;
-      sessions.set(SESSION_A, {
-        ...current,
-        authorityProjection: {
-          ...projection,
-          authoritativeSnapshot: {
-            ...projection.authoritativeSnapshot!,
-            recentIntentOutcomes: projection.authoritativeSnapshot!.recentIntentOutcomes.map(
-              (candidate) =>
-                candidate.intentId === outcome.intentId ? { ...candidate } : candidate,
-            ),
-          },
-        },
-      });
-      return { sessions };
+  it("rejects a predecessor conversion after successor attach", async () => {
+    let resolvePredecessor: (history: unknown[]) => void = () => {};
+    const predecessor = new Promise<unknown[]>((resolve) => {
+      resolvePredecessor = resolve;
     });
-    expect(
-      useSessionsStore
-        .getState()
-        .replaceTranscriptForNavigate(SESSION_A, outcome, [
-          { id: "late", type: "user", data: { role: "user", content: "late branch" } },
-        ]),
-    ).toBe(true);
+    navigationInvoke.mockImplementation(async (channel: string) => {
+      if (channel === "session.transcriptForEntries") return predecessor;
+      if (channel === "session.acknowledgeNavigationPresentation") {
+        return { acknowledged: true };
+      }
+      throw new Error(`unexpected channel: ${channel}`);
+    });
+    useSessionsStore
+      .getState()
+      .seedHistory(SESSION_A, [
+        { id: "visible", type: "user", data: { role: "user", content: "visible" } },
+      ]);
+    installNavigationAttach("predecessor-navigation", "old-leaf");
+    await vi.waitFor(() =>
+      expect(navigationInvoke).toHaveBeenCalledWith(
+        "session.transcriptForEntries",
+        expect.anything(),
+      ),
+    );
+
+    const successorOwner = { hostInstanceId: "host-successor", sessionEpoch: 2 };
+    const successorSnapshot = semanticSnapshot(1, { owner: successorOwner });
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, authorityAttach(successorSnapshot));
+    resolvePredecessor([{ id: "stale", type: "user", data: { role: "user", content: "stale" } }]);
+    await Promise.resolve();
+    await Promise.resolve();
+
     expect(
       allTranscriptBlocks(useSessionsStore.getState().sessions.get(SESSION_A)?.transcript!),
-    ).toMatchObject([{ id: "late" }]);
+    ).toMatchObject([{ id: "visible" }]);
   });
 });

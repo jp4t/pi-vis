@@ -72,18 +72,68 @@ export class DiagnosticLog {
 }
 
 export function formatDiagnosticValue(value: unknown): string {
-  if (value instanceof Error) return value.stack ?? `${value.name}: ${value.message}`;
-  if (typeof value === "string") return value;
-  return inspect(value, { depth: 8, breakLength: 120, maxArrayLength: 100 });
+  try {
+    if (value instanceof Error) {
+      try {
+        const stack = value.stack;
+        if (typeof stack === "string") return stack;
+      } catch {
+        // A hostile Error subclass may expose a throwing stack getter.
+      }
+
+      let name = "Error";
+      let message = "";
+      try {
+        const candidateName = value.name;
+        if (typeof candidateName === "string" && candidateName.length > 0) name = candidateName;
+      } catch {
+        // Preserve the safe default.
+      }
+      try {
+        const candidateMessage = value.message;
+        if (typeof candidateMessage === "string") message = candidateMessage;
+      } catch {
+        // Preserve the safe default.
+      }
+      return message ? `${name}: ${message}` : name;
+    }
+    if (typeof value === "string") return value;
+    return inspect(value, {
+      depth: 8,
+      breakLength: 120,
+      maxArrayLength: 100,
+      customInspect: false,
+      getters: false,
+    });
+  } catch {
+    return "[unformattable diagnostic value]";
+  }
 }
 
 export function formatDiagnosticArguments(args: unknown[]): string {
-  return args.map(formatDiagnosticValue).join(" ");
+  try {
+    return args.map(formatDiagnosticValue).join(" ");
+  } catch {
+    return "[unformattable diagnostic arguments]";
+  }
+}
+
+export function createDiagnosticConsoleError(
+  original: typeof console.error,
+  persist: (args: unknown[]) => void,
+): typeof console.error {
+  return (...args: unknown[]): void => {
+    try {
+      persist(args);
+    } catch {
+      // Diagnostic formatting/persistence must not suppress the real console.
+    }
+    Reflect.apply(original, console, args);
+  };
 }
 
 let activeLog: DiagnosticLog | null = null;
 let mainHandlersInstalled = false;
-let originalConsoleError: typeof console.error | null = null;
 
 export function configureDiagnosticLogging(filePath: string): DiagnosticLog {
   activeLog = new DiagnosticLog(filePath);
@@ -109,11 +159,10 @@ export function installMainProcessDiagnosticHandlers(): void {
   if (mainHandlersInstalled) return;
   mainHandlersInstalled = true;
 
-  originalConsoleError = console.error;
-  console.error = (...args: unknown[]): void => {
+  const originalConsoleError = console.error;
+  console.error = createDiagnosticConsoleError(originalConsoleError, (args) => {
     appendDiagnostic("main", "console.error", formatDiagnosticArguments(args));
-    originalConsoleError?.(...args);
-  };
+  });
 
   process.on("uncaughtExceptionMonitor", (error, origin) => {
     appendDiagnostic("main", "uncaught-exception", error, { origin });

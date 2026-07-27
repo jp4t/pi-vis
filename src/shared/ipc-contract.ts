@@ -30,6 +30,7 @@ import type {
   ReloadRequest,
   ReloadSettlement,
   RendererPublication,
+  RuntimeIdentity,
   RuntimeRecord,
   RuntimeStateUpdate,
   SessionQueryEnvelope,
@@ -320,6 +321,11 @@ export interface IpcInvokeContract {
   /** Every unclaimed bare Escape is acknowledged by the live host. */
   "session.acknowledgeRestoration": {
     req: { sessionId: SessionId; restorationId: string };
+    res: { acknowledged: boolean };
+  };
+  /** Retire one child-owned navigation branch after transcript installation. */
+  "session.acknowledgeNavigationPresentation": {
+    req: { sessionId: SessionId; intentId: string; expectedOwner: RuntimeIdentity };
     res: { acknowledged: boolean };
   };
   "session.escape": {

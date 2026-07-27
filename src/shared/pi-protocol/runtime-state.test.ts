@@ -592,6 +592,35 @@ describe("authority protocol schemas", () => {
 
   it("requires attach baselines, panel reconstruction, and replay to be internally coherent", () => {
     expect(AuthorityAttachBaselineSchema.safeParse(baseline()).success).toBe(true);
+    const navigationPresentation = {
+      intentId: "navigate-a",
+      owner,
+      targetId: "leaf-a",
+      leafId: "leaf-a",
+      branch: [{ id: "leaf-a", type: "message" }],
+    };
+    expect(
+      AuthorityAttachBaselineSchema.safeParse(
+        baseline({ pendingNavigationPresentations: [navigationPresentation] }),
+      ).success,
+    ).toBe(true);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse(
+        baseline({
+          pendingNavigationPresentations: [
+            navigationPresentation,
+            { ...navigationPresentation, owner: otherOwner },
+          ],
+        }),
+      ).success,
+    ).toBe(false);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse(
+        baseline({
+          pendingNavigationPresentations: [navigationPresentation, { ...navigationPresentation }],
+        }),
+      ).success,
+    ).toBe(false);
     const currentShellTurn = {
       id: "shell-1",
       command: "npm init",

@@ -6,7 +6,11 @@
 | `resources/pi-session-host/state-authority.mjs` | Direct snapshots, submission admission/custody, escape, queue restoration, and atomic transitions. |
 | `resources/pi-session-host/state-authority.test.mjs` | Fault-injection regression coverage for authority protocol. |
 | `resources/pi-session-host/bridge.mjs` | Public SDK command/event bridge and runtime rebind wiring. |
+| `src/main/diagnostics.ts` | Synchronous rotating diagnostic sink plus main-process console and fatal-error capture. |
+| `src/main/diagnostics.test.ts` | Diagnostic formatting, rotation, file-permission, and failure-isolation coverage. |
+| `src/main/index.ts` | Electron bootstrap and renderer/Electron-child/Crashpad diagnostic wiring. |
 | `src/main/pi/session-host.ts` | Child-IPC wrapper, host envelope identity/sequence validation, and resync fencing. |
+| `src/preload/index.ts` | Typed renderer bridge and uncaught renderer-error reporting. |
 | `src/main/sessions/session-registry.ts` | Snapshot lease/availability, lifecycle, activation-visit retirement, acknowledgements, and two-phase close; it has no fixed process-cap refusal. |
 | `src/main/sessions/session-search/` | Planned worker-owned persisted-JSONL catalog, disposable SQLite index, query, and exact read-only context implementation. |
 | `src/main/ipc.ts` | Typed renderer↔main handler registration and host event forwarding. |

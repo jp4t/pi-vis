@@ -1705,6 +1705,33 @@ describe("SessionRegistry direct AgentSession authority", () => {
     h.registry.stopAll();
   });
 
+  it("forwards navigation presentation acknowledgement only to the exact runtime owner", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const record = h.registry.getSession(id)!;
+    const [hostInstanceId, sessionEpoch] = runtimeIdentity(record);
+    const owner = { hostInstanceId, sessionEpoch };
+
+    await expect(
+      h.registry.acknowledgeNavigationPresentation(id, "navigate-owner-bound", owner),
+    ).resolves.toBe(true);
+    await expect(
+      h.registry.acknowledgeNavigationPresentation(id, "navigate-owner-bound", {
+        ...owner,
+        sessionEpoch: owner.sessionEpoch + 1,
+      }),
+    ).resolves.toBe(false);
+    expect(
+      h.fakes[0]!.sent.filter(
+        (message) =>
+          message.type === "navigation_presentation_ack" &&
+          message.intentId === "navigate-owner-bound",
+      ),
+    ).toHaveLength(1);
+    h.registry.stopAll();
+  });
+
   it("retains admitted dispatch escrow across duplicate receipts until a terminal authority frame", async () => {
     const h = harness();
     const id = h.registry.openSession("/tmp/project");

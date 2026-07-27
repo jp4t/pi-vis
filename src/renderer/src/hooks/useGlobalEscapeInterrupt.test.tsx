@@ -85,7 +85,7 @@ describe("useGlobalEscapeInterrupt", () => {
           extensionUi: { state: "synchronizing", reason: "test" },
           panels: new Map(),
           recentRecords: [],
-          transientNavigationOutcomes: [],
+          pendingNavigationPresentations: [],
           authoritativeSnapshot: {
             owner: { hostInstanceId: "host-escape", sessionEpoch: 4 },
             snapshotSequence: 1,

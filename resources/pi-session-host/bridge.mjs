@@ -1726,53 +1726,61 @@ export function setupCommandBridge({
           // navigation itself (which can await a branch summarization) then
           // settles as a deferred outcome so serialized ingress keeps
           // flowing and later prompts join navigation custody.
-          const navigationOperation = authority
-            .runNavigation(() =>
-              _session.navigateTree(intent.targetId, { summarize: intent.summarize }),
-            )
-            .then((result) => {
-              const cancelled = result?.cancelled === true || result?.aborted === true;
-              // Pi returns restored editor text as navigation evidence, but
-              // only an empty editor may accept it. The terminal snapshot then
-              // carries the revisioned host editor state; stale/non-empty
-              // drafts remain authoritative instead of being overwritten.
-              if (
-                !cancelled &&
-                typeof result?.editorText === "string" &&
-                editorIsEmptyForNavigation(editorAtNavigationStart)
-              ) {
-                // A rejected concurrent renderer patch can retain a conflict
-                // candidate without changing the revision. Re-read all editor
-                // custody before applying so navigation never clears it.
-                const editorBeforeInjection = uiState.editorSnapshot();
-                if (
-                  editorBeforeInjection.revision === editorAtNavigationStart.revision &&
-                  editorIsEmptyForNavigation(editorBeforeInjection)
-                ) {
-                  uiState.applyEditorPatch({
-                    baseRevision: editorAtNavigationStart.revision,
-                    revision: editorAtNavigationStart.revision + 1,
-                    text: result.editorText,
-                    attachments: [],
-                  });
-                }
-              }
-              return {
-                targetId: intent.targetId,
-                ...(typeof result?.summaryEntry === "object" ? { summarized: true } : {}),
-                ...(result?.cancelled === true ? { cancelled: true } : {}),
-                ...(result?.aborted === true ? { aborted: true } : {}),
-                // Read post-navigation state only after Pi has settled the
-                // navigation. getBranch() is the public root-to-leaf,
-                // in-memory branch; copying it makes the authority outcome
-                // serializable without relying on the session file.
-                ...(!cancelled && typeof result?.editorText === "string"
-                  ? { editorText: result.editorText }
-                  : {}),
-                ...(!cancelled ? { leafId: _session.sessionManager.getLeafId() } : {}),
-                ...(!cancelled ? { branch: [..._session.sessionManager.getBranch()] } : {}),
-              };
+          const navigationOperation = authority.runNavigation(async () => {
+            const result = await _session.navigateTree(intent.targetId, {
+              summarize: intent.summarize,
             });
+            const cancelled = result?.cancelled === true || result?.aborted === true;
+            // Pi returns restored editor text as navigation evidence, but
+            // only an empty editor may accept it. The terminal snapshot then
+            // carries the revisioned host editor state; stale/non-empty
+            // drafts remain authoritative instead of being overwritten.
+            if (
+              !cancelled &&
+              typeof result?.editorText === "string" &&
+              editorIsEmptyForNavigation(editorAtNavigationStart)
+            ) {
+              // A rejected concurrent renderer patch can retain a conflict
+              // candidate without changing the revision. Re-read all editor
+              // custody before applying so navigation never clears it.
+              const editorBeforeInjection = uiState.editorSnapshot();
+              if (
+                editorBeforeInjection.revision === editorAtNavigationStart.revision &&
+                editorIsEmptyForNavigation(editorBeforeInjection)
+              ) {
+                uiState.applyEditorPatch({
+                  baseRevision: editorAtNavigationStart.revision,
+                  revision: editorAtNavigationStart.revision + 1,
+                  text: result.editorText,
+                  attachments: [],
+                });
+              }
+            }
+            const navigationEvidence = {
+              targetId: intent.targetId,
+              ...(typeof result?.summaryEntry === "object" ? { summarized: true } : {}),
+              ...(result?.cancelled === true ? { cancelled: true } : {}),
+              ...(result?.aborted === true ? { aborted: true } : {}),
+              // Read post-navigation state only after Pi has settled the
+              // navigation. getBranch() is the public root-to-leaf,
+              // in-memory branch; copying it makes the authority outcome
+              // serializable without relying on the session file.
+              ...(!cancelled && typeof result?.editorText === "string"
+                ? { editorText: result.editorText }
+                : {}),
+              ...(!cancelled ? { leafId: _session.sessionManager.getLeafId() } : {}),
+              ...(!cancelled ? { branch: [..._session.sessionManager.getBranch()] } : {}),
+            };
+            // Capture the exact post-navigation branch before runNavigation
+            // releases its barrier and schedules custody drain. The entry is
+            // provisional until dispatch settlement publishes its terminal
+            // outcome, but it already prevents later activity from advancing
+            // the session past this presentation boundary.
+            if (!cancelled) {
+              authority.captureNavigationPresentation(envelope.intentId, owner, navigationEvidence);
+            }
+            return navigationEvidence;
+          });
           return { deferredOutcome: navigationOperation };
         }
         case "setModel": {

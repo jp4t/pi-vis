@@ -16,6 +16,7 @@ import type {
   BashActivity,
   CompactionActivity,
   IntentOutcome,
+  NavigationPresentation,
   RendererPublication,
   RuntimeIdentity,
   RuntimeRecord,
@@ -65,7 +66,7 @@ import {
   createRendererAuthorityState,
   reduceAuthorityAttach,
   reduceAuthorityPublication,
-  retireTransientNavigationOutcome,
+  retireNavigationPresentation,
   unavailableAuthority,
 } from "./authority-reducer.js";
 import { useChangelogStore } from "./changelog-store.js";
@@ -1389,17 +1390,25 @@ interface SessionsStore {
     history: TranscriptBlock[],
     opts?: { hydrationToken?: string },
   ) => void;
-  /** Replace only the visible transcript from a completed, owner-bound tree navigation. */
-  replaceTranscriptForNavigate: (
+  /** Replace only the visible transcript from exact child-owned navigation custody. */
+  replaceTranscriptForNavigationPresentation: (
     sessionId: SessionId,
-    outcome: Extract<IntentOutcome, { kind: "navigate" }>,
+    presentation: NavigationPresentation,
     history: TranscriptBlock[],
   ) => boolean;
-  consumeNavigationOutcome: (
+  retireNavigationPresentation: (
     sessionId: SessionId,
     intentId: string,
     owner: RuntimeIdentity,
   ) => void;
+  /**
+   * Convert, install, and acknowledge child-owned navigation custody. Work is
+   * serialized per session and remains independent of tree-overlay lifetime.
+   */
+  reconcileNavigationPresentations: (
+    sessionId: SessionId,
+    requested?: { intentId: string; owner: RuntimeIdentity },
+  ) => Promise<boolean>;
   /** Rebuild presentation from persisted JSONL under history ownership and idle fences. */
   rehydrateHistory: (sessionId: SessionId) => Promise<void>;
   refreshHistoricalCacheMissNotices: (sessionId: SessionId) => Promise<void>;
@@ -1672,7 +1681,71 @@ function observedCompactionKey(
 }
 
 const scheduledPresentationRehydrates = new Set<SessionId>();
+const navigationReconciliationFlights = new Map<SessionId, Promise<Set<string>>>();
+const installedNavigationPresentations = new Map<string, number>();
+const completedNavigationPresentations = new Map<string, number>();
+const navigationRetryAttempts = new Map<string, number>();
+const navigationRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let historyHydrationCounter = 0;
+
+function navigationPresentationKey(
+  sessionId: SessionId,
+  intentId: string,
+  owner: RuntimeIdentity,
+): string {
+  return `${sessionId}\u0000${owner.hostInstanceId}\u0000${owner.sessionEpoch}\u0000${intentId}`;
+}
+
+function rememberNavigationPresentation(target: Map<string, number>, key: string): void {
+  target.delete(key);
+  target.set(key, Date.now());
+  while (target.size > 128) target.delete(target.keys().next().value as string);
+}
+
+function scheduleNavigationReconciliation(sessionId: SessionId): void {
+  queueMicrotask(() => {
+    void useSessionsStore.getState().reconcileNavigationPresentations(sessionId);
+  });
+}
+
+function cancelNavigationRetryTimer(key: string): void {
+  const timer = navigationRetryTimers.get(key);
+  if (timer !== undefined) clearTimeout(timer);
+  navigationRetryTimers.delete(key);
+}
+
+function clearNavigationRetry(key: string): void {
+  cancelNavigationRetryTimer(key);
+  navigationRetryAttempts.delete(key);
+}
+
+function clearNavigationRetriesForSession(sessionId: SessionId): void {
+  const prefix = `${sessionId}\u0000`;
+  for (const key of navigationRetryAttempts.keys()) {
+    if (key.startsWith(prefix)) clearNavigationRetry(key);
+  }
+}
+
+function scheduleNavigationRetry(sessionId: SessionId, key: string): void {
+  if (!useSessionsStore.getState().sessions.has(sessionId)) {
+    clearNavigationRetry(key);
+    return;
+  }
+  if (navigationRetryTimers.has(key)) return;
+  const attempt = navigationRetryAttempts.get(key) ?? 0;
+  const delays = [50, 250, 1_000] as const;
+  if (attempt >= delays.length) return;
+  navigationRetryAttempts.set(key, attempt + 1);
+  const timer = setTimeout(() => {
+    navigationRetryTimers.delete(key);
+    if (!useSessionsStore.getState().sessions.has(sessionId)) {
+      navigationRetryAttempts.delete(key);
+      return;
+    }
+    void useSessionsStore.getState().reconcileNavigationPresentations(sessionId);
+  }, delays[attempt]);
+  navigationRetryTimers.set(key, timer);
+}
 
 function newHistoryHydrationToken(): string {
   return `history-${++historyHydrationCounter}`;
@@ -1692,6 +1765,7 @@ function schedulePresentationRehydrateIfIdle(sessionId: SessionId): void {
   scheduledPresentationRehydrates.add(sessionId);
   queueMicrotask(() => {
     scheduledPresentationRehydrates.delete(sessionId);
+    if (!useSessionsStore.getState().sessions.get(sessionId)?.transcriptPresentationDirty) return;
     void useSessionsStore.getState().rehydrateHistory(sessionId);
   });
 }
@@ -1875,6 +1949,16 @@ const buildSessionsStore = (
 
   removeSession: (sessionId, opts) => {
     forgetPanelInputSession(sessionId);
+    clearNavigationRetriesForSession(sessionId);
+    navigationReconciliationFlights.delete(sessionId);
+    scheduledPresentationRehydrates.delete(sessionId);
+    const navigationKeyPrefix = `${sessionId}\u0000`;
+    for (const key of installedNavigationPresentations.keys()) {
+      if (key.startsWith(navigationKeyPrefix)) installedNavigationPresentations.delete(key);
+    }
+    for (const key of completedNavigationPresentations.keys()) {
+      if (key.startsWith(navigationKeyPrefix)) completedNavigationPresentations.delete(key);
+    }
     set((state) => {
       const sessions = new Map(state.sessions);
       const s = sessions.get(sessionId);
@@ -2213,31 +2297,39 @@ const buildSessionsStore = (
     }
   },
 
-  replaceTranscriptForNavigate: (sessionId, outcome, history) => {
+  replaceTranscriptForNavigationPresentation: (sessionId, presentation, history) => {
     let replaced = false;
     set((state) => {
       const current = state.sessions.get(sessionId);
+      const projection = current?.authorityProjection;
       const snapshot = authoritySnapshotFor(current);
       const currentOutcome = snapshot?.recentIntentOutcomes.find(
-        (candidate) =>
+        (candidate): candidate is Extract<IntentOutcome, { kind: "navigate" }> =>
           candidate.kind === "navigate" &&
-          candidate.intentId === outcome.intentId &&
-          candidate.owner.hostInstanceId === outcome.owner.hostInstanceId &&
-          candidate.owner.sessionEpoch === outcome.owner.sessionEpoch,
+          candidate.intentId === presentation.intentId &&
+          candidate.owner.hostInstanceId === presentation.owner.hostInstanceId &&
+          candidate.owner.sessionEpoch === presentation.owner.sessionEpoch,
       );
-      // A conversion result is presentation-only and is valid only while the
-      // same terminal authority evidence that requested it remains current.
-      // Authority reducers may clone a retained outcome in a later same-owner
-      // frame, so compare its stable owner-bound intent identity and terminal
-      // state rather than JavaScript object identity. Never let a stale owner
-      // or changed terminal settlement replace a successor's visible branch.
+      const latestPresentation = projection?.pendingNavigationPresentations.at(-1);
+      // Conversion is presentation-only and may commit only while the exact
+      // child escrow remains the newest branch for a following owner. Matching
+      // compact terminal metadata prevents an attach/replay or slow conversion
+      // from installing a stale/mismatched branch.
       if (
         !current ||
+        !projection ||
+        projection.semantic.state !== "following" ||
         !snapshot ||
-        snapshot.owner.hostInstanceId !== outcome.owner.hostInstanceId ||
-        snapshot.owner.sessionEpoch !== outcome.owner.sessionEpoch ||
+        snapshot.owner.hostInstanceId !== presentation.owner.hostInstanceId ||
+        snapshot.owner.sessionEpoch !== presentation.owner.sessionEpoch ||
+        !latestPresentation ||
+        latestPresentation.intentId !== presentation.intentId ||
+        latestPresentation.owner.hostInstanceId !== presentation.owner.hostInstanceId ||
+        latestPresentation.owner.sessionEpoch !== presentation.owner.sessionEpoch ||
         !currentOutcome ||
-        currentOutcome.state !== outcome.state
+        currentOutcome.state !== "completed" ||
+        currentOutcome.result?.targetId !== presentation.targetId ||
+        currentOutcome.result.leafId !== presentation.leafId
       ) {
         return {};
       }
@@ -2245,6 +2337,15 @@ const buildSessionsStore = (
       sessions.set(sessionId, {
         ...current,
         transcript: seedFromHistory(current.transcript, history),
+        // The complete in-memory branch is now the presentation baseline.
+        // Retire any persisted-history read that began against the previous
+        // leaf: its JSONL result may not yet encode this navigation.
+        historyHydrating: false,
+        historyHydrationToken: undefined,
+        historyGeneration: current.historyGeneration + 1,
+        transcriptPresentationDirty: false,
+        transcriptPresentationRevision: current.transcriptPresentationRevision + 1,
+        hasTreeHistory: current.hasTreeHistory || history.length > 0,
       });
       replaced = true;
       return { sessions };
@@ -2252,11 +2353,11 @@ const buildSessionsStore = (
     return replaced;
   },
 
-  consumeNavigationOutcome: (sessionId, intentId, owner) => {
+  retireNavigationPresentation: (sessionId, intentId, owner) => {
     set((state) => {
       const current = state.sessions.get(sessionId);
       if (!current?.authorityProjection) return {};
-      const authorityProjection = retireTransientNavigationOutcome(
+      const authorityProjection = retireNavigationPresentation(
         current.authorityProjection,
         intentId,
         owner,
@@ -2266,6 +2367,148 @@ const buildSessionsStore = (
       sessions.set(sessionId, { ...current, authorityProjection });
       return { sessions };
     });
+  },
+
+  reconcileNavigationPresentations: (sessionId, requested) => {
+    const requestedKey = requested
+      ? navigationPresentationKey(sessionId, requested.intentId, requested.owner)
+      : undefined;
+    const predecessor =
+      navigationReconciliationFlights.get(sessionId) ?? Promise.resolve(new Set<string>());
+    const task = predecessor
+      .catch(() => new Set<string>())
+      .then(async () => {
+        const applied = new Set<string>();
+        const acknowledge = async (presentation: NavigationPresentation): Promise<boolean> => {
+          try {
+            const response = await window.pivis.invoke(
+              "session.acknowledgeNavigationPresentation",
+              {
+                sessionId,
+                intentId: presentation.intentId,
+                expectedOwner: presentation.owner,
+              },
+            );
+            return response.acknowledged;
+          } catch {
+            return false;
+          }
+        };
+
+        const session = get().sessions.get(sessionId);
+        if (!session) {
+          clearNavigationRetriesForSession(sessionId);
+          return applied;
+        }
+        const projection = session?.authorityProjection;
+        const owner = projection?.owner;
+        if (!projection || !owner || projection.semantic.state !== "following") return applied;
+        const pending = projection.pendingNavigationPresentations.filter(
+          (item) =>
+            item.owner.hostInstanceId === owner.hostInstanceId &&
+            item.owner.sessionEpoch === owner.sessionEpoch,
+        );
+        if (pending.length === 0) {
+          clearNavigationRetriesForSession(sessionId);
+          return applied;
+        }
+
+        // Only the newest branch can be visible. Older custody is safe to
+        // retire as superseded once a later child-owned presentation exists.
+        for (const superseded of pending.slice(0, -1)) {
+          const supersededKey = navigationPresentationKey(
+            sessionId,
+            superseded.intentId,
+            superseded.owner,
+          );
+          cancelNavigationRetryTimer(supersededKey);
+          if (!(await acknowledge(superseded))) {
+            scheduleNavigationRetry(sessionId, supersededKey);
+            return applied;
+          }
+          clearNavigationRetry(supersededKey);
+          get().retireNavigationPresentation(sessionId, superseded.intentId, superseded.owner);
+        }
+
+        const refreshed = get().sessions.get(sessionId)?.authorityProjection;
+        const refreshedOwner = refreshed?.owner;
+        if (!refreshed || !refreshedOwner || refreshed.semantic.state !== "following") {
+          return applied;
+        }
+        const presentation = refreshed.pendingNavigationPresentations.at(-1);
+        if (
+          !presentation ||
+          presentation.owner.hostInstanceId !== refreshedOwner.hostInstanceId ||
+          presentation.owner.sessionEpoch !== refreshedOwner.sessionEpoch
+        ) {
+          return applied;
+        }
+        const key = navigationPresentationKey(sessionId, presentation.intentId, presentation.owner);
+        cancelNavigationRetryTimer(key);
+
+        const alreadyInstalled =
+          installedNavigationPresentations.has(key) || completedNavigationPresentations.has(key);
+        if (!alreadyInstalled) {
+          let history: TranscriptBlock[];
+          try {
+            history = await window.pivis.invoke("session.transcriptForEntries", {
+              sessionId,
+              entries: presentation.branch,
+            });
+          } catch {
+            // Keep both child and renderer custody and retry independently of
+            // tree-overlay lifetime with bounded exponential backoff.
+            scheduleNavigationRetry(sessionId, key);
+            return applied;
+          }
+          if (!get().replaceTranscriptForNavigationPresentation(sessionId, presentation, history)) {
+            const latest = get()
+              .sessions.get(sessionId)
+              ?.authorityProjection?.pendingNavigationPresentations.at(-1);
+            if (
+              latest &&
+              (latest.intentId !== presentation.intentId ||
+                latest.owner.hostInstanceId !== presentation.owner.hostInstanceId ||
+                latest.owner.sessionEpoch !== presentation.owner.sessionEpoch)
+            ) {
+              scheduleNavigationReconciliation(sessionId);
+            }
+            return applied;
+          }
+          rememberNavigationPresentation(installedNavigationPresentations, key);
+          rememberNavigationPresentation(completedNavigationPresentations, key);
+          applied.add(key);
+        } else {
+          rememberNavigationPresentation(completedNavigationPresentations, key);
+          applied.add(key);
+        }
+
+        if (await acknowledge(presentation)) {
+          get().retireNavigationPresentation(sessionId, presentation.intentId, presentation.owner);
+          installedNavigationPresentations.delete(key);
+          if (
+            get().sessions.get(sessionId)?.authorityProjection?.pendingNavigationPresentations
+              .length === 0
+          ) {
+            clearNavigationRetry(key);
+          } else {
+            scheduleNavigationReconciliation(sessionId);
+          }
+        } else {
+          scheduleNavigationRetry(sessionId, key);
+        }
+        return applied;
+      });
+    navigationReconciliationFlights.set(sessionId, task);
+    const releaseFlight = () => {
+      if (navigationReconciliationFlights.get(sessionId) === task) {
+        navigationReconciliationFlights.delete(sessionId);
+      }
+    };
+    void task.then(releaseFlight, releaseFlight);
+    return task.then(() =>
+      requestedKey === undefined ? true : completedNavigationPresentations.has(requestedKey),
+    );
   },
 
   rehydrateHistory: async (sessionId) => {
@@ -2566,6 +2809,9 @@ const buildSessionsStore = (
 
   applyAuthorityAttach: (sessionId, response) => {
     if (response.status !== "ready") return;
+    // A serialized baseline is a fresh retry boundary and may install a
+    // successor owner; predecessor failures must not exhaust its retry budget.
+    clearNavigationRetriesForSession(sessionId);
     const previousSession = get().sessions.get(sessionId);
     // Main buffers publications while the child serializes its baseline. The
     // authority reducer advances every plane through that replay, but transcript
@@ -2726,6 +2972,7 @@ const buildSessionsStore = (
     if (following && get().sessions.get(sessionId)?.status === "ready") {
       void get().refreshCommands(sessionId);
     }
+    if (following) scheduleNavigationReconciliation(sessionId);
   },
 
   acknowledgeShellReconstruction: (sessionId, reconstructionKey) => {
@@ -2972,9 +3219,13 @@ const buildSessionsStore = (
       });
     }
     if (accepted || authorityRejectedTranscript) schedulePresentationRehydrateIfIdle(sessionId);
+    if (accepted && publication.plane === "semantic") {
+      scheduleNavigationReconciliation(sessionId);
+    }
   },
 
   markAuthorityUnavailable: (sessionId, reason) => {
+    clearNavigationRetriesForSession(sessionId);
     set((state) => {
       const current = state.sessions.get(sessionId);
       if (!current) return {};
