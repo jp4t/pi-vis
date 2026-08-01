@@ -100,4 +100,31 @@ describe("ContextMeter", () => {
     expect(container.textContent).not.toContain("Cache hit rate");
     unmount();
   });
+
+  it("toggles closed on a second trigger click when the title-bar mousedown is retargeted", () => {
+    setStats({
+      sessionId,
+      tokens: { input: 100, output: 25, cacheRead: 0, cacheWrite: 0, total: 125 },
+      contextUsage: { tokens: 125, contextWindow: 1000, percent: 12.5 },
+    });
+
+    const { container, unmount } = mount(<ContextMeter sessionId={sessionId} />);
+    const button = container.querySelector<HTMLButtonElement>(".context-ring");
+    expect(button).toBeTruthy();
+    openDropdown(container);
+    expect(container.querySelector(".context-dropdown")).toBeTruthy();
+
+    const retargetedMouseDown = new MouseEvent("mousedown", { bubbles: true });
+    Object.defineProperty(retargetedMouseDown, "composedPath", {
+      value: () => [button, button!.parentElement, container, document.body, document, window],
+    });
+    act(() => {
+      document.dispatchEvent(retargetedMouseDown);
+      button!.click();
+    });
+
+    expect(button!.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".context-dropdown")).toBeNull();
+    unmount();
+  });
 });

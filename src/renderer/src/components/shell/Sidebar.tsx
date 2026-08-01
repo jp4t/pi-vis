@@ -1,7 +1,7 @@
 import type { SessionId } from "@shared/ids.js";
 import type { SessionStatus } from "@shared/ipc-contract.js";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useExtensionUpdatesStore } from "../../stores/extension-updates-store.js";
 import {
   isNewSessionPending,
@@ -83,8 +83,18 @@ function PinIcon({ filled }: { filled: boolean }): React.ReactElement {
   );
 }
 
+export function synchronizeWorkingIndicatorAnimation(element: HTMLElement): void {
+  if (typeof element.getAnimations !== "function") return;
+  const animation = element.getAnimations()[0];
+  if (animation) animation.startTime = 0;
+}
+
 function WorkingIndicator(): React.ReactElement {
-  return <span className="status-dot status-dot--streaming" title="Working" />;
+  const elementRef = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    if (elementRef.current) synchronizeWorkingIndicatorAnimation(elementRef.current);
+  }, []);
+  return <span ref={elementRef} className="status-dot status-dot--streaming" title="Working" />;
 }
 
 export function Sidebar({
@@ -130,13 +140,6 @@ export function Sidebar({
   const pinnedDragKeyRef = useRef<string | null>(null);
   const [pendingArchive, setPendingArchive] = useState<PendingArchive | null>(null);
   const [archiveInProgress, setArchiveInProgress] = useState(false);
-
-  // One parent-owned pulse clock keeps every working dot on the same phase,
-  // including dots that mount after other sessions have already started.
-  const hasWorkingSession = useMemo(
-    () => Array.from(sessions.values()).some(shouldShowWorkingIndicator),
-    [sessions],
-  );
 
   // Pinned sessions (by file path) as a Set for O(1) lookup during render.
   const pinnedSet = useMemo(() => new Set(pinnedSessions), [pinnedSessions]);
@@ -499,9 +502,7 @@ export function Sidebar({
           isn't clipped by `.sidebar { overflow: hidden }` (and the fade
           mask) when pushed out into the canvas gap to meet the content card's
           left edge. */}
-      <div
-        className={`sidebar__workspaces${hasWorkingSession ? " sidebar__workspaces--working" : ""}`}
-      >
+      <div className="sidebar__workspaces">
         {Array.from(workspaces.values()).map((ws, index) => {
           const isActiveWs = activeWorkspacePath === ws.path;
           const isExpanded = expandedWorkspaces.includes(ws.path);

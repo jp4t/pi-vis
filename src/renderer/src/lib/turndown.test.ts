@@ -1,5 +1,7 @@
+// @vitest-environment jsdom
+
 import { describe, expect, it } from "vitest";
-import { htmlToMarkdown } from "./turndown.js";
+import { htmlToMarkdown, transcriptSelectionToMarkdown } from "./turndown.js";
 
 /** Wrap HTML in a container div so Turndown behaves as it would inside
  *  a real DOM fragment (e.g. from range.cloneContents()). */
@@ -139,5 +141,35 @@ describe("htmlToMarkdown", () => {
       '<div class="code-block" data-language="js"><pre><code>line1\nline2\nline3</code></pre></div>',
     );
     expect(htmlToMarkdown(html)).toContain("```js\nline1\nline2\nline3\n```");
+  });
+
+  it("preserves literal newlines when only user-message text is selected", () => {
+    document.body.innerHTML =
+      '<div class="transcript-block transcript-block--user">' +
+      '<div class="transcript-block__content">first line\nsecond line\n\nfourth line</div>' +
+      "</div>";
+    const content = document.querySelector(".transcript-block__content");
+    if (!content) throw new Error("missing user content");
+    const range = document.createRange();
+    range.selectNodeContents(content);
+
+    expect(transcriptSelectionToMarkdown(range)).toBe("first line\nsecond line\n\nfourth line");
+  });
+
+  it("retains fences and language when a selection is wholly inside highlighted code", () => {
+    document.body.innerHTML =
+      '<div class="code-block" data-language="typescript">' +
+      '<pre class="shiki"><code>' +
+      '<span class="line"><span>const first = 1;</span></span>\n' +
+      '<span class="line"><span>const second = 2;</span></span>' +
+      "</code></pre></div>";
+    const code = document.querySelector("code");
+    if (!code) throw new Error("missing code");
+    const range = document.createRange();
+    range.selectNodeContents(code);
+
+    expect(transcriptSelectionToMarkdown(range)).toBe(
+      "```typescript\nconst first = 1;\nconst second = 2;\n```",
+    );
   });
 });

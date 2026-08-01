@@ -44,10 +44,6 @@
   line-height: var(--leading-body);
 }
 
-.queued-messages__bubble--editing {
-  border-color: var(--border-strong);
-}
-
 .queued-messages__text {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -71,24 +67,4 @@
 .queued-messages__action--remove:hover:not(:disabled),
 .queued-messages__action--remove:focus-visible {
   color: var(--danger);
-}
-
-.queued-messages__edit {
-  display: block;
-  width: min(32rem, 60vw);
-  min-height: 3.25rem;
-  max-height: 8rem;
-  resize: vertical;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--input-bg);
-  color: var(--text);
-  font: inherit;
-  line-height: var(--leading-body);
-  padding: var(--space-2);
-}
-
-.queued-messages__edit:focus {
-  border-color: var(--accent);
-  outline: none;
 }

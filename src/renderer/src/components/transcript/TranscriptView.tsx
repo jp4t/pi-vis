@@ -2,8 +2,10 @@ import type { SessionId } from "@shared/ids.js";
 import type { TranscriptStyle } from "@shared/settings.js";
 import type React from "react";
 import {
+  createContext,
   memo,
   useCallback,
+  useContext,
   useEffect,
   useId,
   useLayoutEffect,
@@ -14,7 +16,7 @@ import {
 import { AnsiText } from "../../lib/ansi.js";
 import { Markdown } from "../../lib/markdown.js";
 import { querySession } from "../../lib/session-intent.js";
-import { htmlToMarkdown } from "../../lib/turndown.js";
+import { transcriptSelectionToMarkdown } from "../../lib/turndown.js";
 import { useImageViewerStore } from "../../stores/image-viewer-store.js";
 import {
   authoritySnapshotFor,
@@ -62,6 +64,17 @@ const SCROLL_BOTTOM_EPSILON_PX = 1;
 // the Composer and shrinking the transcript viewport) as well as by the user.
 // Only an actual user scroll input may break bottom-follow.
 const USER_SCROLL_INTENT_MS = 1000;
+
+type CustomEntryVisibilityScope = "archived" | "live";
+type CompactCustomEntryVisibilityReporter = (
+  entryId: string,
+  visible: boolean,
+  scope: CustomEntryVisibilityScope,
+) => void;
+
+const CompactCustomEntryVisibilityContext =
+  createContext<CompactCustomEntryVisibilityReporter | null>(null);
+const EMPTY_CUSTOM_ENTRY_VISIBILITY: ReadonlyMap<string, boolean> = new Map();
 
 // ── Label visibility ─────────────────────────────────────────────────────
 // Only show "You" / "Pi" when the *speaker* changes.  Tool/bash blocks are
@@ -1374,11 +1387,18 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
   sessionId,
   data,
   preserveScroll,
+  visibilityProbe = false,
+  knownVisible = false,
+  visibilityScope,
 }: {
   sessionId: SessionId;
   data: CustomEntryBlockData;
   preserveScroll: (mutate: () => void) => void;
+  visibilityProbe?: boolean | undefined;
+  knownVisible?: boolean | undefined;
+  visibilityScope?: CustomEntryVisibilityScope | undefined;
 }): React.ReactElement {
+  const reportVisibility = useContext(CompactCustomEntryVisibilityContext);
   // Select primitive owner fields rather than snapshot.owner itself: every
   // authority frame carries a fresh object, and a read-only render_entry query
   // can itself publish a frame. Depending on that object/cursor creates a
@@ -1400,10 +1420,11 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
   const measurementBoxRef = useRef<HTMLSpanElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const [cols, setCols] = useState(80);
+  const [measuredForExpanded, setMeasuredForExpanded] = useState<boolean>();
   const [expanded, setExpanded] = useState(false);
   const [rendered, setRendered] = useState<RenderedEntry>();
 
-  const rendererVisible = rendered?.rendered === true;
+  const rendererVisible = rendered?.rendered === true || (!visibilityProbe && knownVisible);
   const renderedContentVisible = rendererVisible && expanded;
 
   useLayoutEffect(() => {
@@ -1417,12 +1438,17 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
         content: renderedContentVisible ? (contentRef.current ?? undefined) : undefined,
         measurementBox,
         probe,
-        applyColumns: (next) => setCols((current) => (current === next ? current : next)),
+        applyColumns: (next) => {
+          setCols((current) => (current === next ? current : next));
+          setMeasuredForExpanded(expanded);
+        },
       });
     };
-    // The first real-width query is required even when the 80-column probe was
-    // declined. Shared observation keeps hidden entries width-responsive later
-    // without installing one ResizeObserver per transcript item.
+    // Defer each collapsed/expanded query until this layout has real pane
+    // columns. This prevents a measured probe that accepted the entry from
+    // handing off to a fresh 80-column card that immediately declines it.
+    // Shared observation keeps hidden entries width-responsive later without
+    // installing one ResizeObserver per transcript item.
     scheduleMeasure();
     const stopFeedObservation = observeCustomEntryResize(
       host.closest(".transcript-blocks"),
@@ -1436,7 +1462,7 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
       stopContentObservation();
       cancelCustomEntryMeasurement(host);
     };
-  }, [renderedContentVisible]);
+  }, [expanded, renderedContentVisible]);
 
   useEffect(() => {
     renderedEpochRef.current = sessionEpoch;
@@ -1447,8 +1473,10 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
     let cancelled = false;
     if (!runtime) {
       setRendered(undefined);
+      if (visibilityScope) reportVisibility?.(data.entryId, false, visibilityScope);
       return;
     }
+    if (measuredForExpanded !== expanded) return;
     const session = useSessionsStore.getState().sessions.get(sessionId);
     const semantic = session?.authorityProjection?.semantic;
     const cursor =
@@ -1481,7 +1509,11 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
         const rendered = result.response.success
           ? (result.response.data as RenderedEntry | undefined)
           : undefined;
-        setRendered(rendered && typeof rendered.rendered === "boolean" ? rendered : undefined);
+        const next = rendered && typeof rendered.rendered === "boolean" ? rendered : undefined;
+        setRendered(next);
+        if (visibilityScope) {
+          reportVisibility?.(data.entryId, next?.rendered === true, visibilityScope);
+        }
       })
       .catch(() => {
         if (
@@ -1490,13 +1522,25 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
           !sessionMatchesRuntime(useSessionsStore.getState().sessions.get(sessionId), runtime)
         )
           return;
-        // Match Pi: entries whose extension renderer is unavailable stay hidden.
+        // Match Pi: entries whose extension renderer is unavailable stay hidden
+        // and remain transparent to Compact transcript grouping.
         setRendered(undefined);
+        if (visibilityScope) reportVisibility?.(data.entryId, false, visibilityScope);
       });
     return () => {
       cancelled = true;
     };
-  }, [sessionId, data.entryId, cols, expanded, sessionEpoch, runtime]);
+  }, [
+    sessionId,
+    data.entryId,
+    cols,
+    expanded,
+    measuredForExpanded,
+    sessionEpoch,
+    runtime,
+    reportVisibility,
+    visibilityScope,
+  ]);
 
   const toggle = useCallback(
     () => preserveScroll(() => setExpanded((value) => !value)),
@@ -1504,22 +1548,25 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
   );
 
   return (
-    <div ref={hostRef} className={`custom-entry${rendererVisible ? " custom-entry--visible" : ""}`}>
+    <div
+      ref={hostRef}
+      className={`custom-entry${rendererVisible ? " custom-entry--visible" : ""}${visibilityProbe ? " custom-entry--visibility-probe" : ""}`}
+    >
       <span ref={measurementBoxRef} className="custom-entry__measurement-box" aria-hidden="true">
         <span ref={measureRef} className="custom-entry__measure">
           0000000000
         </span>
       </span>
-      {rendererVisible && (
+      {!visibilityProbe && rendererVisible && (
         <ToolCardShell
-          isError={!!rendered.error}
+          isError={!!rendered?.error}
           open={expanded}
           onToggle={toggle}
           accessibleLabel={`${data.customType} extension entry`}
           kind={<span className="tool-card__name">extension</span>}
           subject={<FadeText className="tool-card__subject">{data.customType}</FadeText>}
           trailing={
-            rendered.error ? <span className="tool-card__badge">renderer error</span> : undefined
+            rendered?.error ? <span className="tool-card__badge">renderer error</span> : undefined
           }
         >
           <ProvenanceGrid
@@ -1531,14 +1578,14 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
           <section className="tool-card__section">
             <SectionHeader
               title="Extension view"
-              meta={rendered.error ? "renderer error" : "custom rendering"}
-              copyText={rendered.ansi ?? ""}
+              meta={rendered?.error ? "renderer error" : "custom rendering"}
+              copyText={rendered?.ansi ?? ""}
             />
             <pre
               ref={contentRef}
-              className={`tool-card__extension-render${rendered.error ? " tool-card__extension-render--error" : ""}`}
+              className={`tool-card__extension-render${rendered?.error ? " tool-card__extension-render--error" : ""}`}
             >
-              <AnsiText text={rendered.ansi ?? ""} />
+              <AnsiText text={rendered?.ansi ?? ""} />
             </pre>
           </section>
           {data.data === undefined ? (
@@ -1549,6 +1596,30 @@ const CustomEntryBlock = memo(function CustomEntryBlock({
         </ToolCardShell>
       )}
     </div>
+  );
+});
+
+type CustomEntryTranscriptBlock = Extract<TypedTranscriptBlock, { type: "custom_entry" }>;
+
+const CustomEntryVisibilityProbe = memo(function CustomEntryVisibilityProbe({
+  sessionId,
+  block,
+  scope,
+  preserveScroll,
+}: {
+  sessionId: SessionId;
+  block: CustomEntryTranscriptBlock;
+  scope: CustomEntryVisibilityScope;
+  preserveScroll: (mutate: () => void) => void;
+}): React.ReactElement {
+  return (
+    <CustomEntryBlock
+      sessionId={sessionId}
+      data={block.data}
+      preserveScroll={preserveScroll}
+      visibilityProbe
+      visibilityScope={scope}
+    />
   );
 });
 
@@ -1574,6 +1645,7 @@ interface CompactGroupStats {
 
 type CompactRenderItem =
   | { kind: "item"; item: TranscriptRenderItem }
+  | { kind: "probe"; block: CustomEntryTranscriptBlock }
   | {
       kind: "compact_group";
       key: string;
@@ -1584,9 +1656,16 @@ type CompactRenderItem =
     };
 
 type CompactGroupRenderItem = Extract<CompactRenderItem, { kind: "compact_group" }>;
+type CompactVisibilityProbeRenderItem = Extract<CompactRenderItem, { kind: "probe" }>;
 
 function renderItemKey(item: TranscriptRenderItem): string {
   return item.kind === "block" ? item.block.id : `${item.blockId}-segment-${item.segmentIndex}`;
+}
+
+function compactRenderItemKey(item: CompactRenderItem): string {
+  if (item.kind === "item") return renderItemKey(item.item);
+  if (item.kind === "probe") return `visibility-probe:${item.block.id}`;
+  return item.key;
 }
 
 function renderItemStreaming(item: TranscriptRenderItem): boolean {
@@ -1693,6 +1772,7 @@ function summarizeCompactGroup(stats: CompactGroupStats): string {
 function buildCompactRenderItems(
   blocks: readonly TypedTranscriptBlock[],
   showWorking: boolean,
+  customEntryVisibility: ReadonlyMap<string, boolean>,
 ): CompactRenderItem[] {
   const rendered: CompactRenderItem[] = [];
   let group: TranscriptRenderItem[] = [];
@@ -1736,15 +1816,24 @@ function buildCompactRenderItems(
     }
 
     const item: TranscriptRenderItem = { kind: "block", block };
+    if (block.type === "custom_entry") {
+      // Entry visibility is an asynchronous extension-renderer decision.
+      // Until accepted, a zero-size probe remains a non-flushing render item:
+      // the record stays transparent to grouping while archive presentation
+      // mounts its query through a separate bounded cooperative queue.
+      if (customEntryVisibility.get(block.data.entryId) === true) {
+        flushGroup();
+        rendered.push({ kind: "item", item });
+      } else {
+        rendered.push({ kind: "probe", block });
+      }
+      continue;
+    }
     if (
       block.type === "user" ||
       block.type === "bash" ||
-      block.type === "custom_entry" ||
       (block.type === "error" && !block.data.retryable)
     ) {
-      // Custom entries must mount before we know whether Pi's renderer accepts
-      // them. Keep them outside collapsed compact groups so an unrendered
-      // extension persistence record cannot create a visible group summary.
       flushGroup();
       rendered.push({ kind: "item", item });
     } else {
@@ -1760,10 +1849,14 @@ function TranscriptItemView({
   sessionId,
   item,
   preserveScroll,
+  customEntryKnownVisible = false,
+  customEntryVisibilityScope,
 }: {
   sessionId: SessionId;
   item: TranscriptRenderItem;
   preserveScroll: (mutate: () => void) => void;
+  customEntryKnownVisible?: boolean | undefined;
+  customEntryVisibilityScope?: CustomEntryVisibilityScope | undefined;
 }): React.ReactElement | null {
   if (item.kind === "assistant_segment") {
     return (
@@ -1798,7 +1891,13 @@ function TranscriptItemView({
       );
     case "custom_entry":
       return (
-        <CustomEntryBlock sessionId={sessionId} data={block.data} preserveScroll={preserveScroll} />
+        <CustomEntryBlock
+          sessionId={sessionId}
+          data={block.data}
+          preserveScroll={preserveScroll}
+          knownVisible={customEntryKnownVisible}
+          visibilityScope={customEntryVisibilityScope}
+        />
       );
     case "error":
       return <ErrorBlock data={block.data} />;
@@ -1898,6 +1997,11 @@ const CompactTranscriptGroup = memo(function CompactTranscriptGroup({
 }): React.ReactElement {
   const { open, toggle } = useCardDisclosure(preserveScroll);
   const contentId = useId();
+  const summaryRef = useRef<HTMLButtonElement>(null);
+  const collapseFromRail = useCallback(() => {
+    summaryRef.current?.focus();
+    toggle();
+  }, [toggle]);
 
   return (
     <div
@@ -1905,6 +2009,7 @@ const CompactTranscriptGroup = memo(function CompactTranscriptGroup({
       aria-busy={streaming || undefined}
     >
       <button
+        ref={summaryRef}
         type="button"
         className="compact-transcript-group__summary"
         onClick={toggle}
@@ -1916,6 +2021,15 @@ const CompactTranscriptGroup = memo(function CompactTranscriptGroup({
       </button>
       {open && (
         <div id={contentId} className="compact-transcript-group__content">
+          <button
+            type="button"
+            className="compact-transcript-group__collapse-rail"
+            onClick={collapseFromRail}
+            aria-expanded="true"
+            aria-controls={contentId}
+            aria-label={`Collapse activity — ${summary}`}
+            title="Collapse activity"
+          />
           {archivedItems.length > 0 && (
             <CompactTranscriptGroupItems
               sessionId={sessionId}
@@ -2003,14 +2117,24 @@ const ArchivedCompactChunk = memo(function ArchivedCompactChunk({
       {items.map((item) =>
         item.kind === "item" ? (
           <TranscriptItemView
-            key={renderItemKey(item.item)}
+            key={compactRenderItemKey(item)}
             sessionId={sessionId}
             item={item.item}
+            preserveScroll={preserveScroll}
+            customEntryKnownVisible
+            customEntryVisibilityScope="archived"
+          />
+        ) : item.kind === "probe" ? (
+          <CustomEntryVisibilityProbe
+            key={compactRenderItemKey(item)}
+            sessionId={sessionId}
+            block={item.block}
+            scope="archived"
             preserveScroll={preserveScroll}
           />
         ) : (
           <CompactTranscriptGroup
-            key={item.key}
+            key={compactRenderItemKey(item)}
             sessionId={sessionId}
             items={item.items}
             summary={item.summary}
@@ -2020,6 +2144,30 @@ const ArchivedCompactChunk = memo(function ArchivedCompactChunk({
         ),
       )}
     </div>
+  );
+});
+
+const ArchivedVisibilityProbeChunk = memo(function ArchivedVisibilityProbeChunk({
+  items,
+  sessionId,
+  preserveScroll,
+}: {
+  items: CompactVisibilityProbeRenderItem[];
+  sessionId: SessionId;
+  preserveScroll: (mutate: () => void) => void;
+}): React.ReactElement {
+  return (
+    <>
+      {items.map((item) => (
+        <CustomEntryVisibilityProbe
+          key={compactRenderItemKey(item)}
+          sessionId={sessionId}
+          block={item.block}
+          scope="archived"
+          preserveScroll={preserveScroll}
+        />
+      ))}
+    </>
   );
 });
 
@@ -2036,11 +2184,38 @@ const ArchivedTranscript = memo(function ArchivedTranscript({
   restorePrependScroll,
 }: ArchivedTranscriptProps): React.ReactElement {
   const verboseChunks = useMemo(() => chunkArchiveItems(blocks), [blocks]);
-  const compactChunks = useMemo(() => chunkArchiveItems(compactItems), [compactItems]);
+  const { compactSemanticItems, compactVisibilityProbes } = useMemo(() => {
+    const semanticItems: CompactRenderItem[] = [];
+    const visibilityProbes: CompactVisibilityProbeRenderItem[] = [];
+    for (const item of compactItems) {
+      if (item.kind === "probe") visibilityProbes.push(item);
+      else semanticItems.push(item);
+    }
+    return {
+      compactSemanticItems: semanticItems,
+      compactVisibilityProbes: visibilityProbes,
+    };
+  }, [compactItems]);
+  const compactChunks = useMemo(
+    () => chunkArchiveItems(compactSemanticItems),
+    [compactSemanticItems],
+  );
+  const compactVisibilityProbeChunks = useMemo(
+    () => chunkArchiveItems(compactVisibilityProbes),
+    [compactVisibilityProbes],
+  );
   const chunks = style === "compact" ? compactChunks : verboseChunks;
   const [visibleStart, setVisibleStart] = useState(() => Math.max(0, chunks.length - 1));
+  const [visibleProbeStart, setVisibleProbeStart] = useState(() =>
+    Math.max(0, compactVisibilityProbeChunks.length - 1),
+  );
+  const previousProbeChunkCountRef = useRef(compactVisibilityProbeChunks.length);
   const prependSnapshotRef = useRef<ArchiveScrollSnapshot | undefined>(undefined);
   const effectiveStart = Math.min(visibleStart, chunks.length);
+  const probeChunksGrew = compactVisibilityProbeChunks.length > previousProbeChunkCountRef.current;
+  const effectiveProbeStart = probeChunksGrew
+    ? Math.max(0, compactVisibilityProbeChunks.length - 1)
+    : Math.min(visibleProbeStart, compactVisibilityProbeChunks.length);
 
   useEffect(() => {
     if (effectiveStart === 0) return;
@@ -2050,6 +2225,23 @@ const ArchivedTranscript = memo(function ArchivedTranscript({
     });
     return () => cancelAnimationFrame(frame);
   }, [capturePrependScroll, effectiveStart]);
+
+  useEffect(() => {
+    if (style !== "compact" || effectiveProbeStart === 0) return;
+    const frame = requestAnimationFrame(() => {
+      setVisibleProbeStart((current) => Math.max(0, current - 1));
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [effectiveProbeStart, style]);
+
+  useLayoutEffect(() => {
+    if (probeChunksGrew) {
+      setVisibleProbeStart(Math.max(0, compactVisibilityProbeChunks.length - 1));
+    } else if (visibleProbeStart > compactVisibilityProbeChunks.length) {
+      setVisibleProbeStart(compactVisibilityProbeChunks.length);
+    }
+    previousProbeChunkCountRef.current = compactVisibilityProbeChunks.length;
+  }, [compactVisibilityProbeChunks.length, probeChunksGrew, visibleProbeStart]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: visibleStart is the post-commit trigger for a snapshot captured before that state update.
   useLayoutEffect(() => {
@@ -2072,11 +2264,7 @@ const ArchivedTranscript = memo(function ArchivedTranscript({
             .slice(effectiveStart)
             .map((items) => (
               <ArchivedCompactChunk
-                key={
-                  items[0]?.kind === "item"
-                    ? renderItemKey(items[0].item)
-                    : (items[0]?.key ?? "empty")
-                }
+                key={items[0] ? compactRenderItemKey(items[0]) : "empty"}
                 items={items}
                 sessionId={sessionId}
                 preserveScroll={preserveScroll}
@@ -2092,6 +2280,17 @@ const ArchivedTranscript = memo(function ArchivedTranscript({
                 preserveScroll={preserveScroll}
               />
             ))}
+      {style === "compact" &&
+        compactVisibilityProbeChunks
+          .slice(effectiveProbeStart)
+          .map((items) => (
+            <ArchivedVisibilityProbeChunk
+              key={items[0] ? compactRenderItemKey(items[0]) : "empty-probes"}
+              items={items}
+              sessionId={sessionId}
+              preserveScroll={preserveScroll}
+            />
+          ))}
     </>
   );
 });
@@ -2105,9 +2304,120 @@ interface TranscriptViewProps {
   sessionId: SessionId;
 }
 
+interface CustomEntryVisibilityState {
+  generation: string;
+  archived: ReadonlyMap<string, boolean>;
+  live: ReadonlyMap<string, boolean>;
+}
+
 export function TranscriptView({ sessionId }: TranscriptViewProps): React.ReactElement {
   const session = useSessionsStore((s) => s.sessions.get(sessionId));
   const transcriptStyle = useSettingsStore((s) => s.settings.transcriptStyle);
+  const customEntryOwner = authoritySnapshotFor(session)?.owner;
+  const customEntryGeneration = [
+    sessionId,
+    session?.historyGeneration ?? 0,
+    customEntryOwner?.hostInstanceId ?? "detached",
+    customEntryOwner?.sessionEpoch ?? 0,
+    transcriptStyle,
+  ].join(":");
+  const pendingCustomEntryVisibilityRef = useRef(
+    new Map<string, { visible: boolean; scope: CustomEntryVisibilityScope }>(),
+  );
+  const customEntryVisibilityFrameRef = useRef<number | undefined>(undefined);
+  const [customEntryVisibilityState, setCustomEntryVisibilityState] =
+    useState<CustomEntryVisibilityState>(() => ({
+      generation: customEntryGeneration,
+      archived: new Map(),
+      live: new Map(),
+    }));
+  const archivedCustomEntryVisibility =
+    customEntryVisibilityState.generation === customEntryGeneration
+      ? customEntryVisibilityState.archived
+      : EMPTY_CUSTOM_ENTRY_VISIBILITY;
+  const liveCustomEntryVisibility =
+    customEntryVisibilityState.generation === customEntryGeneration
+      ? customEntryVisibilityState.live
+      : EMPTY_CUSTOM_ENTRY_VISIBILITY;
+  const flushCustomEntryVisibility = useCallback((): void => {
+    customEntryVisibilityFrameRef.current = undefined;
+    const reports = pendingCustomEntryVisibilityRef.current;
+    pendingCustomEntryVisibilityRef.current = new Map();
+    if (reports.size === 0) return;
+    setCustomEntryVisibilityState((current) => {
+      const currentArchived =
+        current.generation === customEntryGeneration
+          ? current.archived
+          : EMPTY_CUSTOM_ENTRY_VISIBILITY;
+      const currentLive =
+        current.generation === customEntryGeneration ? current.live : EMPTY_CUSTOM_ENTRY_VISIBILITY;
+      let nextArchived: Map<string, boolean> | undefined;
+      let nextLive: Map<string, boolean> | undefined;
+      for (const [entryId, { visible, scope }] of reports) {
+        const currentVisibility =
+          scope === "archived" ? (nextArchived ?? currentArchived) : (nextLive ?? currentLive);
+        if (visible) {
+          if (currentVisibility.get(entryId) === true) continue;
+          if (scope === "archived") {
+            nextArchived ??= new Map(currentArchived);
+            nextArchived.set(entryId, true);
+          } else {
+            nextLive ??= new Map(currentLive);
+            nextLive.set(entryId, true);
+          }
+        } else {
+          if (!currentVisibility.has(entryId)) continue;
+          if (scope === "archived") {
+            nextArchived ??= new Map(currentArchived);
+            nextArchived.delete(entryId);
+          } else {
+            nextLive ??= new Map(currentLive);
+            nextLive.delete(entryId);
+          }
+        }
+      }
+      if (!nextArchived && !nextLive) return current;
+      return {
+        generation: customEntryGeneration,
+        archived: nextArchived ?? currentArchived,
+        live: nextLive ?? currentLive,
+      };
+    });
+  }, [customEntryGeneration]);
+  const reportCustomEntryVisibility = useCallback(
+    (entryId: string, visible: boolean, scope: CustomEntryVisibilityScope): void => {
+      pendingCustomEntryVisibilityRef.current.set(entryId, { visible, scope });
+      if (customEntryVisibilityFrameRef.current !== undefined) return;
+      if (typeof requestAnimationFrame === "function") {
+        customEntryVisibilityFrameRef.current = requestAnimationFrame(flushCustomEntryVisibility);
+      } else {
+        customEntryVisibilityFrameRef.current = -1;
+        queueMicrotask(flushCustomEntryVisibility);
+      }
+    },
+    [flushCustomEntryVisibility],
+  );
+  useLayoutEffect(() => {
+    setCustomEntryVisibilityState((current) =>
+      current.generation === customEntryGeneration
+        ? current
+        : {
+            generation: customEntryGeneration,
+            archived: new Map(),
+            live: new Map(),
+          },
+    );
+    return () => {
+      const frame = customEntryVisibilityFrameRef.current;
+      if (frame !== undefined && frame >= 0 && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(frame);
+      }
+      customEntryVisibilityFrameRef.current = undefined;
+      pendingCustomEntryVisibilityRef.current.clear();
+    };
+  }, [customEntryGeneration]);
+  const compactCustomEntryVisibility =
+    transcriptStyle === "compact" ? reportCustomEntryVisibility : null;
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -2232,19 +2542,36 @@ export function TranscriptView({ sessionId }: TranscriptViewProps): React.ReactE
   const archivedCompactItems = useMemo(
     () =>
       transcriptStyle === "compact"
-        ? buildCompactRenderItems(archivedBlocks, false)
+        ? buildCompactRenderItems(archivedBlocks, false, archivedCustomEntryVisibility)
         : EMPTY_COMPACT_RENDER_ITEMS,
-    [archivedBlocks, transcriptStyle],
+    [archivedBlocks, archivedCustomEntryVisibility, transcriptStyle],
   );
   // Keep a trailing archive activity group at the stable archive/live boundary.
   // It can absorb leading live activity without flattening or regrouping the
   // complete archive, and its disclosure state survives live-tail updates.
-  const lastArchivedCompactItem = archivedCompactItems.at(-1);
-  const archivedBoundaryGroup: CompactGroupRenderItem | undefined =
-    lastArchivedCompactItem?.kind === "compact_group" ? lastArchivedCompactItem : undefined;
+  // Visibility probes are structurally present but semantically transparent,
+  // so they cannot hide a boundary group that precedes or follows them.
+  const archivedBoundary = useMemo(() => {
+    for (let index = archivedCompactItems.length - 1; index >= 0; index -= 1) {
+      const item = archivedCompactItems[index];
+      if (item?.kind === "probe") continue;
+      return {
+        index: item?.kind === "compact_group" ? index : -1,
+        group: item?.kind === "compact_group" ? item : undefined,
+      };
+    }
+    return { index: -1, group: undefined };
+  }, [archivedCompactItems]);
+  const archivedBoundaryGroup: CompactGroupRenderItem | undefined = archivedBoundary.group;
   const archivedCompactPrefix = useMemo(
-    () => (archivedBoundaryGroup ? archivedCompactItems.slice(0, -1) : archivedCompactItems),
-    [archivedBoundaryGroup, archivedCompactItems],
+    () =>
+      archivedBoundary.index >= 0
+        ? [
+            ...archivedCompactItems.slice(0, archivedBoundary.index),
+            ...archivedCompactItems.slice(archivedBoundary.index + 1),
+          ]
+        : archivedCompactItems,
+    [archivedBoundary.index, archivedCompactItems],
   );
   // Show the "Running for …" indicator for real agent work. Prompt-backed
   // extension UI can set isStreaming while merely waiting on the user, so the
@@ -2254,11 +2581,13 @@ export function TranscriptView({ sessionId }: TranscriptViewProps): React.ReactE
   const compactRenderItems = useMemo(
     () =>
       transcriptStyle === "compact"
-        ? buildCompactRenderItems(liveBlocks, showWorking)
+        ? buildCompactRenderItems(liveBlocks, showWorking, liveCustomEntryVisibility)
         : EMPTY_COMPACT_RENDER_ITEMS,
-    [showWorking, liveBlocks, transcriptStyle],
+    [showWorking, liveBlocks, liveCustomEntryVisibility, transcriptStyle],
   );
-  const firstLiveCompactItem = compactRenderItems[0];
+  const firstLiveSemanticIndex = compactRenderItems.findIndex((item) => item.kind !== "probe");
+  const firstLiveCompactItem =
+    firstLiveSemanticIndex >= 0 ? compactRenderItems[firstLiveSemanticIndex] : undefined;
   const leadingLiveCompactGroup: CompactGroupRenderItem | undefined =
     firstLiveCompactItem?.kind === "compact_group" ? firstLiveCompactItem : undefined;
   // Combine only fixed-size metadata across the boundary. Archived activity
@@ -2274,13 +2603,16 @@ export function TranscriptView({ sessionId }: TranscriptViewProps): React.ReactE
   // even before the live assistant has emitted a non-empty segment. Visible
   // live prose (or another non-group item) ends that active presentation.
   const compactBoundaryStreaming =
-    leadingLiveCompactGroup?.streaming ?? (compactRenderItems.length === 0 && showWorking);
+    leadingLiveCompactGroup?.streaming ?? (firstLiveCompactItem === undefined && showWorking);
   const compactLiveItems = useMemo(
     () =>
       archivedBoundaryGroup && leadingLiveCompactGroup
-        ? compactRenderItems.slice(1)
+        ? [
+            ...compactRenderItems.slice(0, firstLiveSemanticIndex),
+            ...compactRenderItems.slice(firstLiveSemanticIndex + 1),
+          ]
         : compactRenderItems,
-    [archivedBoundaryGroup, compactRenderItems, leadingLiveCompactGroup],
+    [archivedBoundaryGroup, compactRenderItems, firstLiveSemanticIndex, leadingLiveCompactGroup],
   );
 
   // Sticky bottom via distance-from-bottom detection. Robust against:
@@ -2467,8 +2799,7 @@ export function TranscriptView({ sessionId }: TranscriptViewProps): React.ReactE
     const range = selection.getRangeAt(0);
     if (!container.contains(range.commonAncestorContainer)) return;
 
-    const fragment = range.cloneContents();
-    const markdown = htmlToMarkdown(fragment);
+    const markdown = transcriptSelectionToMarkdown(range);
 
     e.preventDefault();
     e.clipboardData.setData("text/plain", markdown);
@@ -2484,77 +2815,89 @@ export function TranscriptView({ sessionId }: TranscriptViewProps): React.ReactE
     .join(" ");
 
   return (
-    <div
-      className={transcriptClassName}
-      ref={scrollRef}
-      onScroll={handleScroll}
-      onWheelCapture={markUserScrollIntent}
-      onTouchMoveCapture={markUserScrollIntent}
-      onKeyDownCapture={(e) => {
-        if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(e.key)) {
-          markUserScrollIntent();
-        }
-      }}
-      onCopy={handleClipboard}
-    >
-      <div className="transcript-blocks" ref={contentRef}>
-        <ArchivedTranscript
-          key={`${sessionId}:${session?.historyGeneration ?? 0}:${transcriptStyle}`}
-          blocks={archivedBlocks}
-          compactItems={archivedCompactPrefix}
-          style={transcriptStyle}
-          sessionId={sessionId}
-          preserveScroll={preserveScroll}
-          capturePrependScroll={capturePrependScroll}
-          restorePrependScroll={restorePrependScroll}
-        />
-        {transcriptStyle === "compact" && archivedBoundaryGroup && compactBoundarySummary && (
-          <CompactTranscriptGroup
-            key={archivedBoundaryGroup.key}
+    <CompactCustomEntryVisibilityContext.Provider value={compactCustomEntryVisibility}>
+      <div
+        className={transcriptClassName}
+        ref={scrollRef}
+        onScroll={handleScroll}
+        onWheelCapture={markUserScrollIntent}
+        onTouchMoveCapture={markUserScrollIntent}
+        onKeyDownCapture={(e) => {
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(e.key)) {
+            markUserScrollIntent();
+          }
+        }}
+        onCopy={handleClipboard}
+      >
+        <div className="transcript-blocks" ref={contentRef}>
+          <ArchivedTranscript
+            key={`${sessionId}:${session?.historyGeneration ?? 0}:${transcriptStyle}`}
+            blocks={archivedBlocks}
+            compactItems={archivedCompactPrefix}
+            style={transcriptStyle}
             sessionId={sessionId}
-            archivedItems={archivedBoundaryGroup.items}
-            items={leadingLiveCompactGroup?.items ?? EMPTY_COMPACT_GROUP_ITEMS}
-            summary={compactBoundarySummary}
-            streaming={compactBoundaryStreaming}
             preserveScroll={preserveScroll}
+            capturePrependScroll={capturePrependScroll}
+            restorePrependScroll={restorePrependScroll}
           />
-        )}
-        {transcriptStyle === "compact"
-          ? compactLiveItems.map((item) =>
-              item.kind === "item" ? (
+          {transcriptStyle === "compact" && archivedBoundaryGroup && compactBoundarySummary && (
+            <CompactTranscriptGroup
+              key={archivedBoundaryGroup.key}
+              sessionId={sessionId}
+              archivedItems={archivedBoundaryGroup.items}
+              items={leadingLiveCompactGroup?.items ?? EMPTY_COMPACT_GROUP_ITEMS}
+              summary={compactBoundarySummary}
+              streaming={compactBoundaryStreaming}
+              preserveScroll={preserveScroll}
+            />
+          )}
+          {transcriptStyle === "compact"
+            ? compactLiveItems.map((item) =>
+                item.kind === "item" ? (
+                  <TranscriptItemView
+                    key={compactRenderItemKey(item)}
+                    sessionId={sessionId}
+                    item={item.item}
+                    preserveScroll={preserveScroll}
+                    customEntryKnownVisible
+                    customEntryVisibilityScope="live"
+                  />
+                ) : item.kind === "probe" ? (
+                  <CustomEntryVisibilityProbe
+                    key={compactRenderItemKey(item)}
+                    sessionId={sessionId}
+                    block={item.block}
+                    scope="live"
+                    preserveScroll={preserveScroll}
+                  />
+                ) : (
+                  <CompactTranscriptGroup
+                    key={compactRenderItemKey(item)}
+                    sessionId={sessionId}
+                    items={item.items}
+                    summary={item.summary}
+                    streaming={item.streaming}
+                    preserveScroll={preserveScroll}
+                  />
+                ),
+              )
+            : liveBlocks.map((block) => (
                 <TranscriptItemView
-                  key={renderItemKey(item.item)}
+                  key={block.id}
                   sessionId={sessionId}
-                  item={item.item}
+                  item={{ kind: "block", block }}
                   preserveScroll={preserveScroll}
                 />
-              ) : (
-                <CompactTranscriptGroup
-                  key={item.key}
-                  sessionId={sessionId}
-                  items={item.items}
-                  summary={item.summary}
-                  streaming={item.streaming}
-                  preserveScroll={preserveScroll}
-                />
-              ),
-            )
-          : liveBlocks.map((block) => (
-              <TranscriptItemView
-                key={block.id}
-                sessionId={sessionId}
-                item={{ kind: "block", block }}
-                preserveScroll={preserveScroll}
-              />
-            ))}
-        {showWorking && <WorkingRow sessionId={sessionId} />}
-        {showHistoryLoading && (
-          <div className="history-loading-row" role="status">
-            <Spinner />
-            <span>Loading conversation history…</span>
-          </div>
-        )}
+              ))}
+          {showWorking && <WorkingRow sessionId={sessionId} />}
+          {showHistoryLoading && (
+            <div className="history-loading-row" role="status">
+              <Spinner />
+              <span>Loading conversation history…</span>
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+    </CompactCustomEntryVisibilityContext.Provider>
   );
 }

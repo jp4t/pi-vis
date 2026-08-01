@@ -46,3 +46,64 @@ turndownService.addRule("codeBlock", {
 export function htmlToMarkdown(html: string | DocumentFragment): string {
   return turndownService.turndown(html);
 }
+
+function closestElement(node: Node, selector: string): Element | null {
+  const element = node.nodeType === node.ELEMENT_NODE ? (node as Element) : node.parentElement;
+  return element?.closest(selector) ?? null;
+}
+
+function selectedTextContent(range: Range, root: Element): string {
+  const text = root.textContent ?? "";
+  const prefixLength = (container: Node, offset: number): number => {
+    const prefix = root.ownerDocument.createRange();
+    prefix.selectNodeContents(root);
+    prefix.setEnd(container, offset);
+    return (prefix.cloneContents().textContent ?? "").length;
+  };
+  return text.slice(
+    prefixLength(range.startContainer, range.startOffset),
+    prefixLength(range.endContainer, range.endOffset),
+  );
+}
+
+/**
+ * Convert a transcript selection to clipboard Markdown while retaining the
+ * semantic container that Range.cloneContents() drops when both selection
+ * endpoints live inside that container.
+ *
+ * User messages are authored plain text, so their literal Range text is the
+ * clipboard source of truth (including newlines represented only through
+ * `white-space: pre-wrap`). Fenced code needs a synthetic copy of its original
+ * wrapper so the code-block Turndown rule still supplies fences and language
+ * metadata when the selection contains no surrounding prose.
+ */
+export function transcriptSelectionToMarkdown(range: Range): string {
+  const commonAncestor = range.commonAncestorContainer;
+  const userContent = closestElement(
+    commonAncestor,
+    ".transcript-block--user .transcript-block__content",
+  );
+  if (userContent) {
+    return selectedTextContent(range, userContent);
+  }
+
+  const codeBlock = closestElement(commonAncestor, ".code-block");
+  if (codeBlock) {
+    const selectedCodeBlock = codeBlock.cloneNode(false) as Element;
+    const selectedCode = selectedTextContent(range, codeBlock);
+    if (selectedCodeBlock.nodeName === "PRE") {
+      selectedCodeBlock.textContent = selectedCode;
+    } else {
+      const pre = codeBlock.ownerDocument.createElement("pre");
+      const code = codeBlock.ownerDocument.createElement("code");
+      code.textContent = selectedCode;
+      pre.append(code);
+      selectedCodeBlock.append(pre);
+    }
+    const fragment = codeBlock.ownerDocument.createDocumentFragment();
+    fragment.append(selectedCodeBlock);
+    return htmlToMarkdown(fragment);
+  }
+
+  return htmlToMarkdown(range.cloneContents());
+}

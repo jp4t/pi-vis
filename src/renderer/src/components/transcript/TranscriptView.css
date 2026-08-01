@@ -1137,6 +1137,37 @@
   border-left: 1px solid var(--border-faint);
 }
 
+/* A wider invisible button sits around the structural hairline so the line
+   remains an easy collapse target without changing expanded-card geometry. */
+.compact-transcript-group__collapse-rail {
+  position: absolute;
+  inset: 0 auto 0 -0.429rem;
+  z-index: 1;
+  width: 0.857rem;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.compact-transcript-group__collapse-rail::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 calc(0.429rem - 1px);
+  width: 1px;
+  background: var(--border-faint);
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.compact-transcript-group__collapse-rail:is(:hover, :focus-visible)::before {
+  background: var(--accent);
+  box-shadow: 0 0 0.571rem color-mix(in srgb, var(--accent) 42%, transparent);
+}
+
+.compact-transcript-group__collapse-rail:focus-visible {
+  outline: none;
+}
+
 /* Working indicator shown while the agent is running */
 .working-row {
   display: flex;
@@ -1341,6 +1372,19 @@
 
 .custom-entry--visible {
   margin: var(--space-2) 0;
+}
+
+/* Compact mode resolves extension visibility without letting an unresolved or
+   declined persistence record occupy feed space. The probe remains laid out
+   enough to measure the shared transcript width, but is removed from flex flow
+   so it cannot create a visual gap or split an activity disclosure. */
+.custom-entry--visibility-probe {
+  position: absolute;
+  width: 0;
+  height: 0;
+  margin: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .custom-entry__measurement-box {

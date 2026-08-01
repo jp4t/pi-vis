@@ -33,6 +33,10 @@ describe("pinned Pi runtime", () => {
       join(piPackageRoot, "dist", "core", "extensions", "types.d.ts"),
       "utf8",
     );
+    const extensionRunnerTypes = fs.readFileSync(
+      join(piPackageRoot, "dist", "core", "extensions", "runner.d.ts"),
+      "utf8",
+    );
     const publicIndexTypes = fs.readFileSync(join(piPackageRoot, "dist", "index.d.ts"), "utf8");
 
     expect(agentSessionTypes).toContain('type: "summarization_retry_scheduled"');
@@ -41,6 +45,8 @@ describe("pinned Pi runtime", () => {
     expect(agentSessionTypes).toContain("id?: string");
     expect(extensionTypes).toContain("constrainedSampling?: false | ConstrainedSamplingConfig");
     expect(extensionTypes).toContain("outputPad: number");
+    expect(extensionRunnerTypes).toContain("emitInput(text: string");
+    expect(extensionRunnerTypes).toContain("Promise<InputEventResult>");
     expect(publicIndexTypes).toContain("resolveModelScopeWithDiagnostics");
 
     const pi = await import("@earendil-works/pi-coding-agent");

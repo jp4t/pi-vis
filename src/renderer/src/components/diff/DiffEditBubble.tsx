@@ -530,42 +530,12 @@ export function DiffEditBubble(): React.ReactElement | null {
         openResolved("shortcut");
       }
     };
-    // DIAGNOSTIC: detect continuous DOM churn in the diff content (rows
-    // re-rendering under an active selection — the "shifting highlight"
-    // culprit). Logs once per second while churn exceeds the threshold,
-    // with a sample mutated node so the offending component is nameable.
-    let mutationCount = 0;
-    let mutationSample: string | null = null;
-    const observer = new MutationObserver((muts) => {
-      mutationCount += muts.length;
-      if (mutationSample === null) {
-        const t = muts[0]?.target;
-        mutationSample =
-          t instanceof Element
-            ? t.className
-            : (t?.parentElement?.className ?? String(t?.nodeName ?? "?"));
-      }
-    });
-    const content = document.querySelector(".diff-content");
-    if (content) observer.observe(content, { childList: true, characterData: true, subtree: true });
-    const churnTick = window.setInterval(() => {
-      if (mutationCount > 30) {
-        console.log(
-          `[diff-edit] diff DOM churning: ${mutationCount} mutations/s (sample target: ${JSON.stringify(mutationSample)})`,
-        );
-      }
-      mutationCount = 0;
-      mutationSample = null;
-    }, 1000);
-
     document.addEventListener("mousedown", onMouseDown, true);
     window.addEventListener("mouseup", onMouseUp, true);
     window.addEventListener("blur", onBlur);
     document.addEventListener("selectionchange", onSelectionChange);
     window.addEventListener("keydown", onKey, true);
     return () => {
-      observer.disconnect();
-      window.clearInterval(churnTick);
       document.removeEventListener("mousedown", onMouseDown, true);
       window.removeEventListener("mouseup", onMouseUp, true);
       window.removeEventListener("blur", onBlur);

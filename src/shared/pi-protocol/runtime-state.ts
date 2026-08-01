@@ -375,6 +375,13 @@ export const QueueManagementAvailabilitySchema = z
     available: z.boolean(),
     /** Human-readable reason when a mutable queue operation is unsafe. */
     message: z.string().optional(),
+    /**
+     * Owned targets that may still be removed even when rewriting/reordering
+     * the complete queue is unsafe. The host has proved that every *remaining*
+     * slot can be rebuilt exactly; the removed target itself need not be
+     * replayable.
+     */
+    removableIntentIds: z.array(NonEmptyIdSchema).optional(),
   })
   .strict()
   .superRefine((availability, ctx) => {
@@ -383,6 +390,14 @@ export const QueueManagementAvailabilitySchema = z
         code: z.ZodIssueCode.custom,
         path: ["message"],
         message: "an unavailable queue manager needs an explanatory message",
+      });
+    }
+    const removableIntentIds = availability.removableIntentIds ?? [];
+    if (new Set(removableIntentIds).size !== removableIntentIds.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["removableIntentIds"],
+        message: "removable queue intent ids must be unique",
       });
     }
   });
@@ -422,6 +437,16 @@ export const AuthoritativeQueuesSchema = z
         code: z.ZodIssueCode.custom,
         message: "one GUI intent may own at most one authoritative queue slot",
       });
+    }
+    const ownedIntentIdSet = new Set(ownedIntentIds);
+    for (const [index, intentId] of (queues.management?.removableIntentIds ?? []).entries()) {
+      if (!ownedIntentIdSet.has(intentId)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["management", "removableIntentIds", index],
+          message: "a removable intent must own an authoritative queue slot",
+        });
+      }
     }
   });
 export type AuthoritativeQueues = z.infer<typeof AuthoritativeQueuesSchema>;

@@ -164,6 +164,8 @@ export function assertHostCapabilities(session, runtime, pi) {
     "getRegisteredCommands",
     "session.extensionRunner.getRegisteredCommands",
   );
+  fn(session?.extensionRunner, "hasHandlers", "session.extensionRunner.hasHandlers");
+  fn(session?.extensionRunner, "emitInput", "session.extensionRunner.emitInput");
   fn(session?.resourceLoader, "getSkills", "session.resourceLoader.getSkills");
   fn(session?.sessionManager, "getLeafId", "session.sessionManager.getLeafId");
   fn(session?.sessionManager, "getBranch", "session.sessionManager.getBranch");
@@ -277,6 +279,8 @@ export function setupCommandBridge({
   let activeShell = null;
   const lifecycleContext = new AsyncLocalStorage();
   const admissionContext = new AsyncLocalStorage();
+  const inputEmissionContext = new AsyncLocalStorage();
+  const observedInputRunners = new WeakMap();
   const lifecycleBlockers = new Map();
   let nextLifecycleId = 0;
   const resolveModelScope = async (patterns, targetSession = _session) => {
@@ -332,12 +336,51 @@ export function setupCommandBridge({
       });
     },
     runWithSurface: (surface, operation, intentId) =>
-      admissionContext.run(intentId, () =>
-        typeof runWithInvocationSurface === "function"
+      admissionContext.run(intentId, () => {
+        ensureInputResultObserver(_session.extensionRunner);
+        return typeof runWithInvocationSurface === "function"
           ? runWithInvocationSurface(surface, operation)
-          : operation(),
-      ),
+          : operation();
+      }),
   });
+
+  function ensureInputResultObserver(runner) {
+    if (!runner || typeof runner.emitInput !== "function") return;
+    const installed = observedInputRunners.get(runner);
+    if (installed && runner.emitInput === installed) return;
+    const emitInput = runner.emitInput;
+    const wrapped = function (...args) {
+      const nested = inputEmissionContext.getStore() === true;
+      const initiatingIntentId = admissionContext.getStore();
+      return inputEmissionContext.run(true, async () => {
+        const result = await Reflect.apply(emitInput, this, args);
+        if (!nested) {
+          authority.observeInputAdmissionResult(
+            initiatingIntentId,
+            {
+              text: args[0],
+              images: args[1],
+              source: args[2],
+              streamingBehavior: args[3],
+            },
+            result,
+          );
+        }
+        return result;
+      });
+    };
+    try {
+      // ExtensionRunner.emitInput() is a public Pi method. Wrapping the live
+      // runner here observes its final continue/transform/handled result
+      // without executing handlers twice. The current runner is checked at
+      // each operation, so Pi reload/rebind replacements are covered too.
+      runner.emitInput = wrapped;
+      if (runner.emitInput === wrapped) observedInputRunners.set(runner, wrapped);
+    } catch {
+      // A non-writable/non-conforming runner retains conservative anonymous
+      // queue attribution rather than making prompt admission fail.
+    }
+  }
 
   // A confined search open gives Pi an inode-stable transport path while the
   // authority presents the validated canonical source. Extensions can read
@@ -841,7 +884,12 @@ export function setupCommandBridge({
     _unsubscribe?.();
     _unsubscribe = s.subscribe((event) => {
       // Events repair transcript/UI detail; direct snapshots own runtime state.
-      authority.observeEvent(event, admissionContext.getStore());
+      // Queue work started by an input hook is extension-owned even when that
+      // hook ultimately returns `continue`. Detached/nested work inherits this
+      // context, so never let it claim the outer GUI admission's queue slot.
+      const initiatingIntentId =
+        inputEmissionContext.getStore() === true ? undefined : admissionContext.getStore();
+      authority.observeEvent(event, initiatingIntentId);
       // Pi 0.80.4's cache-miss notices normally live in InteractiveMode, which
       // the SDK host does not instantiate. Re-derive the same opt-in notice
       // from public session/message data so showCacheMissNotices still works.

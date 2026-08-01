@@ -140,8 +140,9 @@ export function createStateAuthority({
   const attachmentLedger = new Map();
   // Original GUI payloads retained only while their public queue slot remains
   // attributable. Pi exposes transformed text but no stable queue-item IDs;
-  // an exact, attachment-free plain-text payload is the only kind the host may
-  // rebuild atomically for user-requested remove/edit/reorder operations.
+  // only exact, attachment-free plain-text payloads may be replayed during a
+  // rebuild. An owned non-replayable target may still be removed when every
+  // remaining slot is replayable because the target itself is not reenqueued.
   const queuedPayloads = new Map();
   let queueMutationActive = false;
   // Positional identities parallel Pi's public text queues. GUI ownership is
@@ -403,17 +404,17 @@ export function createStateAuthority({
       // transform can produce the slot, but successful preflight may use it
       // to preserve queue/attachment custody if callback-time isStreaming has
       // already fallen back to false. Positional ownership remains subject to
-      // the stricter raw-text/no-handler checks below.
+      // the final raw-input eligibility checks below.
       admission.queueActivityObserved = true;
     }
     if (admission.queueAppendAttributed || !admission.rawQueueAttributionEligible) return;
     // The context proves this queue_update ran under the owning prompt. With
-    // no input handler and ordinary/raw transport, Pi's own append is the first
-    // exact one-slot growth observed in that context. Other admissions may
-    // have appended since this prompt's baseline, so compare with the prior
-    // public projection rather than assuming the original baseline is current.
-    // Once tagged,
-    // the positional identity survives a later unrelated append in the await
+    // ordinary/raw transport and either no input handler or a final public
+    // `continue` result, Pi's own append is the first exact one-slot growth
+    // observed in that context. Other admissions may have appended since this
+    // prompt's baseline, so compare with the prior public projection rather
+    // than assuming the original baseline is current. Once tagged, the
+    // positional identity survives a later unrelated append in the await
     // inside _queueSteer/_queueFollowUp.
     if (
       observedOneSlotGrowth &&
@@ -423,6 +424,33 @@ export function createStateAuthority({
       identities[priorObservedLength] = initiatingIntentId;
       admission.queueAppendAttributed = true;
     }
+  }
+
+  function observeInputAdmissionResult(initiatingIntentId, input, result) {
+    if (typeof initiatingIntentId !== "string") return;
+    const admission = pendingAdmissions.get(initiatingIntentId);
+    if (
+      !admission ||
+      admission.crossedAcceptance ||
+      admission.cancelled ||
+      admission.sessionEpoch !== sessionEpoch ||
+      isSlashSubmission(admission.request)
+    ) {
+      return;
+    }
+    // The bridge observes Pi's public ExtensionRunner.emitInput() result at the
+    // actual prompt boundary. A final `continue` proves that every input hook
+    // left this ordinary submission's text and images unchanged; transformed
+    // and handled inputs retain the conservative unowned-queue behavior.
+    const expectedImages = admission.request.images ?? [];
+    const observedImages = input?.images ?? [];
+    const inputMatches =
+      input?.text === admission.request.text &&
+      input?.source === "interactive" &&
+      (input.streamingBehavior === undefined ||
+        input.streamingBehavior === admission.request.requestedMode) &&
+      JSON.stringify(observedImages) === JSON.stringify(expectedImages);
+    admission.rawQueueAttributionEligible = inputMatches && result?.action === "continue";
   }
 
   function resetQueueIdentity() {
@@ -2234,13 +2262,16 @@ export function createStateAuthority({
     const isSlashCommand = isSlashSubmission(request);
     const commandName = isSlashCommand ? request.text.slice(1).split(/\s/, 1)[0] : "";
     const isExtension = !!commandName && !!session.extensionRunner.getCommand(commandName);
+    // No input handlers means Pi will enqueue this exact raw payload. When
+    // handlers exist, the bridge observes their final public emitInput()
+    // result and upgrades only an unchanged `continue` before Pi appends.
     let rawQueueAttributionEligible = false;
     if (!isSlashCommand && typeof session.extensionRunner?.hasHandlers === "function") {
       try {
         rawQueueAttributionEligible = session.extensionRunner.hasHandlers("input") === false;
       } catch {
-        // A non-conforming extension runner cannot establish exact raw-text
-        // attribution. Queue cleanup will preserve every cleared slot.
+        // A non-conforming extension runner cannot establish exact input
+        // semantics. Queue cleanup will preserve every cleared slot.
       }
     }
     submitting++;
@@ -3329,19 +3360,29 @@ export function createStateAuthority({
     );
   }
 
-  function queueManagementAvailability(steering, followUp) {
+  function queueIntentOccurrenceCount(intentId) {
+    return [...queueIdentity.steer, ...queueIdentity.followUp].reduce(
+      (count, candidate) => count + (candidate === intentId ? 1 : 0),
+      0,
+    );
+  }
+
+  function queueRebuildSafety(steering, followUp, excludedIntentId) {
     if (pendingQueueClaims.size > 0) {
-      return {
-        available: false,
-        message: "A queued prompt is still being admitted; try again once it appears.",
-      };
+      return "A queued prompt is still being admitted; try again once it appears.";
     }
+    // Exclusion is safe only for one exact positional identity. If internal
+    // corruption ever duplicates an intent across either lane, inspect every
+    // occurrence instead of accidentally omitting multiple queue slots.
+    const excludesOneIntent =
+      typeof excludedIntentId === "string" && queueIntentOccurrenceCount(excludedIntentId) === 1;
     const inspect = (mode, texts, intentIds) => {
       if (texts.length !== intentIds.length) {
         return "Queue ownership is synchronizing; try again once it settles.";
       }
       for (const [index, text] of texts.entries()) {
         const intentId = intentIds[index];
+        if (excludesOneIntent && intentId === excludedIntentId) continue;
         if (typeof intentId !== "string") {
           return "This queue also contains an instruction managed outside Pi-Vis, so it cannot be safely changed here.";
         }
@@ -3362,16 +3403,37 @@ export function createStateAuthority({
       return undefined;
     };
     const steeringMessage = inspect("steer", steering, queueIdentity.steer);
-    if (steeringMessage) return { available: false, message: steeringMessage };
+    if (steeringMessage) return steeringMessage;
     const followUpMessage = inspect("followUp", followUp, queueIdentity.followUp);
-    if (followUpMessage) return { available: false, message: followUpMessage };
-    return { available: true };
+    return followUpMessage;
   }
 
-  function inspectManageableQueues() {
-    const { steering, followUp } = readQueues();
-    const availability = queueManagementAvailability(steering, followUp);
-    if (!availability.available) return availability;
+  function queueManagementAvailability(steering, followUp) {
+    const message = queueRebuildSafety(steering, followUp);
+    if (!message) return { available: true };
+    const removableIntentIds = [
+      ...queueIdentity.steer
+        .filter((intentId) => removableQueueTarget("steer", intentId))
+        .filter((intentId) => queueRebuildSafety(steering, followUp, intentId) === undefined),
+      ...queueIdentity.followUp
+        .filter((intentId) => removableQueueTarget("followUp", intentId))
+        .filter((intentId) => queueRebuildSafety(steering, followUp, intentId) === undefined),
+    ];
+    return {
+      available: false,
+      message,
+      ...(removableIntentIds.length > 0 ? { removableIntentIds } : {}),
+    };
+  }
+
+  function removableQueueTarget(mode, intentId) {
+    if (typeof intentId !== "string") return false;
+    if (queueIntentOccurrenceCount(intentId) !== 1) return false;
+    const payload = queuedPayloads.get(intentId);
+    return payload?.intentId === intentId && payload.requestedMode === mode;
+  }
+
+  function queueEntries(steering, followUp) {
     const entries = (mode, texts, intentIds) =>
       texts.map((text, index) => {
         const intentId = intentIds[index];
@@ -3382,7 +3444,6 @@ export function createStateAuthority({
         };
       });
     return {
-      ...availability,
       steering,
       followUp,
       steeringEntries: entries("steer", steering, queueIdentity.steer),
@@ -3402,10 +3463,8 @@ export function createStateAuthority({
    */
   async function manageQueue(intent) {
     const operation = intent.operation;
-    const current = inspectManageableQueues();
-    if (!current.steeringEntries || !current.followUpEntries) {
-      return queueManagementResult(operation, { message: current.message });
-    }
+    const { steering, followUp } = readQueues();
+    const current = queueEntries(steering, followUp);
 
     if (
       operation === "clear" &&
@@ -3415,6 +3474,19 @@ export function createStateAuthority({
       return queueManagementResult(operation, {
         message: "The pending queue changed before it could be cleared. Review it and try again.",
       });
+    }
+
+    // Whole-queue changes retain the prior safety/error contract even when a
+    // target ID cannot be found in an unowned projection. Removal is checked
+    // later because its exact target may be excluded from the rebuild proof.
+    if (operation !== "remove") {
+      const safetyMessage = queueRebuildSafety(steering, followUp);
+      if (safetyMessage) {
+        return queueManagementResult(operation, {
+          ...(intent.targetIntentId ? { targetIntentId: intent.targetIntentId } : {}),
+          message: safetyMessage,
+        });
+      }
     }
 
     const steeringEntries = current.steeringEntries.map((entry) => structuredClone(entry));
@@ -3441,6 +3513,28 @@ export function createStateAuthority({
         targetIndex = followUpIndex;
         targetQueue = "followUp";
       }
+    }
+
+    if (operation === "remove" && !removableQueueTarget(targetQueue, targetIntentId)) {
+      return queueManagementResult(operation, {
+        ...(targetIntentId ? { targetIntentId } : {}),
+        ...(targetQueue ? { queue: targetQueue } : {}),
+        message: "That instruction is not owned by Pi-Vis and cannot be safely removed.",
+      });
+    }
+
+    // Removing an owned target never replays that target, so its attachments
+    // do not make deletion unsafe. Every remaining slot must still pass the
+    // exact same all-owned, replayable rebuild proof. A transformed slot has
+    // no retained stable ownership and therefore cannot reach this path.
+    const safetyMessage =
+      operation === "remove" ? queueRebuildSafety(steering, followUp, targetIntentId) : undefined;
+    if (safetyMessage) {
+      return queueManagementResult(operation, {
+        ...(targetIntentId ? { targetIntentId } : {}),
+        ...(targetQueue ? { queue: targetQueue } : {}),
+        message: safetyMessage,
+      });
     }
 
     if (operation === "remove") {
@@ -4384,6 +4478,7 @@ export function createStateAuthority({
     requestAuthorityAttach,
     semanticSnapshot,
     observeEvent,
+    observeInputAdmissionResult,
     setShellInputReady,
     publishExtensionUi,
     publishPanel,

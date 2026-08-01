@@ -6,6 +6,7 @@ import type {
   IntentEnvelope,
   IntentOutcome,
   OperationJournalRecord,
+  QueueManagementAvailability,
   RendererPublication,
   SemanticSnapshot,
   SessionIntent,
@@ -52,6 +53,7 @@ type PreviewRuntime = {
   followUp: string[];
   steeringIntentIds: Array<string | null>;
   followUpIntentIds: Array<string | null>;
+  queueManagement?: QueueManagementAvailability;
   recentOutcomes: IntentOutcome[];
   operationJournal: OperationJournalRecord[];
   intentPayloads: Map<string, string>;
@@ -209,6 +211,20 @@ const previewHooks = {
     const runtime = runtimeFor(activeId);
     runtime.steering = [text];
     runtime.steeringIntentIds = [intentId];
+    delete runtime.queueManagement;
+    emitRuntimeState(activeId, true);
+  },
+  /** Install a queue whose one exact target is safe only for deletion. */
+  setRemoveOnlyQueuedSteering(text: string, intentId: string): void {
+    const activeId = useSessionsStore.getState().activeSessionId ?? DEMO_SESSION_ID;
+    const runtime = runtimeFor(activeId);
+    runtime.steering = [text];
+    runtime.steeringIntentIds = [intentId];
+    runtime.queueManagement = {
+      available: false,
+      message: "Only this exact pending instruction can be removed safely.",
+      removableIntentIds: [intentId],
+    };
     emitRuntimeState(activeId, true);
   },
   /** Clear the authority-owned steering slot before publishing its delivery. */
@@ -217,6 +233,7 @@ const previewHooks = {
     const runtime = runtimeFor(activeId);
     runtime.steering = [];
     runtime.steeringIntentIds = [];
+    delete runtime.queueManagement;
     emitRuntimeState(activeId, true);
   },
   /** Replace the fake runtime so render tests can exercise `/reload` semantics. */
@@ -300,15 +317,17 @@ function semanticSnapshot(sessionId: SessionId): SemanticSnapshot {
       followUp: [...runtime.followUp],
       steeringIntentIds: [...runtime.steeringIntentIds],
       followUpIntentIds: [...runtime.followUpIntentIds],
-      management: [...runtime.steeringIntentIds, ...runtime.followUpIntentIds].every(
-        (intentId) => intentId !== null,
-      )
-        ? { available: true }
-        : {
-            available: false,
-            message:
-              "Some pending instructions are managed outside Pi-Vis and cannot be changed here.",
-          },
+      management:
+        runtime.queueManagement ??
+        ([...runtime.steeringIntentIds, ...runtime.followUpIntentIds].every(
+          (intentId) => intentId !== null,
+        )
+          ? { available: true }
+          : {
+              available: false,
+              message:
+                "Some pending instructions are managed outside Pi-Vis and cannot be changed here.",
+            }),
     },
     custody: [],
     editor: { revision: 0, text: "", attachments: [] },
@@ -1383,6 +1402,7 @@ async function settleIntent(envelope: PreviewIntentEnvelope): Promise<void> {
             target.intentIds.splice(nextIndex, 0, intentId!);
           }
         }
+        delete runtime.queueManagement;
         break;
       }
       case "compact":

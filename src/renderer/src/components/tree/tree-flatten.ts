@@ -238,6 +238,56 @@ export function flattenVisible(roots: SessionTreeNode[], opts: FlattenOpts): Vis
   }));
 }
 
+/**
+ * Preserve the native selector's logical cursor when filtering or folding
+ * hides the selected row: walk to the nearest visible ancestor, then fall
+ * back to the final visible row. Choosing the first row makes a hidden recent
+ * leaf appear to jump to the beginning of the conversation.
+ */
+export function resolveVisibleTreeSelection(
+  roots: SessionTreeNode[],
+  rows: VisibleRow[],
+  selectedId: string | null,
+): string | null {
+  if (rows.length === 0) return null;
+  const visibleIds = new Set(rows.map((row) => row.entry.id));
+  const parentById = new Map<string, string | null>();
+  const stack = roots.map((node) => ({ node, parentId: null as string | null })).reverse();
+  while (stack.length > 0) {
+    const { node, parentId } = stack.pop()!;
+    if (parentById.has(node.entry.id)) continue;
+    parentById.set(node.entry.id, parentId);
+    const children = node.children ?? [];
+    for (let index = children.length - 1; index >= 0; index--) {
+      stack.push({ node: children[index]!, parentId: node.entry.id });
+    }
+  }
+
+  let currentId = selectedId;
+  const visited = new Set<string>();
+  while (currentId && !visited.has(currentId)) {
+    if (visibleIds.has(currentId)) return currentId;
+    visited.add(currentId);
+    currentId = parentById.get(currentId) ?? null;
+  }
+  return rows[rows.length - 1]!.entry.id;
+}
+
+/** Step the native tree cursor with wraparound at both list boundaries. */
+export function stepVisibleTreeSelection(
+  rows: VisibleRow[],
+  selectedId: string | null,
+  delta: number,
+): string | null {
+  if (rows.length === 0) return null;
+  const selectedIndex = selectedId ? rows.findIndex((row) => row.entry.id === selectedId) : -1;
+  if (selectedIndex < 0) {
+    return rows[delta < 0 ? rows.length - 1 : 0]!.entry.id;
+  }
+  const nextIndex = (((selectedIndex + delta) % rows.length) + rows.length) % rows.length;
+  return rows[nextIndex]!.entry.id;
+}
+
 function indexNode(
   node: SessionTreeNode,
   parentId: string | undefined,

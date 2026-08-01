@@ -103,6 +103,8 @@ function makeSession(overrides = {}) {
     extensionRunner: {
       getCommand: vi.fn(() => undefined),
       getRegisteredCommands: vi.fn(() => []),
+      hasHandlers: vi.fn(() => false),
+      emitInput: vi.fn(async () => ({ action: "continue" })),
     },
     resourceLoader: { getSkills: vi.fn(() => ({ skills: [] })) },
     sessionManager: {
@@ -3259,6 +3261,282 @@ describe("setupCommandBridge — command mapping", () => {
     expect(acceptEditorSubmission).toHaveBeenCalledWith(
       expect.objectContaining({ intentId: "clear-editor", editorRevision: 3 }),
     );
+  });
+
+  it("observes a passive public input handler before Pi appends the queued prompt", async () => {
+    let emitSessionEvent;
+    const steering = [];
+    let observedThis;
+    const originalEmitInput = vi.fn(async function () {
+      observedThis = this;
+      return { action: "continue" };
+    });
+    const extensionRunner = {
+      getCommand: vi.fn(() => undefined),
+      getRegisteredCommands: vi.fn(() => []),
+      hasHandlers: vi.fn((kind) => kind === "input"),
+      emitInput: originalEmitInput,
+    };
+    const harness = setup(
+      {
+        isStreaming: true,
+        isIdle: false,
+        extensionRunner,
+        subscribe: vi.fn((listener) => {
+          emitSessionEvent = listener;
+          return vi.fn();
+        }),
+        getSteeringMessages: vi.fn(() => steering),
+        prompt: vi.fn(async (text, options) => {
+          const inputResult = await extensionRunner.emitInput(
+            text,
+            options.images,
+            "interactive",
+            options.streamingBehavior,
+          );
+          expect(inputResult).toEqual({ action: "continue" });
+          steering.push(text);
+          emitSessionEvent({
+            type: "queue_update",
+            steering: [...steering],
+            followUp: [],
+          });
+          options.preflightResult(true);
+        }),
+      },
+      {
+        uiState: makeUiState({
+          editorSnapshot: () => ({
+            revision: 6,
+            text: "passive handler queue",
+            attachments: [],
+          }),
+        }),
+      },
+    );
+
+    await expect(
+      harness.handleSubmit({
+        submission: {
+          intentId: "passive-handler-submit",
+          expectedHostId: "test-host",
+          expectedEpoch: 0,
+          editorRevision: 6,
+          text: "passive handler queue",
+          inputKind: "ordinary",
+          images: [],
+          requestedMode: "steer",
+          surface: "composer",
+        },
+      }),
+    ).resolves.toMatchObject({ disposition: "consumed", queued: true });
+
+    expect(originalEmitInput).toHaveBeenCalledWith(
+      "passive handler queue",
+      undefined,
+      "interactive",
+      "steer",
+    );
+    expect(observedThis).toBe(extensionRunner);
+    expect(harness.authority.semanticSnapshot().queues).toMatchObject({
+      steering: ["passive handler queue"],
+      steeringIntentIds: ["passive-handler-submit"],
+      management: { available: true },
+    });
+  });
+
+  it("does not let detached input-handler queue work claim the outer admission", async () => {
+    let emitSessionEvent;
+    const steering = [];
+    const originalEmitInput = vi.fn((text) => {
+      const result = Promise.resolve({ action: "continue" });
+      void result.then(() => {
+        // This job is born inside emitInput() but runs after its public result
+        // has authorized the unchanged outer prompt. It must remain
+        // extension-owned even though its text deliberately matches.
+        queueMicrotask(() => {
+          steering.push(text);
+          emitSessionEvent({
+            type: "queue_update",
+            steering: [...steering],
+            followUp: [],
+          });
+        });
+      });
+      return result;
+    });
+    const extensionRunner = {
+      getCommand: vi.fn(() => undefined),
+      getRegisteredCommands: vi.fn(() => []),
+      hasHandlers: vi.fn((kind) => kind === "input"),
+      emitInput: originalEmitInput,
+    };
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner,
+      subscribe: vi.fn((listener) => {
+        emitSessionEvent = listener;
+        return vi.fn();
+      }),
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn(async (text, options) => {
+        await extensionRunner.emitInput(
+          text,
+          options.images,
+          "interactive",
+          options.streamingBehavior,
+        );
+        steering.push(text);
+        emitSessionEvent({
+          type: "queue_update",
+          steering: [...steering],
+          followUp: [],
+        });
+        options.preflightResult(true);
+      }),
+    });
+
+    await expect(
+      harness.authority.submit({
+        intentId: "outer-after-detached-handler-work",
+        expectedHostId: "test-host",
+        expectedEpoch: 0,
+        editorRevision: 0,
+        text: "same queued text",
+        inputKind: "ordinary",
+        images: [],
+        requestedMode: "steer",
+        surface: "composer",
+      }),
+    ).resolves.toMatchObject({ disposition: "consumed", queued: true });
+
+    expect(originalEmitInput).toHaveBeenCalledOnce();
+    expect(harness.authority.snapshot()).toMatchObject({
+      steering: ["same queued text", "same queued text"],
+      steeringIntentIds: [null, "outer-after-detached-handler-work"],
+    });
+  });
+
+  it("reinstalls input observation after reload replacement and successor rebind", async () => {
+    let emitSessionEvent;
+    const steering = [];
+    const initialEmitInput = vi.fn(async () => ({ action: "continue" }));
+    const extensionRunner = {
+      getCommand: vi.fn(() => undefined),
+      getRegisteredCommands: vi.fn(() => []),
+      hasHandlers: vi.fn((kind) => kind === "input"),
+      emitInput: initialEmitInput,
+    };
+    let queuePrompt = false;
+    const harness = setup({
+      extensionRunner,
+      subscribe: vi.fn((listener) => {
+        emitSessionEvent = listener;
+        return vi.fn();
+      }),
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn(async (text, options) => {
+        await extensionRunner.emitInput(
+          text,
+          options.images,
+          "interactive",
+          options.streamingBehavior,
+        );
+        if (queuePrompt) {
+          steering.push(text);
+          emitSessionEvent({
+            type: "queue_update",
+            steering: [...steering],
+            followUp: [],
+          });
+        }
+        options.preflightResult(true);
+      }),
+    });
+    const submit = (intentId, text, expectedEpoch) =>
+      harness.authority.submit({
+        intentId,
+        expectedHostId: "test-host",
+        expectedEpoch,
+        editorRevision: 0,
+        text,
+        inputKind: "ordinary",
+        images: [],
+        requestedMode: "steer",
+        surface: "composer",
+      });
+
+    await submit("prime-initial-runner", "prime observer", 0);
+    expect(initialEmitInput).toHaveBeenCalledOnce();
+    expect(extensionRunner.emitInput).not.toBe(initialEmitInput);
+    await vi.waitFor(() => expect(harness.authority.hasActiveWork).toBe(false));
+
+    const reloadedEmitInput = vi.fn(async () => ({ action: "continue" }));
+    harness.session.reload.mockImplementationOnce(async ({ beforeSessionStart }) => {
+      await beforeSessionStart();
+      extensionRunner.emitInput = reloadedEmitInput;
+    });
+    await harness.handleReload();
+    expect(harness.authority.sessionEpoch).toBe(1);
+    harness.session.isStreaming = true;
+    harness.session.isIdle = false;
+    queuePrompt = true;
+
+    await submit("after-reload-runner-swap", "queued after reload", 1);
+    expect(reloadedEmitInput).toHaveBeenCalledOnce();
+    expect(extensionRunner.emitInput).not.toBe(reloadedEmitInput);
+    expect(harness.authority.snapshot()).toMatchObject({
+      steering: ["queued after reload"],
+      steeringIntentIds: ["after-reload-runner-swap"],
+    });
+    await vi.waitFor(() => expect(harness.authority.hasActiveWork).toBe(false));
+
+    let emitSuccessorEvent;
+    const successorSteering = [];
+    const successorEmitInput = vi.fn(async () => ({ action: "continue" }));
+    const successorRunner = {
+      getCommand: vi.fn(() => undefined),
+      getRegisteredCommands: vi.fn(() => []),
+      hasHandlers: vi.fn((kind) => kind === "input"),
+      emitInput: successorEmitInput,
+    };
+    const successor = makeSession({
+      sessionId: "input-observer-successor",
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: successorRunner,
+      subscribe: vi.fn((listener) => {
+        emitSuccessorEvent = listener;
+        return vi.fn();
+      }),
+      getSteeringMessages: vi.fn(() => successorSteering),
+      prompt: vi.fn(async (text, options) => {
+        await successorRunner.emitInput(
+          text,
+          options.images,
+          "interactive",
+          options.streamingBehavior,
+        );
+        successorSteering.push(text);
+        emitSuccessorEvent({
+          type: "queue_update",
+          steering: [...successorSteering],
+          followUp: [],
+        });
+        options.preflightResult(true);
+      }),
+    });
+    await harness.runtime.setRebindSession.mock.calls[0][0](successor);
+    expect(harness.authority.sessionEpoch).toBe(2);
+
+    await submit("after-successor-rebind", "queued after rebind", 2);
+    expect(successorEmitInput).toHaveBeenCalledOnce();
+    expect(successorRunner.emitInput).not.toBe(successorEmitInput);
+    expect(harness.authority.snapshot()).toMatchObject({
+      steering: ["queued after rebind"],
+      steeringIntentIds: ["after-successor-rebind"],
+    });
   });
 
   it("propagates prompt admission context to synchronous Pi queue updates", async () => {

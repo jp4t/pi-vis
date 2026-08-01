@@ -6,6 +6,8 @@ import {
   entryCopyText,
   entryDisplayText,
   flattenVisible,
+  resolveVisibleTreeSelection,
+  stepVisibleTreeSelection,
 } from "./tree-flatten.js";
 
 // A realistic tree: settings entries at the ROOT (as every real session has),
@@ -233,6 +235,35 @@ describe("flattenVisible — fold + search", () => {
     expect(seen).toEqual(expect.arrayContaining(["a2", "a2d"]));
     expect(seen).not.toContain("a1d");
     expect(flattenVisible(tree(), opts({ search: "relative zzznope" }))).toHaveLength(0);
+  });
+});
+
+describe("tree selection", () => {
+  it("keeps a hidden leaf near its nearest visible ancestor instead of jumping to row zero", () => {
+    const linearTree = [
+      m("u1", { role: "user", content: "first" }, [
+        m("a1", { role: "assistant", content: "first answer" }, [
+          m("u2", { role: "user", content: "second" }, [
+            m("a2", { role: "assistant", content: "second answer" }),
+          ]),
+        ]),
+      ]),
+    ];
+    const rows = flattenVisible(linearTree, opts({ filterMode: "user-only", leafId: "a2" }));
+
+    expect(ids(rows)).toEqual(["u1", "u2"]);
+    expect(resolveVisibleTreeSelection(linearTree, rows, "a2")).toBe("u2");
+  });
+
+  it("falls back to the final visible row and wraps arrow navigation at both boundaries", () => {
+    const rows = flattenVisible(tree(), opts({ filterMode: "user-only" }));
+    expect(resolveVisibleTreeSelection(tree(), rows, "missing")).toBe(rows.at(-1)?.entry.id);
+
+    const allRows = flattenVisible(tree(), opts({}));
+    const first = allRows[0]!.entry.id;
+    const last = allRows.at(-1)!.entry.id;
+    expect(stepVisibleTreeSelection(allRows, first, -1)).toBe(last);
+    expect(stepVisibleTreeSelection(allRows, last, 1)).toBe(first);
   });
 });
 

@@ -8,7 +8,7 @@ import { act } from "react-dom/test-utils";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSessionsStore } from "../../stores/sessions-store.js";
 import { useSettingsStore } from "../../stores/settings-store.js";
-import { Sidebar } from "./Sidebar.js";
+import { Sidebar, synchronizeWorkingIndicatorAnimation } from "./Sidebar.js";
 
 const WS_A = "/tmp/workspace-a";
 const WS_C = "/tmp/workspace-c";
@@ -38,6 +38,20 @@ async function flushEffects(): Promise<void> {
     await Promise.resolve();
   });
 }
+
+describe("sidebar working indicator", () => {
+  it("anchors each compositor animation to the shared document timeline", () => {
+    const element = document.createElement("span");
+    const animation = { startTime: null } as Animation;
+    Object.defineProperty(element, "getAnimations", {
+      value: vi.fn(() => [animation]),
+    });
+
+    synchronizeWorkingIndicatorAnimation(element);
+
+    expect(animation.startTime).toBe(0);
+  });
+});
 
 describe("Sidebar boot workspace restore", () => {
   afterEach(() => {

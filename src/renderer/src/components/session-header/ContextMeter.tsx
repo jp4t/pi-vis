@@ -19,8 +19,10 @@ import "./ContextMeter.css";
  * outside click, matching the model/thinking dropdowns.
  */
 export function ContextMeter({ sessionId }: { sessionId: SessionId }): React.ReactElement {
-  const session = useSessionsStore((s) => s.sessions.get(sessionId));
-  const stats = session?.stats;
+  // Streaming updates replace the session object frequently. Subscribe only
+  // to the stats slice so the title-bar meter does not rerender for every
+  // transcript delta.
+  const stats = useSessionsStore((s) => s.sessions.get(sessionId)?.stats);
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -29,7 +31,14 @@ export function ContextMeter({ sessionId }: { sessionId: SessionId }): React.Rea
   useEffect(() => {
     if (!open) return;
     const onMouseDown = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+      const wrap = wrapRef.current;
+      if (!wrap) return;
+      // Electron/Chromium may retarget a title-bar event while preserving its
+      // composed path. Treat the trigger as inside before changing state;
+      // otherwise the opening mousedown closes the card and the following
+      // click immediately reopens it instead of toggling it closed.
+      if (e.composedPath().includes(wrap) || wrap.contains(e.target as Node)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", onMouseDown, true);
     return () => document.removeEventListener("mousedown", onMouseDown, true);

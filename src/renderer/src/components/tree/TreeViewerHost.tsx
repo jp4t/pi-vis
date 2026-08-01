@@ -19,7 +19,13 @@ import { FadeText } from "../common/FadeText.js";
 import { ScrollFadeFrame } from "../common/ScrollFadeFrame.js";
 import { IconCheck, IconChevronRight, IconClose, IconCopy } from "../common/icons.js";
 import { canCopyTreeSelection } from "./tree-copy.js";
-import { type VisibleRow, entryCopyText, flattenVisible } from "./tree-flatten.js";
+import {
+  type VisibleRow,
+  entryCopyText,
+  flattenVisible,
+  resolveVisibleTreeSelection,
+  stepVisibleTreeSelection,
+} from "./tree-flatten.js";
 import "../common/viewer-header.css";
 import "./TreeViewer.css";
 
@@ -165,13 +171,16 @@ export function TreeViewerHost({ sessionId }: TreeViewerHostProps): React.ReactE
     [],
   );
 
-  // Auto-select the first visible row if selection becomes invalid.
+  // Preserve the logical cursor when filtering/folding hides its row. Pi's
+  // native selector walks to the nearest visible ancestor, then uses the last
+  // visible row as its fallback; jumping to row zero loses the current branch.
   useEffect(() => {
     if (!visible) return;
-    if (selectedId && visibleRows.some((r) => r.entry.id === selectedId)) return;
-    const first = visibleRows[0];
-    if (first) useTreeStore.getState().setSelected(first.entry.id);
-  }, [visible, visibleRows, selectedId]);
+    const resolvedId = resolveVisibleTreeSelection(nodes, visibleRows, selectedId);
+    if (resolvedId && resolvedId !== selectedId) {
+      useTreeStore.getState().setSelected(resolvedId);
+    }
+  }, [visible, nodes, visibleRows, selectedId]);
 
   // Keyboard navigation: ↑/↓/←/→/Enter/Esc.
   // biome-ignore lint/correctness/useExhaustiveDependencies: state-action references are stable from Zustand; listeners read current values at call time.
@@ -714,18 +723,11 @@ function moveSelection(
   selectedId: string | null,
   setSelected: (id: string) => void,
 ): void {
-  if (rows.length === 0) return;
-  const idx = selectedId ? rows.findIndex((r) => r.entry.id === selectedId) : -1;
-  let next = idx + delta;
-  if (next < 0) next = 0;
-  if (next > rows.length - 1) next = rows.length - 1;
-  const target = rows[next];
-  if (target) {
-    setSelected(target.entry.id);
+  const targetId = stepVisibleTreeSelection(rows, selectedId, delta);
+  if (targetId) {
+    setSelected(targetId);
     requestAnimationFrame(() => {
-      const el = document.querySelector<HTMLElement>(
-        `[data-entry-id="${cssEscape(target.entry.id)}"]`,
-      );
+      const el = document.querySelector<HTMLElement>(`[data-entry-id="${cssEscape(targetId)}"]`);
       el?.scrollIntoView({ block: "nearest", behavior: "auto" });
     });
   }

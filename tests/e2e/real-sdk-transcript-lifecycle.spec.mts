@@ -22,7 +22,6 @@ const LIFECYCLE_EXTENSION = join(
   here,
   "../fixtures/real-host-lifecycle-extension/lifecycle-e2e.ts",
 );
-const SMOKE_EXTENSION = join(here, "../fixtures/real-host-smoke-extension/smoke-e2e.ts");
 
 async function closeFixture(
   launch: RealSdkLaunch | undefined,
@@ -470,12 +469,10 @@ test.describe("Pinned real Pi transcript lifecycle", () => {
     );
     const fixture = createRealSdkFixture({
       providerBaseUrl: provider.baseUrl,
-      // Exact queue ownership is intentionally unavailable when an input
-      // handler participates because Pi exposes no transformed-item identity.
-      // Use the command-only fixture here so this journey tests the safe exact
-      // ownership/remove/restore path; handler ambiguity is covered directly
-      // by state-authority fault injection.
-      extensionFiles: [SMOKE_EXTENSION],
+      // This extension has a passive input handler for ordinary unmarked text.
+      // Pi's public `continue` result must retain exact queue ownership so the
+      // queued steer remains removable and restorable.
+      extensionFiles: [LIFECYCLE_EXTENSION],
     });
     let launch: RealSdkLaunch | undefined;
     try {
@@ -499,10 +496,8 @@ test.describe("Pinned real Pi transcript lifecycle", () => {
       // A handled extension command reports successful prompt preflight but
       // creates no Pi queue slot. Its temporary claim must retire before the
       // following ordinary prompt becomes visible in the queue getter.
-      await submitSlash(textarea, "/smoke-e2e");
-      await expect(
-        window.getByText("Real SDK host command completed", { exact: true }),
-      ).toBeVisible();
+      await submitSlash(textarea, "/e2e-notify");
+      await expect(window.getByText("e2e lifecycle notification", { exact: true })).toBeVisible();
       expect(provider.requests).toHaveLength(1);
 
       const staleQueuedText = "remove this queued steering before delivery";

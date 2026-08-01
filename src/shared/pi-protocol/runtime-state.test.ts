@@ -167,6 +167,74 @@ describe("authority protocol schemas", () => {
       SemanticSnapshotSchema.safeParse(
         snapshot({
           queues: {
+            steering: ["one"],
+            followUp: ["two"],
+            steeringIntentIds: ["duplicate-owner"],
+            followUpIntentIds: ["duplicate-owner"],
+            management: {
+              available: false,
+              message: "One intent cannot own two removable positions",
+              removableIntentIds: ["duplicate-owner"],
+            },
+          },
+        }),
+      ).success,
+    ).toBe(false);
+    expect(
+      SemanticSnapshotSchema.safeParse(
+        snapshot({
+          queues: {
+            steering: ["one"],
+            followUp: [],
+            steeringIntentIds: ["owned-one"],
+            followUpIntentIds: [],
+            management: {
+              available: false,
+              message: "Unknown removal ids are invalid",
+              removableIntentIds: ["absent-target"],
+            },
+          },
+        }),
+      ).success,
+    ).toBe(false);
+    expect(
+      SemanticSnapshotSchema.safeParse(
+        snapshot({
+          queues: {
+            steering: ["one"],
+            followUp: [],
+            steeringIntentIds: ["owned-one"],
+            followUpIntentIds: [],
+            management: {
+              available: false,
+              message: "Only removal is safe",
+              removableIntentIds: ["owned-one"],
+            },
+          },
+        }),
+      ).success,
+    ).toBe(true);
+    expect(
+      SemanticSnapshotSchema.safeParse(
+        snapshot({
+          queues: {
+            steering: ["one"],
+            followUp: [],
+            steeringIntentIds: ["owned-one"],
+            followUpIntentIds: [],
+            management: {
+              available: false,
+              message: "Duplicate removal ids are invalid",
+              removableIntentIds: ["owned-one", "owned-one"],
+            },
+          },
+        }),
+      ).success,
+    ).toBe(false);
+    expect(
+      SemanticSnapshotSchema.safeParse(
+        snapshot({
+          queues: {
             steering: [],
             followUp: [],
             steeringIntentIds: [],

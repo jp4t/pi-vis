@@ -649,6 +649,125 @@ describe("state authority", () => {
     promptDone.resolve();
   });
 
+  it("keeps an unchanged prompt removable when a passive input handler continues", async () => {
+    let steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((text, options) => {
+        harness.authority.observeInputAdmissionResult(
+          "continued-input",
+          {
+            text,
+            images: options.images,
+            source: "interactive",
+            streamingBehavior: options.streamingBehavior,
+          },
+          { action: "continue" },
+        );
+        steering.push(text);
+        harness.authority.observeEvent(
+          { type: "queue_update", steering: [...steering], followUp: [] },
+          "continued-input",
+        );
+        options.preflightResult(true);
+        return Promise.resolve();
+      }),
+      clearQueue: vi.fn(() => {
+        const cleared = [...steering];
+        steering = [];
+        return { steering: cleared, followUp: [] };
+      }),
+    });
+    const { authority, session } = harness;
+
+    await authority.submit(
+      makeRequest("continued-input", {
+        text: "unchanged queued steering",
+        requestedMode: "steer",
+      }),
+    );
+
+    expect(authority.semanticSnapshot().queues).toMatchObject({
+      steering: ["unchanged queued steering"],
+      steeringIntentIds: ["continued-input"],
+      management: { available: true },
+    });
+    await expect(
+      authority.manageQueue({
+        kind: "manageQueue",
+        operation: "remove",
+        targetIntentId: "continued-input",
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      queue: "steer",
+      targetIntentId: "continued-input",
+    });
+    expect(steering).toEqual([]);
+    expect(session.clearQueue).toHaveBeenCalledOnce();
+  });
+
+  it("attributes only Pi's raw append after a passive handler queues side-effect work", async () => {
+    const promptDone = deferred();
+    const steering = [];
+    const harness = setup({
+      isStreaming: true,
+      isIdle: false,
+      extensionRunner: {
+        getCommand: vi.fn(() => undefined),
+        hasHandlers: vi.fn((kind) => kind === "input"),
+      },
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((text, options) => {
+        steering.push("handler side effect");
+        harness.authority.observeEvent(
+          { type: "queue_update", steering: [...steering], followUp: [] },
+          "continued-after-side-effect",
+        );
+        harness.authority.observeInputAdmissionResult(
+          "continued-after-side-effect",
+          {
+            text,
+            images: options.images,
+            source: "interactive",
+            streamingBehavior: options.streamingBehavior,
+          },
+          { action: "continue" },
+        );
+        steering.push(text);
+        harness.authority.observeEvent(
+          { type: "queue_update", steering: [...steering], followUp: [] },
+          "continued-after-side-effect",
+        );
+        options.preflightResult(true);
+        return promptDone.promise;
+      }),
+    });
+
+    await harness.authority.submit(
+      makeRequest("continued-after-side-effect", {
+        text: "outer raw prompt",
+        requestedMode: "steer",
+      }),
+    );
+
+    expect(harness.authority.snapshot()).toMatchObject({
+      steering: ["handler side effect", "outer raw prompt"],
+      steeringIntentIds: [null, "continued-after-side-effect"],
+    });
+    expect(harness.authority.semanticSnapshot().queues.management).toMatchObject({
+      available: false,
+      message: expect.stringContaining("outside Pi-Vis"),
+    });
+    promptDone.resolve();
+  });
+
   it("rebuilds a strictly owned queue to remove, edit, and reorder one pending instruction", async () => {
     let steering = [];
     let followUp = [];
@@ -807,51 +926,98 @@ describe("state authority", () => {
     expect(session.clearQueue).not.toHaveBeenCalled();
   });
 
-  it("refuses to rebuild transformed or attached GUI queue entries", async () => {
-    for (const scenario of [
-      {
-        queuedText: "extension transformed text",
-        images: [],
-        expectedMessage: "outside Pi-Vis",
-      },
-      {
-        queuedText: "plain text",
-        images: [{ type: "image", data: "AAE=", mimeType: "image/png" }],
-        expectedMessage: "has attachments",
-      },
-    ]) {
-      const steering = [];
-      const { authority, session } = setup({
-        isStreaming: true,
-        isIdle: false,
-        getSteeringMessages: vi.fn(() => steering),
-        prompt: vi.fn((_text, options) => {
-          steering.push(scenario.queuedText);
-          options.preflightResult(true);
-          return Promise.resolve();
-        }),
-      });
+  it("does not advertise deletion for a transformed GUI submission without stable ownership", async () => {
+    const steering = [];
+    const { authority, session } = setup({
+      isStreaming: true,
+      isIdle: false,
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((_text, options) => {
+        steering.push("extension transformed text");
+        options.preflightResult(true);
+        return Promise.resolve();
+      }),
+    });
 
-      await authority.submit(
-        makeRequest(`unsafe-${scenario.expectedMessage}`, {
-          text: "plain text",
-          requestedMode: "steer",
-          images: scenario.images,
-        }),
-      );
-      expect(authority.semanticSnapshot().queues.management).toMatchObject({
-        available: false,
-        message: expect.stringContaining(scenario.expectedMessage),
-      });
-      await expect(
-        authority.manageQueue({
-          kind: "manageQueue",
-          operation: "remove",
-          targetIntentId: `unsafe-${scenario.expectedMessage}`,
-        }),
-      ).resolves.toMatchObject({ message: expect.stringContaining(scenario.expectedMessage) });
-      expect(session.clearQueue).not.toHaveBeenCalled();
-    }
+    await authority.submit(
+      makeRequest("transformed", {
+        text: "plain text",
+        requestedMode: "steer",
+      }),
+    );
+    expect(authority.semanticSnapshot().queues.management).toMatchObject({
+      available: false,
+      message: expect.stringContaining("outside Pi-Vis"),
+    });
+    expect(authority.semanticSnapshot().queues.management.removableIntentIds).toBeUndefined();
+    await expect(
+      authority.manageQueue({
+        kind: "manageQueue",
+        operation: "remove",
+        targetIntentId: "transformed",
+      }),
+    ).resolves.toMatchObject({ message: expect.stringContaining("already delivered or removed") });
+    expect(session.clearQueue).not.toHaveBeenCalled();
+  });
+
+  it("removes an unsafe owned target when every remaining queue item is replayable", async () => {
+    let steering = [];
+    const { authority, session } = setup({
+      isStreaming: true,
+      isIdle: false,
+      getSteeringMessages: vi.fn(() => steering),
+      prompt: vi.fn((text, options) => {
+        steering.push(text);
+        options.preflightResult(true);
+        return Promise.resolve();
+      }),
+      clearQueue: vi.fn(() => {
+        steering = [];
+      }),
+      steer: vi.fn(async (text) => {
+        steering.push(text);
+      }),
+      followUp: vi.fn(async () => {}),
+    });
+
+    await authority.submit(makeRequest("safe", { text: "keep me", requestedMode: "steer" }));
+    await authority.submit(
+      makeRequest("attached", {
+        text: "remove me",
+        requestedMode: "steer",
+        images: [{ type: "image", data: "AAE=", mimeType: "image/png" }],
+      }),
+    );
+
+    expect(authority.semanticSnapshot().queues.management).toEqual({
+      available: false,
+      message: expect.stringContaining("has attachments"),
+      removableIntentIds: ["attached"],
+    });
+
+    await expect(
+      authority.manageQueue({
+        kind: "manageQueue",
+        operation: "remove",
+        targetIntentId: "safe",
+      }),
+    ).resolves.toMatchObject({ message: expect.stringContaining("has attachments") });
+    expect(session.clearQueue).not.toHaveBeenCalled();
+
+    await expect(
+      authority.manageQueue({
+        kind: "manageQueue",
+        operation: "remove",
+        targetIntentId: "attached",
+      }),
+    ).resolves.toMatchObject({
+      applied: true,
+      queue: "steer",
+      targetIntentId: "attached",
+    });
+    expect(steering).toEqual(["keep me"]);
+    expect(authority.snapshot().steeringIntentIds).toEqual(["safe"]);
+    expect(session.clearQueue).toHaveBeenCalledOnce();
   });
 
   it("does not let a pending handled extension command claim a later prompt queue slot", async () => {

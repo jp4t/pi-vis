@@ -160,6 +160,7 @@ test.describe("Title-bar surfaces", () => {
     await page.locator(".context-ring").click();
     await assertAboveViewer(".context-dropdown");
     await page.locator(".context-ring").click();
+    await expect(page.locator(".context-dropdown")).toHaveCount(0);
     await expect(page.locator(".diff-viewer")).toBeVisible();
 
     await page.locator('[data-testid="worktree-switcher-trigger"]').click();

@@ -26,12 +26,6 @@
    fade mask clip any child positioned out into the canvas gap to reach the
    content card's left edge. See App.css for the rationale. */
 
-@property --status-dot-pulse-opacity {
-  syntax: "<number>";
-  inherits: true;
-  initial-value: 1;
-}
-
 .sidebar__workspaces {
   flex: 1;
   overflow-y: auto;
@@ -623,17 +617,14 @@
   vertical-align: middle;
 }
 
-/* One animation on the shared list owns the phase for every working dot.
-   A late-mounted or newly revealed dot inherits the clock's current value
-   instead of starting an independent animation that can drift out of sync. */
-.sidebar__workspaces--working {
-  animation: status-dot-pulse-clock 1s ease-in-out infinite;
-}
-
-/* filled circle — working */
+/* Filled circle — working. Animate opacity on the dot itself so Chromium can
+   keep the pulse on the compositor. Animating an inherited custom property on
+   the workspace list forced frame-rate style recalculation across every
+   sidebar descendant. Each animation is anchored once to document timeline
+   zero at mount, keeping late dots aligned without an animated ancestor. */
 .status-dot--streaming {
   background: var(--accent);
-  opacity: var(--status-dot-pulse-opacity);
+  animation: status-dot-pulse 1s ease-in-out infinite;
 }
 
 /* filled circle — turn finished (unread sidebar notification) */
@@ -695,18 +686,18 @@
   transform: translate(-50%, -50%) rotate(-45deg);
 }
 
-@keyframes status-dot-pulse-clock {
+@keyframes status-dot-pulse {
   0%,
   100% {
-    --status-dot-pulse-opacity: 1;
+    opacity: 1;
   }
   50% {
-    --status-dot-pulse-opacity: 0.4;
+    opacity: 0.4;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .sidebar__workspaces--working {
+  .status-dot--streaming {
     animation: none;
   }
 }

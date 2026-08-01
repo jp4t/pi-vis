@@ -156,3 +156,47 @@ test("preview completes sequential conversation-tree navigations", async ({ page
   await navigateTo("Fix the config loader.");
   await navigateTo("Let me try relative paths instead.");
 });
+
+test("conversation-tree selection resolves hidden rows and wraps at list boundaries", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const composer = page.locator(".composer__textarea");
+  await expect(composer).toBeEnabled({ timeout: 20_000 });
+  await composer.fill("/tree");
+  await composer.press("Enter");
+
+  const tree = page.locator(".tree-viewer");
+  await expect(tree).toBeVisible();
+  const rows = tree.locator(".tree-viewer__row");
+  const selectedRow = tree.locator('.tree-viewer__row[aria-selected="true"]');
+  const activeLeaf = rows.filter({ hasText: "Switching to relative-path strategy." });
+  const inactiveLeaf = rows.filter({ hasText: "Fixed it with absolute paths." });
+  const activeBranch = rows.filter({ hasText: "Let me try relative paths instead." });
+
+  await expect(activeLeaf).toHaveAttribute("aria-selected", "true");
+
+  // Filtering out the selected row and all of its ancestors falls back to the
+  // final visible result, matching Pi instead of jumping to the first result.
+  await inactiveLeaf.click();
+  await expect(inactiveLeaf).toHaveAttribute("aria-selected", "true");
+  await tree.getByRole("textbox", { name: "Search tree" }).fill("relative");
+  await expect(rows).toHaveCount(2);
+  await expect(activeLeaf).toHaveAttribute("aria-selected", "true");
+
+  // Folding an ancestor of the selected leaf resolves selection to that
+  // nearest visible ancestor, not to row zero.
+  await tree.getByRole("textbox", { name: "Search tree" }).fill("");
+  await activeBranch.getByRole("button", { name: "Collapse" }).click();
+  await expect(activeBranch).toHaveAttribute("aria-selected", "true");
+
+  // Native Pi navigation wraps in both directions.
+  const firstRow = rows.first();
+  const lastRow = rows.last();
+  await firstRow.click();
+  await page.keyboard.press("ArrowUp");
+  await expect(lastRow).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("ArrowDown");
+  await expect(firstRow).toHaveAttribute("aria-selected", "true");
+  await expect(selectedRow).toHaveCount(1);
+});

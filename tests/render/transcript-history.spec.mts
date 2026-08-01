@@ -283,7 +283,10 @@ test("compact activity uses one summary disclosure for both states", async ({ pa
   await expect(summary).toHaveAttribute("aria-expanded", "true");
   await expect(content).toHaveAttribute("id", controlledId!);
   await expect(content).toBeVisible();
-  await expect(group.locator(".compact-transcript-group__collapse-rail")).toHaveCount(0);
+  const collapseRail = group.getByRole("button", {
+    name: "Collapse activity — Thinking, 1 tool call",
+  });
+  await expect(collapseRail).toBeVisible();
 
   // The outer disclosure owns the transcript region; the child card keeps its
   // one independent full-record disclosure inside that region.
@@ -300,9 +303,10 @@ test("compact activity uses one summary disclosure for both states", async ({ pa
   await expect(childDisclosure).toHaveAttribute("aria-expanded", "false");
   await expect(childCard.getByText("hidden output", { exact: true })).toHaveCount(0);
   await expect(summary).toHaveAttribute("aria-expanded", "true");
-  await summary.click();
+  await collapseRail.click();
 
   await expect(summary).toHaveAttribute("aria-expanded", "false");
+  await expect(summary).toBeFocused();
   await expect(group).not.toHaveClass(/compact-transcript-group--open/);
   await expect(content).toHaveCount(0);
 });
@@ -608,6 +612,37 @@ test("a pending bubble removes its exact instruction", async ({ page }) => {
     .filter({ hasText: "remove this stale instruction" });
   await expect(queuedBubble).toHaveCount(1);
   await expect(queuedBubble.locator(".queued-messages__actions")).toHaveCSS("opacity", "1");
+  await expect(queuedBubble.getByRole("button", { name: "Edit queued instruction" })).toHaveCount(
+    0,
+  );
+  await queuedBubble.getByRole("button", { name: "Remove queued instruction" }).click();
+  await expect(queuedBubble).toHaveCount(0);
+});
+
+test("a delete-only pending bubble keeps its exact remove control", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.locator(".composer")).toBeVisible({ timeout: 20_000 });
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __pivisPreview: {
+          setRemoveOnlyQueuedSteering: (text: string, intentId: string) => void;
+        };
+      }
+    ).__pivisPreview.setRemoveOnlyQueuedSteering("remove attached steering", "attached-intent");
+  });
+
+  const queuedBubble = page
+    .locator(".queued-messages__bubble")
+    .filter({ hasText: "remove attached steering" });
+  await expect(queuedBubble).toHaveCount(1);
+  await expect(queuedBubble.getByRole("button", { name: /Move queued instruction/u })).toHaveCount(
+    0,
+  );
+  await expect(queuedBubble.getByRole("button", { name: "Edit queued instruction" })).toHaveCount(
+    0,
+  );
   await queuedBubble.getByRole("button", { name: "Remove queued instruction" }).click();
   await expect(queuedBubble).toHaveCount(0);
 });
