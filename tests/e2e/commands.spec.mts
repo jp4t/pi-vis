@@ -157,6 +157,35 @@ test.describe("Slash commands", () => {
     await expect(interfaceSection.getByText("Family", { exact: true })).toHaveCount(0);
     await expect(interfaceSection).not.toContainText("Pi-Vis owns interface font families");
 
+    const darkThemeRow = interfaceSection.locator(".settings-row", { hasText: "Dark theme" });
+    await darkThemeRow.locator(".settings-select__trigger").click();
+    for (const name of ["Cendre Hard", "Cendre Medium", "Cendre Soft"]) {
+      await expect(darkThemeRow.getByRole("option", { name })).toBeVisible();
+    }
+    await darkThemeRow.getByRole("option", { name: "Cendre Soft" }).click();
+    await expect(darkThemeRow.locator(".settings-select__trigger")).toContainText("Cendre Soft");
+    await interfaceSection
+      .getByRole("group", { name: "Theme mode" })
+      .getByRole("button", { name: "Dark" })
+      .click();
+    const appliedThemeGrounds = await window.locator("html").evaluate((element) => {
+      const styles = getComputedStyle(element);
+      return {
+        transcript: styles.getPropertyValue("--bg").trim(),
+        sidebar: styles.getPropertyValue("--bg-sunken").trim(),
+        popup: styles.getPropertyValue("--surface").trim(),
+        popupHover: styles.getPropertyValue("--surface-2").trim(),
+        strongestSurface: styles.getPropertyValue("--surface-3").trim(),
+      };
+    });
+    expect(appliedThemeGrounds).toEqual({
+      transcript: "#231f1d",
+      sidebar: "#2d2725",
+      popup: "#37312e",
+      popupHover: "#443c39",
+      strongestSurface: "#554c48",
+    });
+
     const codeSection = window.locator(".settings-section", {
       has: window.getByRole("heading", { name: "Code" }),
     });

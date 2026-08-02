@@ -2,6 +2,9 @@ import catppuccinFrappe from "./themes/catppuccin-frappe.json";
 import catppuccinLatte from "./themes/catppuccin-latte.json";
 import catppuccinMacchiato from "./themes/catppuccin-macchiato.json";
 import catppuccinMocha from "./themes/catppuccin-mocha.json";
+import cendreHard from "./themes/cendre-hard.json";
+import cendreMedium from "./themes/cendre-medium.json";
+import cendreSoft from "./themes/cendre-soft.json";
 import everforestDark from "./themes/everforest-dark.json";
 import everforestLight from "./themes/everforest-light.json";
 import glowSticks from "./themes/glow-sticks.json";
@@ -30,6 +33,9 @@ export const BUNDLED_THEMES: readonly Theme[] = [
   ThemeSchema.parse(everforestDark),
   ThemeSchema.parse(everforestLight),
   ThemeSchema.parse(glowSticks),
+  ThemeSchema.parse(cendreHard),
+  ThemeSchema.parse(cendreMedium),
+  ThemeSchema.parse(cendreSoft),
 ];
 
 export const DEFAULT_DARK_THEME_ID = "mocha";

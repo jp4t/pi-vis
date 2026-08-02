@@ -20,9 +20,10 @@ extensions.
   your extensions, skills, prompts, slash commands, and compaction behave exactly
   as they do in the terminal — including their dialogs, toasts, status bar, and
   widgets.
-- **Themes.** Nine built-in colorschemes — Catppuccin (Latte, Frappé,
-  Macchiato, Mocha), Everforest and Gruvbox Material in dark + light, and the
-  OLED-black Glow Sticks — plus user-droppable theme JSON files.
+- **Themes.** Twelve built-in colorschemes — Catppuccin (Latte, Frappé,
+  Macchiato, Mocha), Everforest and Gruvbox Material in dark + light, the
+  OLED-black Glow Sticks, and Cendre in Hard, Medium, and Soft depths — plus
+  user-droppable theme JSON files.
 
 ## Download
 
@@ -96,11 +97,12 @@ npm run dist       # build + electron-builder (mac dmg/zip)
 
 ## Acknowledgements
 
-Built-in color themes include palette values derived from the MIT-licensed
-[Catppuccin](https://github.com/catppuccin/catppuccin) and
-[Gruvbox Material](https://github.com/sainnhe/gruvbox-material) projects. See
-[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for the required license
-notices.
+Built-in color themes include palette and syntax values from MIT-licensed
+projects, including [Cendre](https://cendretheme.com/),
+[Catppuccin](https://github.com/catppuccin/catppuccin), and
+[Gruvbox Material](https://github.com/sainnhe/gruvbox-material). See
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for attribution and the
+required license notices.
 
 ## Verification checklist
 
