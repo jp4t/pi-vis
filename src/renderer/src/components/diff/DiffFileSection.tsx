@@ -746,7 +746,7 @@ function RowsView({
                 <div className="diff-row__code">
                   {renderTokens(
                     row.line.text,
-                    null,
+                    newTokenByLineNo?.(row.line.newNo) ?? oldTokenByLineNo?.(row.line.oldNo),
                     null,
                     "old",
                     cellSearch(search, row.lineIdx, "context"),
