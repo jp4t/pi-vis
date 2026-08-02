@@ -221,13 +221,20 @@ describe("Cendre bundled themes", () => {
       ["#1a1716", "#231f1d", "#2d2725", "#37312e", "#443c39", "#554c48"],
     ] as const;
     const planeRoles = ["bg-deep", "bg", "bg-sunken", "surface", "surface-2", "surface-3"] as const;
+    const expectedScrims = [
+      "rgba(15, 12, 10, 0.7)",
+      "rgba(20, 17, 16, 0.7)",
+      "rgba(26, 23, 22, 0.7)",
+    ] as const;
 
     CENDRE.forEach((theme, index) => {
       const actual = planeRoles.map((role) => theme.colors[role]);
       expect(actual, theme.id).toEqual(expectedPlanes[index]);
       expect(theme.colors["input-bg"], theme.id).toBe(theme.colors["bg-sunken"]);
       expect(theme.colors.shadow, theme.id).toBe(theme.colors["bg-deep"]);
-      expect(theme.colors.scrim, theme.id).toBe(theme.colors["bg-deep"]);
+      // Keep the modal ground depth-specific but translucent: an opaque
+      // scrim defeats every overlay's backdrop-filter and blanks the app.
+      expect(theme.colors.scrim, theme.id).toBe(expectedScrims[index]);
       expect(theme.colors["on-accent"], theme.id).toBe(theme.colors.bg);
 
       for (let plane = 1; plane < actual.length; plane++) {

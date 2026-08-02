@@ -29,7 +29,7 @@
     "magenta": "#9480ba",
     "cursor": "#ea9875",
     "shadow": "#1a1716",
-    "scrim": "#1a1716",
+    "scrim": "rgba(26, 23, 22, 0.7)",
     "input-bg": "#2d2725"
   },
   "syntax": {
