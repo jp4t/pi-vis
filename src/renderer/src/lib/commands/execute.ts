@@ -166,7 +166,9 @@ async function dispatchAndAwait(
         ? "Another session operation is already running; the shell command was not started."
         : receipt.reason === "stale_editor" && intent.kind === "runBash"
           ? "The shell draft changed before it could start; the current draft was preserved."
-          : `Intent was not admitted: ${receipt.reason.replaceAll("_", " ")}`;
+          : receipt.reason === "cancelled" && intent.kind === "runBash"
+            ? "The shell command was cancelled before it started; the current draft was preserved."
+            : `Intent was not admitted: ${receipt.reason.replaceAll("_", " ")}`;
     deps.addToast(sessionId, message, "warning");
     throw new InputNotConsumedError(message);
   }

@@ -899,6 +899,108 @@ describe("transcript reducer", () => {
     });
   });
 
+  it("restores non-PTY output, deduplicates covered replay, and settles from the final result", () => {
+    let state = applyPiEvent(
+      createTranscriptState(),
+      e({
+        type: "bash_execution_start",
+        id: "restored-non-pty",
+        command: "remote-build",
+        pty: false,
+        startedAt: 1_786_000_000_100,
+        cwd: "/workspace/remote",
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_update",
+        id: "restored-non-pty",
+        delta: "pre-attach one\n",
+        sequence: 1,
+      }),
+    );
+
+    state = restoreActiveShellTurn(state, {
+      id: "restored-non-pty",
+      command: "remote-build",
+      owner: { hostInstanceId: "shell-host", sessionEpoch: 4 },
+      startedAt: 1_786_000_000_100,
+      cwd: "/workspace/remote",
+      pty: false,
+      outputText: "retained baseline\n",
+      outputThroughSequence: 2,
+      replayTruncated: true,
+    });
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_update",
+        id: "restored-non-pty",
+        delta: "covered replay\n",
+        sequence: 2,
+      }),
+    );
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_update",
+        id: "restored-non-pty",
+        delta: "live continuation\n",
+        sequence: 3,
+      }),
+    );
+
+    expect(state.blocks).toMatchObject([
+      {
+        type: "bash",
+        data: {
+          executionId: "restored-non-pty",
+          command: "remote-build",
+          outputText:
+            "[Earlier shell output omitted during reload]\nretained baseline\nlive continuation\n",
+          pty: false,
+          isStreaming: true,
+          streamOutputSequence: 3,
+          liveReplayTruncated: true,
+        },
+      },
+    ]);
+    const active = state.blocks[0];
+    expect(active?.type).toBe("bash");
+    if (active?.type === "bash") {
+      expect(active.data.terminalOutput).toBeUndefined();
+      expect(active.data.terminalOutputSequence).toBeUndefined();
+      expect(active.data.terminalMode).toBeUndefined();
+    }
+
+    state = applyPiEvent(
+      state,
+      e({
+        type: "bash_execution_end",
+        id: "restored-non-pty",
+        command: "remote-build",
+        output: "complete canonical output\n",
+        exitCode: 0,
+        pty: false,
+        durationMs: 900,
+      }),
+    );
+    expect(state.activeBashId).toBeNull();
+    expect(state.activeBashExecutionId).toBeNull();
+    expect(state.blocks).toMatchObject([
+      {
+        type: "bash",
+        data: {
+          outputText: "complete canonical output\n",
+          exitCode: 0,
+          isStreaming: false,
+          pty: false,
+        },
+      },
+    ]);
+  });
+
   it("preserves usage on live tool results and compaction summaries", () => {
     let state = applyPiEvent(
       createTranscriptState(),

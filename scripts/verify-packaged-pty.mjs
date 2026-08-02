@@ -10,6 +10,7 @@ import { NODE_PTY_PACKAGE, NODE_PTY_VERSION, patchNodePty } from "./patch-node-p
 const scriptPath = fileURLToPath(import.meta.url);
 const projectRoot = path.resolve(path.dirname(scriptPath), "..");
 const require = createRequire(import.meta.url);
+const PINNED_PI_VERSION = "0.83.0";
 
 function packagedPaths(appBundle) {
   const resources = path.join(appBundle, "Contents", "Resources");
@@ -20,12 +21,19 @@ function packagedPaths(appBundle) {
     "@homebridge",
     "node-pty-prebuilt-multiarch",
   );
+  const piPackageDirectory = path.join(
+    unpacked,
+    "node_modules",
+    "@earendil-works",
+    "pi-coding-agent",
+  );
   return {
     executable: path.join(appBundle, "Contents", "MacOS", "Pi-Vis"),
     asar: path.join(resources, "app.asar"),
     hostScript: path.join(unpacked, "out", "resources", "pi-session-host", "host.mjs"),
     packageDirectory,
     helper: path.join(packageDirectory, "build", "Release", "spawn-helper"),
+    piManifest: path.join(piPackageDirectory, "package.json"),
   };
 }
 
@@ -60,13 +68,25 @@ function verifyPackagedApp(appBundle) {
     throw new Error("The packaged PTY verifier currently supports macOS application bundles only.");
   }
   const paths = packagedPaths(appBundle);
-  for (const required of [paths.executable, paths.asar, paths.hostScript, paths.helper]) {
+  for (const required of [
+    paths.executable,
+    paths.asar,
+    paths.hostScript,
+    paths.helper,
+    paths.piManifest,
+  ]) {
     if (!fs.existsSync(required)) throw new Error(`Missing packaged artifact: ${required}`);
+  }
+  const packagedPiVersion = JSON.parse(fs.readFileSync(paths.piManifest, "utf8")).version;
+  if (packagedPiVersion !== PINNED_PI_VERSION) {
+    throw new Error(
+      `Packaged Pi version mismatch: expected ${PINNED_PI_VERSION}, found ${String(packagedPiVersion)}.`,
+    );
   }
   fs.accessSync(paths.helper, fs.constants.X_OK);
   patchNodePty({ packageDirectory: paths.packageDirectory, verifyOnly: true });
   console.log(
-    `[packaged-pty] Verified patched ${NODE_PTY_PACKAGE}@${NODE_PTY_VERSION} and executable spawn-helper in ${appBundle}`,
+    `[packaged-pty] Verified Pi ${PINNED_PI_VERSION}, patched ${NODE_PTY_PACKAGE}@${NODE_PTY_VERSION}, and executable spawn-helper in ${appBundle}`,
   );
 
   // The journey launches the completed app. pty.start resolves from Electron's

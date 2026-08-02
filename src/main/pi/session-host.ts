@@ -237,6 +237,7 @@ export interface IntentReceipt {
     | "closing"
     | "transitioning"
     | "busy"
+    | "cancelled"
     | "invalid";
   invalidReason?: "malformed" | "payload_conflict" | "payload_too_large" | "capacity";
 }

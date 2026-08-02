@@ -2737,6 +2737,165 @@ describe("SessionRegistry direct AgentSession authority", () => {
     h.registry.stopAll();
   });
 
+  it("replaces provider-auth revisions and clears them by operation or stable acknowledgement", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const record = h.registry.getSession(id)!;
+    const fake = h.fakes[0]!;
+    const stableId = "provider-auth-openrouter";
+
+    fake.emitWire({
+      type: "extension_ui_request",
+      id: stableId,
+      operationId: `${stableId}:1`,
+      method: "providerAuth",
+      providerName: "OpenRouter",
+      authType: "oauth",
+      phase: "oauth",
+      authUrl: "https://openrouter.example/authorize",
+    });
+    expect([...record._pendingUiRequests.keys()]).toEqual([`${stableId}:1`]);
+
+    fake.emitWire({ type: "ui_ack", operationId: `${stableId}:1` });
+    expect(record._pendingUiRequests.size).toBe(0);
+
+    fake.emitWire({
+      type: "extension_ui_request",
+      id: stableId,
+      operationId: `${stableId}:2`,
+      method: "providerAuth",
+      providerName: "OpenRouter",
+      authType: "oauth",
+      phase: "oauth",
+      authUrl: "https://openrouter.example/authorize",
+    });
+    fake.emitWire({
+      type: "extension_ui_request",
+      id: stableId,
+      operationId: `${stableId}:3`,
+      method: "providerAuth",
+      providerName: "OpenRouter",
+      authType: "oauth",
+      phase: "prompt",
+      prompt: "Paste the authorization code or redirect URL",
+      promptType: "manual_code",
+      placeholder: "https://localhost/callback?code=...",
+    });
+
+    expect([...record._pendingUiRequests.entries()]).toEqual([
+      [
+        `${stableId}:3`,
+        expect.objectContaining({
+          id: stableId,
+          operationId: `${stableId}:3`,
+          phase: "prompt",
+          promptType: "manual_code",
+        }),
+      ],
+    ]);
+    expect(h.uiRequests.slice(-2)).toEqual([
+      [id, expect.objectContaining({ operationId: `${stableId}:2`, phase: "oauth" })],
+      [
+        id,
+        expect.objectContaining({
+          operationId: `${stableId}:3`,
+          phase: "prompt",
+          promptType: "manual_code",
+        }),
+      ],
+    ]);
+
+    fake.emitWire({ type: "ui_ack", operationId: `${stableId}:2` });
+    expect([...record._pendingUiRequests.keys()]).toEqual([`${stableId}:3`]);
+
+    // Provider-auth completion acknowledges the stable surface id rather than
+    // its final prompt revision.
+    fake.emitWire({ type: "ui_ack", operationId: stableId });
+    expect(record._pendingUiRequests.size).toBe(0);
+    expect(h.uiAcknowledgements).toContainEqual([id, `${stableId}:1`]);
+    expect(h.uiAcknowledgements).toContainEqual([id, stableId]);
+    h.registry.stopAll();
+  });
+
+  it("collapses provider-auth revisions installed by a transition batch", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const record = h.registry.getSession(id)!;
+    const fake = h.fakes[0]!;
+    const stableId = "provider-auth-transition";
+
+    fake.emitWire({
+      type: "extension_ui_request",
+      id: stableId,
+      operationId: `${stableId}:direct`,
+      method: "providerAuth",
+      providerName: "OpenRouter",
+      authType: "oauth",
+      phase: "waiting",
+    });
+    expect([...record._pendingUiRequests.keys()]).toEqual([`${stableId}:direct`]);
+
+    // Initial binding uses the same atomic transition-batch installation path
+    // as replacement. Re-enter that path with two ordered revisions and prove
+    // both the pre-batch revision and the first batch revision are superseded.
+    record._procReady = false;
+    const terminalSnapshot = fake.snapshot();
+    fake.emitControl({
+      type: "transition_batch",
+      batch: {
+        transitionId: `initial-${fake.hostInstanceId}`,
+        provisionalEpoch: fake.sessionEpoch,
+        records: [
+          {
+            type: "ui",
+            request: {
+              type: "extension_ui_request",
+              id: stableId,
+              operationId: `${stableId}:oauth`,
+              method: "providerAuth",
+              providerName: "OpenRouter",
+              authType: "oauth",
+              phase: "oauth",
+              authUrl: "https://openrouter.example/authorize",
+            },
+          },
+          {
+            type: "ui",
+            request: {
+              type: "extension_ui_request",
+              id: stableId,
+              operationId: `${stableId}:manual`,
+              method: "providerAuth",
+              providerName: "OpenRouter",
+              authType: "oauth",
+              phase: "prompt",
+              prompt: "Paste the authorization code or redirect URL",
+              promptType: "manual_code",
+            },
+          },
+        ],
+        terminalSnapshot,
+      },
+    });
+    record._procReady = true;
+
+    expect([...record._pendingUiRequests.entries()]).toEqual([
+      [
+        `${stableId}:manual`,
+        expect.objectContaining({
+          id: stableId,
+          operationId: `${stableId}:manual`,
+          promptType: "manual_code",
+        }),
+      ],
+    ]);
+    fake.emitWire({ type: "ui_ack", operationId: `${stableId}:manual` });
+    expect(record._pendingUiRequests.size).toBe(0);
+    h.registry.stopAll();
+  });
+
   it("retires old-host dialogs, panels, and pending acknowledgements before restart", async () => {
     const h = harness();
     const id = h.registry.openSession("/tmp/project");

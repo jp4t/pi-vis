@@ -92,6 +92,7 @@ function makeSession(manager) {
       hasHandlers: vi.fn(() => false),
       emit: vi.fn(),
     },
+    abort: vi.fn(async () => {}),
     dispose: vi.fn(),
     createReplacedSessionContext: vi.fn(() => ({})),
   };
@@ -191,11 +192,13 @@ describe("confined session lineage", () => {
   it("canonicalizes an actual pinned Pi fork whose branch is already materialized", async () => {
     const fixture = makeFixture();
     const { runtime, starts, lineageReloads } = makeRuntime(fixture);
+    const previousSession = runtime.session;
 
     await expect(runtime.fork("user-2")).resolves.toMatchObject({
       cancelled: false,
       selectedText: "second",
     });
+    expect(previousSession.abort).toHaveBeenCalledOnce();
 
     const successor = runtime.session.sessionManager;
     const successorFile = successor.getSessionFile();
@@ -223,10 +226,12 @@ describe("confined session lineage", () => {
   it("materializes and reloads canonical lineage for Pi's deferred fork", async () => {
     const fixture = makeFixture();
     const { runtime, starts, lineageReloads } = makeRuntime(fixture);
+    const previousSession = runtime.session;
 
     await expect(runtime.fork("user-1", { position: "at" })).resolves.toMatchObject({
       cancelled: false,
     });
+    expect(previousSession.abort).toHaveBeenCalledOnce();
 
     const successor = runtime.session.sessionManager;
     const successorFile = successor.getSessionFile();
@@ -291,8 +296,10 @@ describe("confined session lineage", () => {
   it("canonicalizes new-session lifecycle metadata without inventing lineage", async () => {
     const fixture = makeFixture();
     const { runtime, starts } = makeRuntime(fixture);
+    const previousSession = runtime.session;
 
     await expect(runtime.newSession()).resolves.toEqual({ cancelled: false });
+    expect(previousSession.abort).toHaveBeenCalledOnce();
 
     expect(runtime.session.sessionManager.getHeader()?.parentSession).toBeUndefined();
     expect(starts).toEqual([

@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PI_PACKAGE_SEGMENTS = ["node_modules", "@earendil-works", "pi-coding-agent"] as const;
+export const PINNED_PI_VERSION = "0.83.0";
 
 // The bundled package must live on the real filesystem — the SDK host is
 // forked (possibly under system Node) and pty spawns cli.js directly, neither
@@ -76,13 +77,18 @@ export function getPinnedPi(
   const cliPath = path.join(pkgDir, "dist", "cli.js");
   if (!existsSync(cliPath)) return null;
 
-  let version = "unknown";
+  let version: unknown;
   try {
     const pkg = JSON.parse(readFileSync(path.join(pkgDir, "package.json"), "utf8"));
-    if (typeof pkg.version === "string") version = pkg.version;
+    version = pkg.version;
   } catch {
-    // version stays "unknown"; the runtime itself is still usable
+    return null;
   }
-  cached = { path: cliPath, version };
+  // The SDK host and typed compatibility layer are audited against one exact
+  // Pi release. A stale/corrupt packaged dependency is a broken installation,
+  // not a runtime we can safely launch. The explicit override above remains a
+  // test-only seam for fake-host and fault-injection journeys.
+  if (version !== PINNED_PI_VERSION) return null;
+  cached = { path: cliPath, version: PINNED_PI_VERSION };
   return cached;
 }

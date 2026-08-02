@@ -15,6 +15,7 @@ export const CUSTOM_SENTINEL = "REAL-REGRESSION-CUSTOM-OVERLAY";
 export const CUSTOM_DONE_SENTINEL = "REAL-REGRESSION-CUSTOM-DONE";
 export const NAME_SENTINEL = "REAL-REGRESSION-EXACT-SESSION-NAME";
 export const WRONG_COMPACT_SENTINEL = "REAL-REGRESSION-WRONG-COMPACT-COLLISION";
+export const SCOPED_MODELS_SENTINEL = "REAL-REGRESSION-SCOPED-MODELS";
 
 const staticWidget = (ctx: ExtensionContext) => {
   ctx.ui.setWidget("real-regression-static-dock", [STATIC_DOCK_SENTINEL]);
@@ -40,6 +41,17 @@ export default function realSdkRegressions(pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     staticWidget(ctx);
     installFactories(ctx);
+    if (ctx.scopedModels.length > 0) {
+      const scope = ctx.scopedModels
+        .map(
+          ({ model, thinkingLevel }) =>
+            `${model.provider}/${model.id}:${thinkingLevel ?? "inherit"}`,
+        )
+        .join(",");
+      ctx.ui.setWidget("real-regression-scoped-models", [
+        `${SCOPED_MODELS_SENTINEL} current=${ctx.model?.provider}/${ctx.model?.id} thinking=${ctx.thinkingLevel} scope=${scope}`,
+      ]);
+    }
   });
 
   pi.registerCommand("regression-replace-factory", {

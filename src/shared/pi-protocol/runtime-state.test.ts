@@ -8,6 +8,7 @@ import {
   IntentOutcomeSchema,
   IntentPayloadConflictSchema,
   IntentReceiptSchema,
+  NonPtyShellTurnSnapshotSchema,
   PanelPresentationBaselineSchema,
   RendererPublicationSchema,
   SESSION_QUERY_POLICY,
@@ -672,6 +673,83 @@ describe("authority protocol schemas", () => {
         baseline({ pendingNavigationPresentations: [navigationPresentation] }),
       ).success,
     ).toBe(true);
+    const nonPtyShellTurn = {
+      id: "remote-shell-1",
+      command: "remote-build",
+      owner,
+      startedAt: 1_700_000_000_100,
+      cwd: "/workspace/remote",
+      pty: false as const,
+      outputText: "building\n",
+      outputThroughSequence: 3,
+      replayTruncated: true,
+    };
+    const nonPtyBaseline = baseline({
+      semantic: {
+        sync: { state: "following", cursor },
+        snapshot: snapshot({
+          sdk: {
+            isStreaming: false,
+            isIdle: false,
+            isCompacting: false,
+            isRetrying: false,
+            retryAttempt: 0,
+            isBashRunning: true,
+          },
+          activity: {
+            bash: {
+              kind: "bash",
+              state: "active",
+              intentId: "remote-shell-1",
+              command: "remote-build",
+              pty: false,
+            },
+          },
+        }),
+      },
+      transcript: {
+        sync: { state: "following", cursor },
+        persistedHistoryCursor: null,
+        liveTailCursor: null,
+        overlapBoundary: null,
+        currentShellTurn: nonPtyShellTurn,
+      },
+    });
+    expect(NonPtyShellTurnSnapshotSchema.safeParse(nonPtyShellTurn).success).toBe(true);
+    expect(AuthorityAttachBaselineSchema.safeParse(nonPtyBaseline).success).toBe(true);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse({
+        ...nonPtyBaseline,
+        transcript: {
+          ...nonPtyBaseline.transcript,
+          currentShellTurn: { ...nonPtyShellTurn, owner: otherOwner },
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse({
+        ...nonPtyBaseline,
+        semantic: {
+          ...nonPtyBaseline.semantic,
+          snapshot: snapshot({
+            activity: {
+              bash: {
+                kind: "bash",
+                state: "active",
+                intentId: "different-shell",
+                pty: false,
+              },
+            },
+          }),
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      NonPtyShellTurnSnapshotSchema.safeParse({
+        ...nonPtyShellTurn,
+        ansi: "terminal-only-field",
+      }).success,
+    ).toBe(false);
     expect(
       AuthorityAttachBaselineSchema.safeParse(
         baseline({
@@ -712,19 +790,41 @@ describe("authority protocol schemas", () => {
         replayTruncated: true,
       }).success,
     ).toBe(true);
-    expect(
-      AuthorityAttachBaselineSchema.safeParse(
-        baseline({
-          transcript: {
-            sync: { state: "following", cursor },
-            persistedHistoryCursor: null,
-            liveTailCursor: null,
-            overlapBoundary: null,
-            currentShellTurn,
+    const ptyBaseline = baseline({
+      semantic: {
+        sync: { state: "following", cursor },
+        snapshot: snapshot({
+          activity: {
+            bash: {
+              kind: "bash",
+              state: "active",
+              intentId: "shell-1",
+              command: "npm init",
+              pty: true,
+              inputReady: true,
+              terminalMode: "compact",
+            },
           },
         }),
-      ).success,
-    ).toBe(true);
+      },
+      transcript: {
+        sync: { state: "following", cursor },
+        persistedHistoryCursor: null,
+        liveTailCursor: null,
+        overlapBoundary: null,
+        currentShellTurn,
+      },
+    });
+    expect(AuthorityAttachBaselineSchema.safeParse(ptyBaseline).success).toBe(true);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse({
+        ...ptyBaseline,
+        transcript: {
+          ...ptyBaseline.transcript,
+          currentShellTurn: { ...currentShellTurn, owner: otherOwner },
+        },
+      }).success,
+    ).toBe(false);
     expect(
       ShellTurnSnapshotSchema.safeParse({
         ...currentShellTurn,
@@ -843,7 +943,7 @@ describe("authority protocol schemas", () => {
     }
   });
 
-  it("models an exact-editor Shell Turn refusal as a typed non-admitted receipt", () => {
+  it("models draft-preserving Shell Turn refusals as typed non-admitted receipts", () => {
     expect(
       IntentReceiptSchema.parse({
         status: "not_admitted",
@@ -851,5 +951,12 @@ describe("authority protocol schemas", () => {
         reason: "stale_editor",
       }),
     ).toMatchObject({ status: "not_admitted", reason: "stale_editor" });
+    expect(
+      IntentReceiptSchema.parse({
+        status: "not_admitted",
+        intentId: "shell-3",
+        reason: "cancelled",
+      }),
+    ).toMatchObject({ status: "not_admitted", reason: "cancelled" });
   });
 });

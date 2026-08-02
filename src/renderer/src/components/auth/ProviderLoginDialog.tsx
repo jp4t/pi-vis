@@ -109,16 +109,17 @@ export function ProviderLoginDialog({
         request.message && <p className="provider-login-dialog__message">{request.message}</p>
       )}
 
-      {(request.phase === "oauth" || request.phase === "device") && request.authUrl && (
-        <button
-          type="button"
-          className="provider-login-dialog__primary"
-          disabled={busy}
-          onClick={() => void openUrl(request.authUrl!)}
-        >
-          Open browser
-        </button>
-      )}
+      {(request.phase === "oauth" || request.phase === "device" || request.phase === "prompt") &&
+        request.authUrl && (
+          <button
+            type="button"
+            className="provider-login-dialog__primary"
+            disabled={busy}
+            onClick={() => void openUrl(request.authUrl!)}
+          >
+            Open browser
+          </button>
+        )}
 
       {request.deviceCode && (
         <div className="provider-login-dialog__code-block">

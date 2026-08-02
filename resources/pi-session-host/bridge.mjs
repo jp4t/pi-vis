@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { constants as osConstants } from "node:os";
 import { basename } from "node:path";
-import { createStateAuthority } from "./state-authority.mjs";
+import { SHELL_ADMISSION_CANCELLED_CODE, createStateAuthority } from "./state-authority.mjs";
 
 function exitSignalName(value) {
   if (typeof value === "string" && value.length > 0) return value;
@@ -166,6 +166,7 @@ export function assertHostCapabilities(session, runtime, pi) {
   );
   fn(session?.extensionRunner, "hasHandlers", "session.extensionRunner.hasHandlers");
   fn(session?.extensionRunner, "emitInput", "session.extensionRunner.emitInput");
+  fn(session?.extensionRunner, "emitUserBash", "session.extensionRunner.emitUserBash");
   fn(session?.resourceLoader, "getSkills", "session.resourceLoader.getSkills");
   fn(session?.sessionManager, "getLeafId", "session.sessionManager.getLeafId");
   fn(session?.sessionManager, "getBranch", "session.sessionManager.getBranch");
@@ -277,6 +278,8 @@ export function setupCommandBridge({
   let activeCommands = 0;
   let nextInterruptId = 1;
   let activeShell = null;
+  let activeNonPtyShell = null;
+  const pendingUserBashPreparations = new Set();
   const lifecycleContext = new AsyncLocalStorage();
   const admissionContext = new AsyncLocalStorage();
   const inputEmissionContext = new AsyncLocalStorage();
@@ -335,6 +338,8 @@ export function setupCommandBridge({
         message: `Prompt admission remained unresolved for intent ${intentId}`,
       });
     },
+    hasPendingBashPreparation: () => pendingUserBashPreparations.size > 0,
+    cancelPendingBashPreparation: () => cancelPendingUserBashPreparations(),
     runWithSurface: (surface, operation, intentId) =>
       admissionContext.run(intentId, () => {
         ensureInputResultObserver(_session.extensionRunner);
@@ -587,8 +592,8 @@ export function setupCommandBridge({
   }
 
   function disposeShell() {
-    if (!activeShell) return;
-    activeShell.controller.forceKill();
+    cancelPendingUserBashPreparations();
+    activeShell?.controller.forceKill();
     _session.abortBash();
   }
 
@@ -596,11 +601,216 @@ export function setupCommandBridge({
     activeShell?.controller.setTransportBackpressured?.(backpressured === true);
   }
 
-  function executeStreamingBash(executionId, command, excludeFromContext) {
+  function cancelPendingUserBashPreparations() {
+    let cancelled = 0;
+    for (const preparation of [...pendingUserBashPreparations]) {
+      if (preparation.cancel()) cancelled += 1;
+    }
+    return cancelled;
+  }
+
+  function emitUserBash(command, excludeFromContext) {
+    const shellCwd = _session.sessionManager.getCwd();
+    const event = {
+      type: "user_bash",
+      command,
+      excludeFromContext: excludeFromContext ?? false,
+      cwd: shellCwd,
+    };
+
+    // UserBashEvent intentionally has no AbortSignal. Race the public emitter
+    // against a host-owned cancellation token and keep consuming the losing
+    // promise: ESC/abort can release serialized admission immediately, while
+    // a late handler result or rejection can never execute, persist, or become
+    // an unhandled rejection.
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const settle = (callback, value) => {
+        if (settled) return false;
+        settled = true;
+        pendingUserBashPreparations.delete(preparation);
+        callback(value);
+        return true;
+      };
+      const preparation = {
+        cancel: () => {
+          const error = new Error("Shell command was cancelled before it started");
+          error.code = SHELL_ADMISSION_CANCELLED_CODE;
+          return settle(reject, error);
+        },
+      };
+      pendingUserBashPreparations.add(preparation);
+
+      let operation;
+      try {
+        operation = _session.extensionRunner.emitUserBash(event);
+      } catch (error) {
+        settle(reject, error);
+        return;
+      }
+      Promise.resolve(operation).then(
+        (result) => settle(resolve, result),
+        (error) => settle(reject, error),
+      );
+    });
+  }
+
+  function emitUserBashForSurface(surface, command, excludeFromContext) {
+    const operation = () => emitUserBash(command, excludeFromContext);
+    return typeof runWithInvocationSurface === "function"
+      ? runWithInvocationSurface(surface, operation)
+      : operation();
+  }
+
+  function executeNonPtyBash(executionId, command, excludeFromContext, eventResult) {
+    if (activeShell || activeNonPtyShell) throw new Error("A Shell Turn is already running");
+    const shellSession = _session;
+    const shellToken = { executionId, session: shellSession };
+    activeNonPtyShell = shellToken;
+    const startedAt = Date.now();
+    const shellCwd = shellSession.sessionManager.getCwd();
+    const release = () => {
+      if (activeNonPtyShell === shellToken) activeNonPtyShell = null;
+    };
+    try {
+      shellSession.sessionManager.appendCustomEntry("pivis.shell_turn_start", {
+        version: 1,
+        executionId,
+        command,
+        excludeFromContext: excludeFromContext === true,
+        startedAt,
+        cwd: shellCwd,
+        pty: false,
+      });
+      authority.observeEvent({
+        type: "bash_execution_start",
+        id: executionId,
+        command,
+        ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        pty: false,
+        startedAt,
+        cwd: shellCwd,
+      });
+    } catch (error) {
+      release();
+      throw error;
+    }
+
+    const finish = (result, errorMessage) => {
+      const endedAt = Date.now();
+      try {
+        authority.observeEvent({
+          type: "bash_execution_end",
+          id: executionId,
+          command,
+          output: typeof result?.output === "string" ? result.output : "",
+          ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
+          ...(typeof result?.cancelled === "boolean" ? { cancelled: result.cancelled } : {}),
+          ...(typeof result?.truncated === "boolean" ? { truncated: result.truncated } : {}),
+          ...(typeof result?.fullOutputPath === "string"
+            ? { fullOutputPath: result.fullOutputPath }
+            : {}),
+          ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+          ...(errorMessage ? { errorMessage } : {}),
+          pty: false,
+          durationMs: Math.max(0, endedAt - startedAt),
+        });
+        try {
+          shellSession.sessionManager.appendCustomEntry("pivis.shell_turn_complete", {
+            version: 1,
+            executionId,
+            endedAt,
+            durationMs: Math.max(0, endedAt - startedAt),
+            ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
+            ...(typeof result?.cancelled === "boolean" ? { cancelled: result.cancelled } : {}),
+            ...(typeof result?.truncated === "boolean" ? { truncated: result.truncated } : {}),
+            ...(errorMessage ? { errorMessage } : {}),
+          });
+        } catch (error) {
+          console.error(
+            "[pi-session-host] Failed to persist Shell Turn metadata:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+      } finally {
+        release();
+      }
+    };
+
+    const recordFailure = (error, persist = true) => {
+      const detail = (error instanceof Error ? error.message : String(error))
+        .replaceAll("\u0000", "")
+        .replaceAll("\u001b", "")
+        .slice(0, 4_096);
+      const result = {
+        output: `[Shell execution failed: ${detail || "unknown error"}]`,
+        cancelled: false,
+        truncated: false,
+      };
+      if (persist) {
+        try {
+          shellSession.recordBashResult(command, result, {
+            ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+          });
+        } catch (recordError) {
+          console.error(
+            "[pi-session-host] Failed to persist Shell Turn failure:",
+            recordError instanceof Error ? recordError.message : recordError,
+          );
+        }
+      }
+      return { result, detail: detail || "unknown error" };
+    };
+
+    if (eventResult.result) {
+      try {
+        shellSession.recordBashResult(command, eventResult.result, {
+          ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        });
+        finish(eventResult.result);
+        return Promise.resolve(eventResult.result);
+      } catch (error) {
+        // The replacement result already made its one canonical recording
+        // attempt. Do not append a second Bash message if that attempt threw.
+        const failure = recordFailure(error, false);
+        finish(failure.result, failure.detail);
+        return Promise.reject(error);
+      }
+    }
+
+    let operation;
+    try {
+      operation = shellSession.executeBash(command, undefined, {
+        id: executionId,
+        ...(excludeFromContext !== undefined ? { excludeFromContext } : {}),
+        operations: eventResult.operations,
+      });
+    } catch (error) {
+      const failure = recordFailure(error);
+      finish(failure.result, failure.detail);
+      return Promise.reject(error);
+    }
+    return Promise.resolve(operation).then(
+      (result) => {
+        finish(result);
+        return result;
+      },
+      (error) => {
+        const failure = recordFailure(error);
+        finish(failure.result, failure.detail);
+        throw error;
+      },
+    );
+  }
+
+  function executeStreamingBash(executionId, command, excludeFromContext, eventResult) {
+    if (eventResult?.result || eventResult?.operations) {
+      return executeNonPtyBash(executionId, command, excludeFromContext, eventResult);
+    }
     if (typeof createShellController !== "function") {
       throw new Error("Shell PTY capability is unavailable");
     }
-    if (activeShell) throw new Error("A Shell Turn is already running");
+    if (activeShell || activeNonPtyShell) throw new Error("A Shell Turn is already running");
     if (typeof pi?.getShellConfig !== "function") {
       throw new Error("Pi is missing public getShellConfig()");
     }
@@ -859,6 +1069,7 @@ export function setupCommandBridge({
   }
 
   async function interruptActiveOperation() {
+    cancelPendingUserBashPreparations();
     const ops = [...activeInterrupts.values()];
     for (const op of ops) {
       try {
@@ -1704,32 +1915,43 @@ export function setupCommandBridge({
           return { deferredOutcome: operation };
         }
         case "runBash": {
-          // Bash can run arbitrarily long; settle it off-scheduler too. Pi
-          // emits correlated bash_execution_update chunks, bracketed by the
-          // host so the native transcript streams and still settles once.
-          // Construct the PTY and persist the start marker before registering
-          // the deferred operation. A throw here is therefore a truthful
-          // pre-admission rejection; synchronous executeBash failures after
-          // that marker are converted to a rejected promise by the helper.
-          const shellOperation = executeStreamingBash(
-            envelope.intentId,
-            intent.command,
-            intent.excludeFromContext,
-          );
           return {
-            deferredOutcome: trackInterruptibleOperation(
-              "bash",
-              () => _session.abortBash(),
-              () => shellOperation,
-            ).then((result) => {
+            // Pi 0.83 user_bash handlers may await arbitrary work. The
+            // authority awaits this preparation outside its scheduler, then
+            // calls startShell in a fresh serialized slot after revalidating
+            // owner, editor, lifecycle, and foreground-work fences.
+            shellPreparation: emitUserBashForSurface(
+              "composer",
+              intent.command,
+              intent.excludeFromContext,
+            ),
+            startShell: (eventResult) => {
+              const shellOperation = executeStreamingBash(
+                envelope.intentId,
+                intent.command,
+                intent.excludeFromContext,
+                eventResult,
+              );
               return {
-                started: true,
-                ...(typeof result?.output === "string" ? { output: result.output } : {}),
-                ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
-                ...(typeof result?.cancelled === "boolean" ? { cancelled: result.cancelled } : {}),
-                ...(typeof result?.truncated === "boolean" ? { truncated: result.truncated } : {}),
+                deferredOutcome: trackInterruptibleOperation(
+                  "bash",
+                  () => _session.abortBash(),
+                  () => shellOperation,
+                ).then((result) => {
+                  return {
+                    started: true,
+                    ...(typeof result?.output === "string" ? { output: result.output } : {}),
+                    ...(Number.isInteger(result?.exitCode) ? { exitCode: result.exitCode } : {}),
+                    ...(typeof result?.cancelled === "boolean"
+                      ? { cancelled: result.cancelled }
+                      : {}),
+                    ...(typeof result?.truncated === "boolean"
+                      ? { truncated: result.truncated }
+                      : {}),
+                  };
+                }),
               };
-            }),
+            },
           };
         }
         case "setTrust": {
@@ -2059,14 +2281,11 @@ export function setupCommandBridge({
           //   1. session.scopedModels (session-only scope, e.g. from a prior
           //      set_scoped_models this session). The scoped entry's `.model`
           //      is a plain data Model object safe for IPC.
-          //   2. settingsManager.getEnabledModels() — the SAVED scope
-          //      persisted by save_scoped_models. The SDK starts every
-          //      session with scopedModels: [] and, unlike pi's CLI main.js,
-          //      NEVER resolves these saved patterns into session.scopedModels,
-          //      so without this fallback a persisted scope would be invisible
-          //      to the dropdown on a fresh session / after relaunch. We
-          //      resolve the patterns with Pi's public diagnostic resolver,
-          //      exactly like its own TUI.
+          //   2. settingsManager.getEnabledModels() — a defensive fallback
+          //      for a legacy/custom runtime that did not project SAVED scope
+          //      into AgentSession at construction. The production host now
+          //      resolves these patterns before construction so Pi 0.83's
+          //      ctx.scopedModels is populated for session_start hooks too.
           const scoped = _session.scopedModels;
           if (Array.isArray(scoped) && scoped.length > 0) {
             const scopedModels = scoped
@@ -2151,16 +2370,23 @@ export function setupCommandBridge({
         // data.output / data.exitCode; returning the full BashResult (which
         // also carries cancelled/truncated) matches rpc-mode and is a superset.
         case "bash": {
+          const eventResult = await emitUserBashForSurface(
+            msg.uiSurface,
+            command.command,
+            command.excludeFromContext,
+          );
           const result = await trackInterruptibleOperation(
             "bash",
             () => _session.abortBash(),
-            () => executeStreamingBash(id, command.command, command.excludeFromContext),
+            () =>
+              executeStreamingBash(id, command.command, command.excludeFromContext, eventResult),
           );
           send({ type: "response", id, success: true, data: result });
           break;
         }
 
         case "abort_bash": {
+          cancelPendingUserBashPreparations();
           _session.abortBash();
           send({ type: "response", id, success: true });
           break;

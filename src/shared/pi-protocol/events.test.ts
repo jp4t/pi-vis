@@ -66,7 +66,7 @@ describe("PiEventSchema", () => {
     ).toMatchObject({ result: { usage } });
   });
 
-  it("accepts Pi 0.82 direct bash execution updates as known events", () => {
+  it("accepts Pi 0.83 direct bash execution updates as known events", () => {
     expect(
       PiEventSchema.parse({
         type: "bash_execution_update",

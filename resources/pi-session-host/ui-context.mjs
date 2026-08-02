@@ -132,6 +132,7 @@ export function createDialogResolver(sendToMain, onAcknowledged = () => {}) {
     let currentPrompt;
     let closed = false;
     let cancelling = false;
+    let latestOAuthContext;
 
     const baseRequest = {
       type: "extension_ui_request",
@@ -233,10 +234,12 @@ export function createDialogResolver(sendToMain, onAcknowledged = () => {}) {
         const cleanup = () => authPrompt?.signal?.removeEventListener?.("abort", onPromptAbort);
         currentPrompt = { resolve: resolveFn, reject: rejectFn, cleanup };
         authPrompt?.signal?.addEventListener?.("abort", onPromptAbort, { once: true });
+        const oauthContext = authPrompt?.type === "manual_code" ? latestOAuthContext : undefined;
         publish({
           phase: "prompt",
           promptType: authPrompt?.type,
           prompt: String(authPrompt?.message ?? "Continue sign-in"),
+          ...oauthContext,
           ...(authPrompt?.placeholder ? { placeholder: String(authPrompt.placeholder) } : {}),
           ...(Array.isArray(authPrompt?.options)
             ? {
@@ -254,10 +257,13 @@ export function createDialogResolver(sendToMain, onAcknowledged = () => {}) {
     const notify = (event) => {
       if (!event || closed) return;
       if (event.type === "auth_url") {
-        publish({
-          phase: "oauth",
+        latestOAuthContext = {
           authUrl: String(event.url),
           ...(event.instructions ? { message: String(event.instructions) } : {}),
+        };
+        publish({
+          phase: "oauth",
+          ...latestOAuthContext,
         });
       } else if (event.type === "device_code") {
         publish({

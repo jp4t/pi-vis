@@ -95,7 +95,7 @@ has already passed verification.
 
 The automated suite (`typecheck`, `lint`, `test`, `test:render`, `test:e2e`) is
 run by `npm run release`; its Electron lane includes the isolated, repository-pinned
-Pi 0.82.1 SDK-host compatibility journeys described in `docs/testing.md`. The
+Pi 0.83.0 SDK-host compatibility journeys described in `docs/testing.md`. The
 subsequent `dist` step also runs `verify:packaged-pty` against the completed app;
 it must not be skipped or replaced by a repository-tree native smoke. Two
 behavior contracts are NOT covered by that suite and MUST be verified manually

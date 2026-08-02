@@ -10,7 +10,7 @@ import type { ScriptedOpenAILatency } from "./scripted-openai-provider.mjs";
 const supportDir = dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = join(supportDir, "../../..");
 export const APP_ENTRY = join(PROJECT_ROOT, "out/main/index.js");
-export const PINNED_PI_VERSION = "0.82.1";
+export const PINNED_PI_VERSION = "0.83.0";
 /** Real-SDK journeys retain realistic, reproducible streaming cadence. */
 export const REAL_SDK_PROVIDER_LATENCY: ScriptedOpenAILatency = {
   firstByteMs: [10, 40],
@@ -73,6 +73,10 @@ export interface RealSdkFixtureOptions {
   realHostControl?: boolean;
   compactionEnabled?: boolean;
   modelInput?: Array<"text" | "image">;
+  /** Optional custom-model catalogue used by saved-scope regression fixtures. */
+  localModelIds?: string[];
+  /** Persist Pi's enabledModels setting before the first runtime is constructed. */
+  enabledModels?: string[];
   retry?: {
     enabled: boolean;
     maxRetries?: number;
@@ -145,7 +149,12 @@ function copyExtensions(agentDir: string, extensionFiles: string[]): void {
   }
 }
 
-function writeModels(agentDir: string, baseUrl: string, input: Array<"text" | "image">): void {
+function writeModels(
+  agentDir: string,
+  baseUrl: string,
+  input: Array<"text" | "image">,
+  modelIds: string[],
+): void {
   fs.writeFileSync(
     join(agentDir, "models.json"),
     JSON.stringify({
@@ -159,17 +168,15 @@ function writeModels(agentDir: string, baseUrl: string, input: Array<"text" | "i
             supportsReasoningEffort: false,
             supportsUsageInStreaming: false,
           },
-          models: [
-            {
-              id: "pivis-test-model",
-              name: "Pi-Vis Test Model",
-              reasoning: false,
-              input,
-              contextWindow: 128_000,
-              maxTokens: 512,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            },
-          ],
+          models: modelIds.map((id) => ({
+            id,
+            name: id === "pivis-test-model" ? "Pi-Vis Test Model" : "Pi-Vis Scoped Model",
+            reasoning: id !== "pivis-test-model",
+            input,
+            contextWindow: 128_000,
+            maxTokens: 512,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          })),
         },
       },
     }),
@@ -249,7 +256,12 @@ export function createRealSdkFixture(options: RealSdkFixtureOptions = {}): RealS
   const dirs = makeDirectories(options.workspaceDir);
   copyExtensions(dirs.agent, options.extensionFiles ?? []);
   if (options.providerBaseUrl) {
-    writeModels(dirs.agent, options.providerBaseUrl, options.modelInput ?? ["text"]);
+    writeModels(
+      dirs.agent,
+      options.providerBaseUrl,
+      options.modelInput ?? ["text"],
+      options.localModelIds ?? ["pivis-test-model"],
+    );
   }
   fs.writeFileSync(
     join(dirs.agent, "settings.json"),
@@ -267,6 +279,7 @@ export function createRealSdkFixture(options: RealSdkFixtureOptions = {}): RealS
       },
       defaultThinkingLevel: "off",
       defaultProjectTrust: "never",
+      ...(options.enabledModels ? { enabledModels: options.enabledModels } : {}),
     }),
   );
   fs.writeFileSync(

@@ -37,7 +37,7 @@ import * as crypto from "node:crypto";
 import {
   applyPiVisTheme,
   configureHttpDispatcher,
-  createSessionRuntimeOverrideResolver,
+  createSessionRuntimeOptionsResolver,
   createTrustResolver,
   importPi,
   importPiTui,
@@ -589,7 +589,10 @@ async function handleInit(msg) {
             canonicalSessionFile,
           }
         : undefined;
-    const resolveRuntimeOverrides = createSessionRuntimeOverrideResolver(runtimeResumeState);
+    const resolveRuntimeOptions = createSessionRuntimeOptionsResolver(
+      pi.resolveModelScopeWithDiagnostics,
+      runtimeResumeState,
+    );
 
     const createRuntime = async ({
       cwd: sc,
@@ -625,14 +628,22 @@ async function handleInit(msg) {
       // message count, which would let another session's global defaults leak
       // into an already-created empty session. New sessions and unavailable
       // stored models still use Pi's normal settings fallback.
-      const sessionOverrides = resolveRuntimeOverrides(sm, services.modelRuntime);
+      const { sessionOptions, diagnostics: modelScopeDiagnostics } = await resolveRuntimeOptions(
+        sm,
+        services.settingsManager,
+        services.modelRuntime,
+      );
       const result = await pi.createAgentSessionFromServices({
         services,
         sessionManager: sm,
         sessionStartEvent: presentedSessionStartEvent,
-        ...sessionOverrides,
+        ...sessionOptions,
       });
-      return { ...result, services, diagnostics: services.diagnostics };
+      return {
+        ...result,
+        services,
+        diagnostics: [...services.diagnostics, ...modelScopeDiagnostics],
+      };
     };
 
     runtime = await pi.createAgentSessionRuntime(createRuntime, {

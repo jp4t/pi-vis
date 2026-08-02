@@ -1,5 +1,6 @@
 import { expect, test } from "./support/invariants.mjs";
 import {
+  PINNED_PI_VERSION,
   type RealSdkFixture,
   type RealSdkLaunch,
   createRealSdkFixture,
@@ -23,6 +24,9 @@ test.describe("packaged macOS PTY", () => {
     try {
       launch = await fixture.launch();
       const { window } = launch;
+      await expect(
+        window.evaluate(() => window.pivis.invoke("pi.info", undefined)),
+      ).resolves.toEqual({ version: PINNED_PI_VERSION });
 
       // This invokes src/main/pty.ts from Electron's logical app.asar path. A
       // successful return means node-pty loaded and spawn-helper created Pi's

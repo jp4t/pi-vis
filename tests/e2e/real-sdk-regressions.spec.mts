@@ -27,6 +27,7 @@ const CUSTOM = "REAL-REGRESSION-CUSTOM-OVERLAY";
 const CUSTOM_DONE = "REAL-REGRESSION-CUSTOM-DONE";
 const NAME = "REAL-REGRESSION-EXACT-SESSION-NAME";
 const WRONG_COMPACT = "REAL-REGRESSION-WRONG-COMPACT-COLLISION";
+const SCOPED_MODELS = "REAL-REGRESSION-SCOPED-MODELS";
 
 async function closeFixture(
   launch: RealSdkLaunch | undefined,
@@ -114,7 +115,7 @@ async function assertDockNeverFlashed(page: Page): Promise<void> {
     .toBe(false);
 }
 
-test.describe("Pinned real Pi 0.82.1 regressions", () => {
+test.describe("Pinned real Pi 0.83.0 regressions", () => {
   test("real factory widgets, unified draft custody, and custom Escape share one live authority", async () => {
     test.setTimeout(180_000);
     const fixture = createRealSdkFixture({ extensionFiles: [EXTENSION] });
@@ -199,6 +200,43 @@ test.describe("Pinned real Pi 0.82.1 regressions", () => {
       throw await withDiagnostics(error, fixture, launch);
     } finally {
       await closeFixture(launch, fixture);
+    }
+  });
+
+  test("saved enabledModels initialize the fresh model and session_start ctx.scopedModels", async () => {
+    test.setTimeout(180_000);
+    const provider = await createScriptedOpenAIProvider([], {
+      latency: REAL_SDK_PROVIDER_LATENCY,
+    });
+    const fixture = createRealSdkFixture({
+      providerBaseUrl: provider.baseUrl,
+      extensionFiles: [EXTENSION],
+      localModelIds: ["pivis-test-model", "pivis-scoped-model"],
+      enabledModels: ["pivis-local/pivis-scoped-model:high", "pivis-local/pivis-test-model"],
+    });
+    let launch: RealSdkLaunch | undefined;
+    try {
+      launch = await fixture.launch();
+      const { window } = launch;
+      await openNewRegressionSession(window);
+
+      await expect(
+        window.locator(".dock__widget-line").filter({ hasText: SCOPED_MODELS }),
+      ).toHaveText(
+        `${SCOPED_MODELS} current=pivis-local/pivis-scoped-model thinking=high scope=pivis-local/pivis-scoped-model:high,pivis-local/pivis-test-model:inherit`,
+        { timeout: 60_000 },
+      );
+      await expect(window.locator(".session-header__model-btn")).toContainText(
+        "Pi-Vis Scoped Model",
+      );
+      await expect(
+        window.locator(".session-header__thinking > .session-header__picker-btn"),
+      ).toContainText("high");
+      provider.assertExhausted();
+    } catch (error) {
+      throw await withDiagnostics(error, fixture, launch, provider);
+    } finally {
+      await closeFixture(launch, fixture, provider);
     }
   });
 

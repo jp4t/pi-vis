@@ -1,6 +1,10 @@
 import * as crypto from "node:crypto";
 
 const MAX_SHELL_COMMAND_BYTES = 64 * 1024;
+const LIVE_NON_PTY_SHELL_REPLAY_LIMIT = 1024 * 1024;
+const LIVE_NON_PTY_SHELL_CHUNK_LIMIT = 512;
+
+export const SHELL_ADMISSION_CANCELLED_CODE = "PIVIS_SHELL_ADMISSION_CANCELLED";
 
 function isSlashSubmission(request) {
   if (request?.inputKind === "slash_command") return true;
@@ -11,6 +15,26 @@ function isSlashSubmission(request) {
 
 function inputKindForEditorText(text) {
   return typeof text === "string" && text.startsWith("/") ? "slash_command" : "ordinary";
+}
+
+function appendBoundedNonPtyShellOutput(shell, delta) {
+  const source = typeof delta === "string" ? delta : "";
+  const sourceTruncated = source.length > LIVE_NON_PTY_SHELL_REPLAY_LIMIT;
+  const retained = sourceTruncated ? source.slice(-LIVE_NON_PTY_SHELL_REPLAY_LIMIT) : source;
+  shell.outputChunks.push(retained);
+  shell.outputChars += retained.length;
+  shell.outputSequence += 1;
+  if (sourceTruncated) shell.replayTruncated = true;
+
+  while (
+    shell.outputChunks.length > 0 &&
+    (shell.outputChars > LIVE_NON_PTY_SHELL_REPLAY_LIMIT ||
+      shell.outputChunks.length > LIVE_NON_PTY_SHELL_CHUNK_LIMIT)
+  ) {
+    shell.outputChars -= shell.outputChunks.shift()?.length ?? 0;
+    shell.replayTruncated = true;
+  }
+  return shell.outputSequence;
 }
 
 /**
@@ -44,6 +68,8 @@ export function createStateAuthority({
   onAdmissionStuck = () => {},
   admissionStuckMs = 60_000,
   runWithSurface = (_surface, operation) => operation(),
+  hasPendingBashPreparation = () => false,
+  cancelPendingBashPreparation = () => 0,
 }) {
   let session = initialSession;
   // A confined search open may give Pi an inode-stable transport path
@@ -1226,10 +1252,17 @@ export function createStateAuthority({
                 ...(shellTurn?.excludeFromContext !== undefined
                   ? { excludeFromContext: shellTurn.excludeFromContext }
                   : {}),
-                ...(shellTurn?.pty === true
-                  ? { pty: true, inputReady: shellTurn.inputReady === true }
+                ...(shellTurn
+                  ? {
+                      pty: shellTurn.pty === true,
+                      ...(shellTurn.pty === true
+                        ? { inputReady: shellTurn.inputReady === true }
+                        : {}),
+                    }
                   : {}),
-                ...(shellTurn?.mode ? { terminalMode: shellTurn.mode } : {}),
+                ...(shellTurn?.pty === true && shellTurn.mode
+                  ? { terminalMode: shellTurn.mode }
+                  : {}),
               },
             }
           : {}),
@@ -2807,55 +2840,105 @@ export function createStateAuthority({
         pruneDispatchedIntents();
         return receipt;
       };
-      const admissionPromise = schedule("ingress", async () => {
-        // A Shell Turn receipt transfers draft custody. Recheck every mutable
-        // admission fact in the serialized slot, then return that receipt only
-        // after the executor proves PTY construction and the durable start
-        // marker by handing back its deferred terminal outcome.
+      const rejectionReason = (error) =>
+        error?.code === SHELL_ADMISSION_CANCELLED_CODE ? "cancelled" : "transport_unavailable";
+      const commitPreparedShell = (startShell, prepared) =>
+        schedule("ingress", () => {
+          // A Shell Turn receipt transfers draft custody. Recheck every mutable
+          // admission fact after extension preparation, then start the shell and
+          // publish its receipt in this one serialized slot. user_bash handlers
+          // may await arbitrary UI/network work, so their public hook promise
+          // must never occupy the scheduler while unrelated ingress is ready.
+          if (stopped || closePreparation?.confirmed || fatalAdmissionFence) {
+            return rejectAdmission("closing");
+          }
+          if (transition) return rejectAdmission("transitioning");
+          if (owner.hostInstanceId !== hostInstanceId || owner.sessionEpoch !== sessionEpoch) {
+            return rejectAdmission("stale_owner");
+          }
+          if (!shellIntentMatchesEditor(intent)) return rejectAdmission("stale_editor");
+          if (shellAdmissionBusy(entry)) return rejectAdmission("busy");
+
+          let result;
+          try {
+            result = startShell(prepared);
+          } catch (error) {
+            return rejectAdmission(rejectionReason(error));
+          }
+          if (!result || typeof result.deferredOutcome?.then !== "function") {
+            return rejectAdmission("transport_unavailable");
+          }
+
+          // startShell returns only after the selected PTY/non-PTY path and its
+          // durable start marker succeed. Consume the exact authoritative shell
+          // draft in this same serialized slot before publishing admission. A
+          // false result is an internal invariant failure after execution may
+          // already exist, so never lie with `not_admitted`; keep the visible
+          // turn admitted and publish a bounded, non-secret diagnostic instead.
+          if (!consumeShellEditor(intent, intentId)) {
+            appendAnomaly(
+              "shell_editor_custody_lost",
+              "durable_shell_start_without_editor_consumption",
+            );
+          }
+
+          entry.admitted = true;
+          entry.recordSequence = ++nextDispatchedIntentSequence;
+          entry.admissionReceipt = {
+            status: "admitted",
+            intentId,
+            owner: structuredClone(owner),
+          };
+          entry.admissionPromise = null;
+          commitSemanticFrame([{ type: "intent_admitted", intentId, owner, kind: intent.kind }]);
+          void result.deferredOutcome
+            .then(settleFromResult, settleFromError)
+            .finally(publishIfOwner);
+          return structuredClone(entry.admissionReceipt);
+        });
+      const beginPreparation = schedule("ingress", () => {
+        // Validate once before even emitting user_bash. This preserves the
+        // authority boundary for a draft/lifecycle race that occurs between
+        // reservation and the first scheduler turn. The same facts are checked
+        // again after the hook settles, immediately before durable start.
         if (stopped || closePreparation?.confirmed || fatalAdmissionFence) {
-          return rejectAdmission("closing");
+          return { rejection: rejectAdmission("closing") };
         }
-        if (transition) return rejectAdmission("transitioning");
+        if (transition) return { rejection: rejectAdmission("transitioning") };
         if (owner.hostInstanceId !== hostInstanceId || owner.sessionEpoch !== sessionEpoch) {
-          return rejectAdmission("stale_owner");
+          return { rejection: rejectAdmission("stale_owner") };
         }
-        if (!shellIntentMatchesEditor(intent)) return rejectAdmission("stale_editor");
-        if (shellAdmissionBusy(entry)) return rejectAdmission("busy");
-
-        let result;
+        if (!shellIntentMatchesEditor(intent)) {
+          return { rejection: rejectAdmission("stale_editor") };
+        }
+        if (shellAdmissionBusy(entry)) return { rejection: rejectAdmission("busy") };
         try {
-          result = await execute(intent, owner);
-        } catch {
-          return rejectAdmission("transport_unavailable");
+          // Wrap the returned value instead of returning it directly so the
+          // scheduler never assimilates/awaits an async user_bash preparation.
+          return { plan: execute(intent, owner) };
+        } catch (error) {
+          return { rejection: rejectAdmission(rejectionReason(error)) };
         }
-        if (!result || typeof result.deferredOutcome?.then !== "function") {
-          return rejectAdmission("transport_unavailable");
-        }
-
-        // `execute` returns only after PTY construction and the durable start
-        // marker succeed. Consume the exact authoritative shell draft in this
-        // same serialized slot before publishing admission. A false result is
-        // an internal invariant failure after a process may already exist, so
-        // never lie with `not_admitted`; keep the visible turn admitted and
-        // publish a bounded, non-secret diagnostic instead.
-        if (!consumeShellEditor(intent, intentId)) {
-          appendAnomaly(
-            "shell_editor_custody_lost",
-            "durable_shell_start_without_editor_consumption",
-          );
-        }
-
-        entry.admitted = true;
-        entry.recordSequence = ++nextDispatchedIntentSequence;
-        entry.admissionReceipt = {
-          status: "admitted",
-          intentId,
-          owner: structuredClone(owner),
-        };
-        entry.admissionPromise = null;
-        commitSemanticFrame([{ type: "intent_admitted", intentId, owner, kind: intent.kind }]);
-        void result.deferredOutcome.then(settleFromResult, settleFromError).finally(publishIfOwner);
-        return structuredClone(entry.admissionReceipt);
+      });
+      const admissionPromise = beginPreparation.then((begin) => {
+        if (begin.rejection) return begin.rejection;
+        return Promise.resolve(begin.plan).then(
+          (plan) => {
+            if (
+              plan &&
+              typeof plan === "object" &&
+              "shellPreparation" in plan &&
+              typeof plan.startShell === "function"
+            ) {
+              return Promise.resolve(plan.shellPreparation).then(
+                (prepared) => commitPreparedShell(plan.startShell, prepared),
+                (error) => schedule("ingress", () => rejectAdmission(rejectionReason(error))),
+              );
+            }
+            return commitPreparedShell(() => plan, undefined);
+          },
+          (error) => schedule("ingress", () => rejectAdmission(rejectionReason(error))),
+        );
       });
       entry.admissionPromise = admissionPromise;
       return admissionPromise;
@@ -3083,19 +3166,39 @@ export function createStateAuthority({
     if (event?.type === "queue_update") {
       observeAttributableAdmissionQueueAppend(initiatingIntentId);
     }
+    let publishedEvent = event;
     if (event?.type === "bash_execution_start") {
       shellTurn = {
         id: event.id,
         command: event.command,
         startedAt: event.startedAt ?? Date.now(),
+        cwd: event.cwd,
         excludeFromContext: event.excludeFromContext,
         pty: event.pty === true,
         // A PTY exists only after the injected BashOperations spawn succeeds.
         // stdin-transport shells additionally remain fenced until their fixed
         // bootstrap has been fully parsed and removed from the output plane.
         inputReady: false,
-        mode: "compact",
+        mode: event.pty === true ? "compact" : undefined,
+        outputChunks: [],
+        outputChars: 0,
+        outputSequence: 0,
+        replayTruncated: false,
       };
+    } else if (
+      event?.type === "bash_execution_update" &&
+      shellTurn?.pty === false &&
+      shellTurn.id === event.id
+    ) {
+      const sequence = appendBoundedNonPtyShellOutput(shellTurn, event.delta);
+      publishedEvent = { ...event, sequence };
+      // Retained non-PTY output is presentation reconstruction state, not a
+      // semantic fact. Keep the transcript cursor ordered without advancing
+      // the semantic snapshot once per output chunk.
+      if (typeof sendPresentation === "function") {
+        publishTranscript([publishedEvent]);
+        return undefined;
+      }
     } else if (
       event?.type === "bash_terminal_data" &&
       shellTurn?.id === event.id &&
@@ -3113,7 +3216,6 @@ export function createStateAuthority({
     } else if (event?.type === "bash_execution_end" && shellTurn?.id === event.id) {
       shellTurn = null;
     }
-    let publishedEvent = event;
     if (event?.type === "message_start" && event.message?.role === "user") {
       const { deliveredQueueIntentIds } = readQueues(true);
       // More than one removal for one event is ambiguous; retire all rather
@@ -3874,8 +3976,15 @@ export function createStateAuthority({
             ...(restorationId ? { restorationId } : {}),
           };
         }
-      } else if (session.isBashRunning) {
-        session.abortBash();
+      } else if (session.isBashRunning || hasPendingBashPreparation()) {
+        // A Pi 0.83 user_bash handler may still be resolving before
+        // AgentSession creates its Bash AbortController. Fence that pending
+        // preparation only after higher-priority ESC targets have been ruled
+        // out, then abort any Bash operation that already crossed the SDK
+        // boundary. Extension-internal side effects are not reversible, but
+        // its late result can no longer start or record a Shell Turn.
+        if (session.isBashRunning) session.abortBash();
+        cancelPendingBashPreparation();
         value = { ...base, disposition: "abort_requested", target: "bash" };
       } else if (submitting > 0 || unresolvedAdmissions > 0) {
         value = {
@@ -4304,7 +4413,22 @@ export function createStateAuthority({
       const currentShellTurn =
         retainedShell && typeof retainedShell.id === "string"
           ? { ...structuredClone(retainedShell), owner }
-          : undefined;
+          : shellTurn?.pty === false
+            ? {
+                id: shellTurn.id,
+                command: shellTurn.command,
+                owner,
+                startedAt: shellTurn.startedAt,
+                ...(shellTurn.cwd !== undefined ? { cwd: shellTurn.cwd } : {}),
+                ...(shellTurn.excludeFromContext !== undefined
+                  ? { excludeFromContext: shellTurn.excludeFromContext }
+                  : {}),
+                pty: false,
+                outputText: shellTurn.outputChunks.join(""),
+                outputThroughSequence: shellTurn.outputSequence,
+                ...(shellTurn.replayTruncated === true ? { replayTruncated: true } : {}),
+              }
+            : undefined;
       return {
         status: "ready",
         baseline: {

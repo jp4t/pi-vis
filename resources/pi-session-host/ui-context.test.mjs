@@ -86,6 +86,63 @@ describe("createDialogResolver", () => {
     expect(acknowledged).toContain(current.id);
   });
 
+  it("keeps OAuth launch details on a subsequent manual-code prompt revision", async () => {
+    const sent = [];
+    const controller = new AbortController();
+    const resolver = createDialogResolver((message) => sent.push(message));
+    const surface = resolver.createProviderAuthSurface(
+      "OpenRouter",
+      "oauth",
+      controller.signal,
+      () => controller.abort(),
+    );
+    const authUrl =
+      "https://openrouter.ai/auth?callback_url=http%3A%2F%2F127.0.0.1%3A49152%2Foauth%2Fcallback";
+    const instructions =
+      "Complete sign-in in your browser. If the browser is on another machine, paste the final redirect URL here.";
+
+    surface.interaction.notify({ type: "auth_url", url: authUrl, instructions });
+    const oauthRequest = resolver.pendingSnapshot()[0].request;
+    expect(oauthRequest).toMatchObject({
+      method: "providerAuth",
+      phase: "oauth",
+      authUrl,
+      message: instructions,
+    });
+
+    const prompt = surface.interaction.prompt({
+      type: "manual_code",
+      message:
+        "Complete sign-in in your browser, or paste the authorization code / redirect URL here:",
+      placeholder: "http://127.0.0.1:49152/oauth/callback",
+    });
+    const promptRequest = resolver.pendingSnapshot()[0].request;
+    expect(promptRequest).toMatchObject({
+      id: oauthRequest.id,
+      method: "providerAuth",
+      phase: "prompt",
+      promptType: "manual_code",
+      prompt:
+        "Complete sign-in in your browser, or paste the authorization code / redirect URL here:",
+      placeholder: "http://127.0.0.1:49152/oauth/callback",
+      authUrl,
+      message: instructions,
+    });
+    expect(promptRequest.operationId).not.toBe(oauthRequest.operationId);
+
+    resolver.resolve({
+      type: "extension_ui_response",
+      id: promptRequest.id,
+      operationId: promptRequest.operationId,
+      value: "http://127.0.0.1:49152/oauth/callback?code=manual-code",
+    });
+    await expect(prompt).resolves.toContain("code=manual-code");
+    expect(JSON.stringify(resolver.pendingSnapshot())).not.toContain("manual-code");
+
+    surface.complete();
+    expect(resolver.pendingCount).toBe(0);
+  });
+
   it("cancels a provider-auth surface and its pending prompt once", async () => {
     const sent = [];
     const controller = new AbortController();

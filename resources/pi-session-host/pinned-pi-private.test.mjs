@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { VERSION as INSTALLED_PI_VERSION } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { PINNED_PRIVATE_LLAMA_VERSION, importPinnedLlamaExtension } from "./pinned-pi-private.mjs";
 
@@ -17,8 +18,9 @@ describe("pinned private llama.cpp adapter", () => {
     tempRoot = undefined;
   });
 
-  it("selects exactly the hidden llama.cpp factory from Pi 0.82.1", async () => {
-    const extension = await importPinnedLlamaExtension(PINNED_PI_CLI, PINNED_PRIVATE_LLAMA_VERSION);
+  it("selects exactly the hidden llama.cpp factory from the installed pinned Pi", async () => {
+    expect(INSTALLED_PI_VERSION).toBe(PINNED_PRIVATE_LLAMA_VERSION);
+    const extension = await importPinnedLlamaExtension(PINNED_PI_CLI, INSTALLED_PI_VERSION);
 
     expect(extension).toEqual({
       name: "llama.cpp",
@@ -29,8 +31,8 @@ describe("pinned private llama.cpp adapter", () => {
   });
 
   it("refuses to reuse the exception for a different Pi version", async () => {
-    await expect(importPinnedLlamaExtension(PINNED_PI_CLI, "0.82.2")).rejects.toThrow(
-      /approved only for Pi 0\.82\.1/,
+    await expect(importPinnedLlamaExtension(PINNED_PI_CLI, "0.82.1")).rejects.toThrow(
+      /approved only for Pi 0\.83\.0/,
     );
   });
 
@@ -41,7 +43,7 @@ describe("pinned private llama.cpp adapter", () => {
     mkdirSync(path.join(distDir, "extensions"), { recursive: true });
     writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ type: "module" }));
     writeFileSync(path.join(distDir, "cli.js"), "// fake pinned Pi CLI\n");
-    writeFileSync(path.join(distDir, "index.js"), "export const VERSION = '0.82.1';\n");
+    writeFileSync(path.join(distDir, "index.js"), "export const VERSION = '0.83.0';\n");
     writeFileSync(
       path.join(distDir, "extensions", "index.js"),
       "export const builtInExtensions = [];\n",

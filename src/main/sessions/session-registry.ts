@@ -724,6 +724,26 @@ export class SessionRegistry {
     if (record?._activationVisitId) record._activationVisitInteracted = true;
   }
 
+  private installPendingUiRequest(record: SessionRecord, request: ExtensionUiRequest): void {
+    // Persistent surfaces (notably provider auth) publish revisions with one
+    // stable request id and a new operation id. Main retains only the latest
+    // revision so lifecycle checks and response lookup cannot keep an obsolete
+    // OAuth/device phase alive beside its successor prompt.
+    for (const [operationId, pending] of record._pendingUiRequests) {
+      if (pending.id === request.id) record._pendingUiRequests.delete(operationId);
+    }
+    const operationId = request.operationId ?? request.id;
+    record._pendingUiRequests.set(operationId, structuredClone(request));
+  }
+
+  private clearPendingUiRequestRevisions(record: SessionRecord, acknowledgedId: string): void {
+    for (const [operationId, request] of record._pendingUiRequests) {
+      if (operationId === acknowledgedId || request.id === acknowledgedId) {
+        record._pendingUiRequests.delete(operationId);
+      }
+    }
+  }
+
   private attachHost(record: SessionRecord, proc: SessionHost): void {
     const current = () => this.sessions.get(record.sessionId) === record && record.proc === proc;
     proc.on("event", (event) => {
@@ -748,9 +768,7 @@ export class SessionRegistry {
         });
         return;
       }
-      const operationId =
-        (request as ExtensionUiRequest & { operationId?: string }).operationId ?? request.id;
-      record._pendingUiRequests.set(operationId, structuredClone(request));
+      this.installPendingUiRequest(record, request);
       this.onUiRequest(record.sessionId, request);
     });
     proc.on("lifecycleUiLease", (active) => {
@@ -1018,7 +1036,7 @@ export class SessionRegistry {
         record._pendingUiAcks.delete(operationId);
         pending.resolve(true);
       }
-      record._pendingUiRequests.delete(operationId);
+      this.clearPendingUiRequestRevisions(record, operationId);
       this.onUiAcknowledged(record.sessionId, operationId);
     });
     proc.on("unresponsive", () => {
@@ -1184,10 +1202,7 @@ export class SessionRegistry {
         record._mutationSequence++;
       } else if (item.type === "ui") {
         record._mutationSequence++;
-        const operationId =
-          (item.request as ExtensionUiRequest & { operationId?: string }).operationId ??
-          item.request.id;
-        record._pendingUiRequests.set(operationId, structuredClone(item.request));
+        this.installPendingUiRequest(record, item.request);
       } else if (item.type === "panel") {
         record._mutationSequence++;
         if (item.event.type === "panel_open") {

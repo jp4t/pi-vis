@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { getPinnedPi } from "./pinned-pi.js";
+import { PINNED_PI_VERSION, getPinnedPi } from "./pinned-pi.js";
 
 describe("getPinnedPi", () => {
   it("resolves the bundled pi runtime with its exact pinned version", () => {
@@ -11,7 +11,8 @@ describe("getPinnedPi", () => {
     expect(info!.path.endsWith(path.join("dist", "cli.js"))).toBe(true);
     expect(info!.path).toContain(path.join("@earendil-works", "pi-coding-agent"));
     expect(existsSync(info!.path)).toBe(true);
-    expect(info!.version).toBe("0.82.1");
+    expect(info!.version).toBe(PINNED_PI_VERSION);
+    expect(PINNED_PI_VERSION).toBe("0.83.0");
   });
 
   it("honors an existing override path (test seam)", () => {

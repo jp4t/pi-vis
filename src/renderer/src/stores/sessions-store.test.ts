@@ -5321,6 +5321,87 @@ describe("sessions store - authority intent projection", () => {
     });
   });
 
+  it("installs a live non-PTY Shell Turn keyframe before replaying newer output", () => {
+    const snapshot = semanticSnapshot(1, {
+      sdk: {
+        isStreaming: false,
+        isIdle: false,
+        isCompacting: false,
+        isRetrying: false,
+        retryAttempt: 0,
+        isBashRunning: true,
+      },
+      activity: {
+        bash: {
+          kind: "bash",
+          state: "active",
+          intentId: "restored-operations",
+          command: "extension-command",
+          startedAt: 1_786_000_000_100,
+          excludeFromContext: false,
+          pty: false,
+          inputReady: false,
+        },
+      },
+    });
+    const attach = authorityAttach(snapshot);
+    attach.baseline.transcript.currentShellTurn = {
+      id: "restored-operations",
+      command: "extension-command",
+      owner: snapshot.owner,
+      startedAt: 1_786_000_000_100,
+      cwd: "/workspace/restored",
+      excludeFromContext: false,
+      pty: false,
+      outputText: "first\n",
+      outputThroughSequence: 1,
+    };
+    attach.replay = [
+      {
+        sessionId: SESSION_A,
+        rendererGeneration: 0,
+        publicationSequence: 1,
+        plane: "transcript",
+        owner: snapshot.owner,
+        payload: {
+          kind: "delta",
+          cursor: {
+            ...snapshot.owner,
+            transportSequence: 2,
+            snapshotSequence: snapshot.snapshotSequence,
+          },
+          liveTailCursor: "2",
+          entries: [
+            {
+              type: "bash_execution_update",
+              id: "restored-operations",
+              delta: "second\n",
+              sequence: 2,
+            },
+          ],
+        },
+      },
+    ];
+
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+
+    const session = useSessionsStore.getState().sessions.get(SESSION_A)!;
+    expect(session.transcript.activeBashExecutionId).toBe("restored-operations");
+    expect(session.transcript.blocks).toHaveLength(1);
+    expect(session.transcript.blocks[0]).toMatchObject({
+      type: "bash",
+      data: {
+        executionId: "restored-operations",
+        command: "extension-command",
+        outputText: "first\nsecond\n",
+        streamOutputSequence: 2,
+        pty: false,
+        isStreaming: true,
+        cwd: "/workspace/restored",
+      },
+    });
+  });
+
   it("retains only a matching live PTY presentation across a recoverable semantic fence", () => {
     const snapshot = semanticSnapshot(1, {
       sdk: {

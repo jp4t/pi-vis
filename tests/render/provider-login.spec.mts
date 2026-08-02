@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("runtime-native provider sign-in", () => {
-  test("signs in with a secret prompt, refreshes models, and supports device-code OAuth", async ({
+  test("signs in with a secret prompt, refreshes models, and supports OAuth journeys", async ({
     page,
   }, testInfo) => {
     await page.goto("/");
@@ -158,5 +158,56 @@ test.describe("runtime-native provider sign-in", () => {
       .toBe("https://example.com/device");
     await device.getByRole("button", { name: "Cancel" }).click();
     await expect(device).toBeHidden();
+
+    await composer.fill("/login");
+    await composer.press("Enter");
+    await page.locator(".picker--login").getByRole("option").filter({ hasText: "OAuth" }).click();
+    const manualCode = page.getByRole("dialog", { name: "Sign in to Preview" });
+    const redirectInput = manualCode.getByRole("textbox", {
+      name: "Complete sign-in in your browser, or paste the authorization code / redirect URL here:",
+    });
+    await expect(redirectInput).toBeVisible();
+    await expect(manualCode).toContainText(
+      "If the browser is on another machine, paste the final redirect URL here.",
+    );
+    await expect(manualCode.getByRole("button", { name: "Open browser" })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("manual-code.png"), fullPage: true });
+
+    await manualCode.getByRole("button", { name: "Open browser" }).click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (
+              globalThis as unknown as {
+                __previewExternalLinks?: Array<{ url: string }>;
+              }
+            ).__previewExternalLinks?.at(-1)?.url,
+        ),
+      )
+      .toBe(
+        "https://openrouter.ai/auth?callback_url=http%3A%2F%2F127.0.0.1%3A49152%2Foauth%2Fcallback%2Fpreview&code_challenge=preview-challenge&code_challenge_method=S256",
+      );
+
+    const redirectValue =
+      "http://127.0.0.1:49152/oauth/callback/preview?code=render-manual-code-must-not-persist";
+    await redirectInput.fill(redirectValue);
+    await manualCode.getByRole("button", { name: "Continue" }).click();
+    await expect(manualCode).toBeHidden();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (needle) => ({
+            body: document.body.textContent?.includes(needle) ?? false,
+            store: JSON.stringify(
+              (
+                window as unknown as { __pivisStore?: { getState: () => unknown } }
+              ).__pivisStore?.getState(),
+            ).includes(needle),
+          }),
+          redirectValue,
+        ),
+      )
+      .toEqual({ body: false, store: false });
   });
 });

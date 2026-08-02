@@ -68,6 +68,7 @@ const previewAuthPrompts = new Map<
   { sessionId: SessionId; resolve: () => void; reject: (error: Error) => void }
 >();
 let previewLoginComplete = false;
+let previewOauthLoginCount = 0;
 
 // Test/preview hooks (NOT part of the real IPC contract). Render tests use
 // these to drive deterministic streaming + observe panel input without a
@@ -1306,10 +1307,18 @@ async function settleIntent(envelope: PreviewIntentEnvelope): Promise<void> {
         break;
       case "loginProvider": {
         const requestId = `preview-auth-${envelope.intentId}`;
+        const oauthLoginCount =
+          intent.authType === "oauth" ? ++previewOauthLoginCount : previewOauthLoginCount;
+        const useManualCodeOAuth = intent.authType === "oauth" && oauthLoginCount > 1;
         await new Promise<void>((resolve, reject) => {
           let timer: number | undefined;
-          const finish = (): void => {
+          let promptTimer: number | undefined;
+          const clearTimers = (): void => {
             if (timer !== undefined) window.clearTimeout(timer);
+            if (promptTimer !== undefined) window.clearTimeout(promptTimer);
+          };
+          const finish = (): void => {
+            clearTimers();
             previewAuthPrompts.delete(requestId);
             resolve();
           };
@@ -1317,12 +1326,12 @@ async function settleIntent(envelope: PreviewIntentEnvelope): Promise<void> {
             sessionId: envelope.sessionId,
             resolve: finish,
             reject: (error) => {
-              if (timer !== undefined) window.clearTimeout(timer);
+              clearTimers();
               previewAuthPrompts.delete(requestId);
               reject(error);
             },
           });
-          publishProviderAuthRequest(envelope.sessionId, {
+          const baseRequest = {
             type: "extension_ui_request",
             id: requestId,
             operationId: `${requestId}:1`,
@@ -1331,21 +1340,48 @@ async function settleIntent(envelope: PreviewIntentEnvelope): Promise<void> {
             method: "providerAuth",
             providerName: "Preview",
             authType: intent.authType,
-            ...(intent.authType === "api_key"
-              ? {
-                  phase: "prompt",
-                  promptType: "secret",
-                  prompt: "API key",
-                  placeholder: "Paste your API key",
-                }
-              : {
-                  phase: "device",
-                  authUrl: "https://example.com/device",
-                  deviceCode: "PI-VIS-80",
-                  message: "Enter this code in your browser, then return here.",
-                }),
-          });
-          if (intent.authType === "oauth") {
+          } as const;
+          if (intent.authType === "api_key") {
+            publishProviderAuthRequest(envelope.sessionId, {
+              ...baseRequest,
+              phase: "prompt",
+              promptType: "secret",
+              prompt: "API key",
+              placeholder: "Paste your API key",
+            });
+          } else if (useManualCodeOAuth) {
+            const authUrl =
+              "https://openrouter.ai/auth?callback_url=http%3A%2F%2F127.0.0.1%3A49152%2Foauth%2Fcallback%2Fpreview&code_challenge=preview-challenge&code_challenge_method=S256";
+            const callbackUrl = "http://127.0.0.1:49152/oauth/callback/preview";
+            const instructions =
+              "Complete sign-in in your browser. If the browser is on another machine, paste the final redirect URL here.";
+            publishProviderAuthRequest(envelope.sessionId, {
+              ...baseRequest,
+              phase: "oauth",
+              authUrl,
+              message: instructions,
+            });
+            promptTimer = window.setTimeout(() => {
+              publishProviderAuthRequest(envelope.sessionId, {
+                ...baseRequest,
+                operationId: `${requestId}:2`,
+                phase: "prompt",
+                promptType: "manual_code",
+                prompt:
+                  "Complete sign-in in your browser, or paste the authorization code / redirect URL here:",
+                placeholder: callbackUrl,
+                authUrl,
+                message: instructions,
+              });
+            }, 100);
+          } else {
+            publishProviderAuthRequest(envelope.sessionId, {
+              ...baseRequest,
+              phase: "device",
+              authUrl: "https://example.com/device",
+              deviceCode: "PI-VIS-80",
+              message: "Enter this code in your browser, then return here.",
+            });
             timer = window.setTimeout(finish, 2_500);
           }
         });
@@ -1614,7 +1650,7 @@ const stub = {
   invoke: async (channel: string, req?: unknown) => {
     switch (channel) {
       case "pi.info":
-        return { version: "0.82.1-stub" };
+        return { version: "0.83.0-stub" };
       case "extensionUpdates.status":
         return previewExtensionUpdateStatus;
       case "extensionUpdates.check": {

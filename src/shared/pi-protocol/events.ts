@@ -242,7 +242,7 @@ export const SummarizationRetryFinishedEventSchema = z.object({
   type: z.literal("summarization_retry_finished"),
 });
 
-// Pi 0.82 emits the update variant from AgentSession.executeBash(). Pi-Vis
+// Pi 0.83 emits the update variant from AgentSession.executeBash(). Pi-Vis
 // brackets it with start/end records so the native transcript has a complete,
 // correlated streaming lifecycle rather than waiting for final persistence.
 export const BashExecutionStartEventSchema = z.object({
@@ -261,6 +261,8 @@ export const BashExecutionUpdateEventSchema = z.object({
   type: z.literal("bash_execution_update"),
   id: z.string().optional(),
   delta: z.string(),
+  /** Host-assigned ordering for bounded non-PTY attach reconstruction. */
+  sequence: z.number().int().positive().optional(),
 });
 
 /** Raw, transient PTY bytes for a live user-owned Shell Turn. */

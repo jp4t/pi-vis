@@ -4,7 +4,6 @@
  * All functions receive `piPath` (the pinned pi resolved by pinned-pi.ts in
  * the main process) so imports are resolved from that exact runtime.
  */
-
 import { existsSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -155,6 +154,119 @@ export function createSessionRuntimeOverrideResolver(runtimeResumeState) {
     const resumeState = initial ? runtimeResumeState : undefined;
     initial = false;
     return resolveSessionRuntimeOverrides(sessionManager, modelRuntime, resumeState);
+  };
+}
+
+// ─── Session Runtime Model Options ────────────────────────────────────────────
+
+function isModelReference(value) {
+  return (
+    value &&
+    typeof value.provider === "string" &&
+    value.provider.length > 0 &&
+    typeof value.modelId === "string" &&
+    value.modelId.length > 0
+  );
+}
+
+function modelsMatch(left, right) {
+  return left?.provider === right?.provider && left?.id === right?.id;
+}
+
+/**
+ * Resolve the complete model-related options for one AgentSession factory run.
+ *
+ * Pi's CLI resolves saved `enabledModels` settings before constructing the
+ * session. The public SDK intentionally does not do that on its own, so SDK
+ * embedders must pass the resolved scope explicitly. Doing this here also
+ * makes Pi 0.83's `ctx.scopedModels` available to `session_start` handlers,
+ * before extensions are bound.
+ *
+ * Existing branch metadata and a resolvable non-null model from a same-session
+ * resume checkpoint remain authoritative. A valid null checkpoint deliberately
+ * leaves model selection to the configured scope/settings, matching Pi's
+ * normal fallback, while its thinking level still retains precedence. Only a
+ * genuinely fresh, metadata-free session chooses an initial model from the
+ * configured scope: the saved default when it is in scope, otherwise the first
+ * resolved entry. An explicit thinking level on that scope entry is used only
+ * when persisted/resume thinking did not already provide a stronger override.
+ */
+export async function resolveSessionRuntimeOptions({
+  sessionManager,
+  settingsManager,
+  modelRuntime,
+  resolveModelScopeWithDiagnostics,
+  runtimeResumeState,
+}) {
+  const context = sessionManager.buildSessionContext();
+  const sessionOverrides = resolveSessionRuntimeOverrides(
+    sessionManager,
+    modelRuntime,
+    runtimeResumeState,
+  );
+  const configuredPatterns = settingsManager?.getEnabledModels?.();
+  const scopeResult =
+    Array.isArray(configuredPatterns) && configuredPatterns.length > 0
+      ? await resolveModelScopeWithDiagnostics([...configuredPatterns], modelRuntime)
+      : { scopedModels: [], diagnostics: [] };
+  const scopedModels = Array.isArray(scopeResult?.scopedModels) ? scopeResult.scopedModels : [];
+  const diagnostics = Array.isArray(scopeResult?.diagnostics) ? scopeResult.diagnostics : [];
+  const sessionOptions = { scopedModels, ...sessionOverrides };
+
+  const hasExistingMessages = Array.isArray(context.messages) && context.messages.length > 0;
+  const hasPersistedModel = isModelReference(context.model);
+  const hasResumeModel = isModelReference(runtimeResumeState?.model);
+  const mayChooseScopedInitialModel =
+    scopedModels.length > 0 &&
+    !hasExistingMessages &&
+    !hasPersistedModel &&
+    !hasResumeModel &&
+    sessionOverrides.model === undefined;
+
+  if (mayChooseScopedInitialModel) {
+    const savedProvider = settingsManager?.getDefaultProvider?.();
+    const savedModelId = settingsManager?.getDefaultModel?.();
+    const savedModel =
+      typeof savedProvider === "string" &&
+      savedProvider.length > 0 &&
+      typeof savedModelId === "string" &&
+      savedModelId.length > 0
+        ? modelRuntime.getModel(savedProvider, savedModelId)
+        : undefined;
+    const selected =
+      (savedModel && scopedModels.find((entry) => modelsMatch(entry?.model, savedModel))) ??
+      scopedModels[0];
+    if (selected?.model) {
+      sessionOptions.model = selected.model;
+      if (sessionOptions.thinkingLevel === undefined && selected.thinkingLevel !== undefined) {
+        sessionOptions.thinkingLevel = selected.thinkingLevel;
+      }
+    }
+  }
+
+  return { sessionOptions, diagnostics };
+}
+
+/**
+ * Bind owner-local resume state to the first factory invocation while resolving
+ * saved model scope independently for every later /new, /resume, /fork, or
+ * imported runtime.
+ */
+export function createSessionRuntimeOptionsResolver(
+  resolveModelScopeWithDiagnostics,
+  runtimeResumeState,
+) {
+  let initial = true;
+  return (sessionManager, settingsManager, modelRuntime) => {
+    const resumeState = initial ? runtimeResumeState : undefined;
+    initial = false;
+    return resolveSessionRuntimeOptions({
+      sessionManager,
+      settingsManager,
+      modelRuntime,
+      resolveModelScopeWithDiagnostics,
+      runtimeResumeState: resumeState,
+    });
   };
 }
 

@@ -181,7 +181,7 @@ describe("SessionHost", () => {
   });
 
   it("round-trips exact-owner navigation presentation acknowledgement", async () => {
-    fake.emitReady("0.82.1");
+    fake.emitReady("0.83.0");
     await host.waitForReady();
     const owner = { hostInstanceId: fake.hostInstanceId, sessionEpoch: fake.sessionEpoch };
 
@@ -823,7 +823,7 @@ describe("SessionHost", () => {
 
   describe("Shell Turn I/O round-trips", () => {
     it("forwards sequenced input and returns the host acknowledgement", async () => {
-      await fake.emitReady("0.82.1");
+      await fake.emitReady("0.83.0");
       await host.waitForReady();
 
       await expect(host.sendShellInput("shell-1", 2, "yes\n")).resolves.toEqual({
@@ -841,7 +841,7 @@ describe("SessionHost", () => {
     });
 
     it("forwards resize revisions, reconstruction acknowledgement, and signals", async () => {
-      await fake.emitReady("0.82.1");
+      await fake.emitReady("0.83.0");
       await host.waitForReady();
 
       await expect(host.sendShellResize("shell-1", 4, 120, 40)).resolves.toBe(true);

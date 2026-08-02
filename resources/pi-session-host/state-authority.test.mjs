@@ -3773,6 +3773,61 @@ describe("state authority", () => {
     await flush();
   });
 
+  it("reattaches a bounded active non-PTY Shell Turn with an ordered output baseline", async () => {
+    const sendPresentation = vi.fn();
+    const { authority, session } = setup({}, { sendPresentation });
+    session.isBashRunning = true;
+    authority.beginObservedOperation("bash");
+    authority.observeEvent({
+      type: "bash_execution_start",
+      id: "non-pty-attach",
+      command: "remote-build",
+      excludeFromContext: true,
+      pty: false,
+      startedAt: 1_786_000_000_000,
+      cwd: "/workspace/remote",
+    });
+    const newest = "n".repeat(1024 * 1024);
+    authority.observeEvent({
+      type: "bash_execution_update",
+      id: "non-pty-attach",
+      delta: `discarded-prefix${newest}`,
+    });
+
+    const attached = await readyAttach(authority, 25);
+    expect(attached.transcript.currentShellTurn).toEqual({
+      id: "non-pty-attach",
+      command: "remote-build",
+      owner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+      startedAt: 1_786_000_000_000,
+      cwd: "/workspace/remote",
+      excludeFromContext: true,
+      pty: false,
+      outputText: newest,
+      outputThroughSequence: 1,
+      replayTruncated: true,
+    });
+    expect(attached.semantic.snapshot.activity.bash).toMatchObject({
+      intentId: "non-pty-attach",
+      pty: false,
+    });
+    expect(AuthorityAttachBaselineSchema.safeParse(attached).success).toBe(true);
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_execution_update",
+              id: "non-pty-attach",
+              sequence: 1,
+            }),
+          ],
+        }),
+      }),
+    );
+  });
+
   it("refuses a foreground Shell Turn before admission while the session is busy", async () => {
     const { authority, session, setEditor, acceptShellEditorSubmission } = setup({
       isIdle: false,
@@ -3867,6 +3922,21 @@ describe("state authority", () => {
     await flush();
     expect(firstSettled).toBe(false);
     expect(authority.semanticSnapshot().activeIntents).toEqual([]);
+
+    const unrelated = vi.fn(() => ({
+      deferredOutcome: Promise.resolve({ refreshed: true }),
+    }));
+    await expect(
+      authority.dispatchIntent(
+        {
+          intentId: "unrelated-during-shell-preparation",
+          expectedOwner: { hostInstanceId: "host-1", sessionEpoch: 0 },
+          intent: { kind: "refreshModels" },
+        },
+        unrelated,
+      ),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() => expect(unrelated).toHaveBeenCalledOnce());
 
     preparation.resolve();
     await expect(first).resolves.toMatchObject({ status: "admitted" });

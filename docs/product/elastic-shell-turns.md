@@ -4,7 +4,7 @@
 
 **Feature area:** Composer, direct shell execution, transcript
 
-**Runtime baseline:** Pi 0.82.1
+**Runtime baseline:** Pi 0.83.0
 
 **Scope:** P0 product behavior and the contracts required to implement it
 
@@ -16,9 +16,10 @@ question.
 
 A direct `!` or `!!` command is a user-authored **Shell Turn**, not a Pi tool
 call. The editable prefix makes the interpretation visible before submission.
-After submission, a single PTY-backed surface appears at the Composer boundary,
-accepts interactive input in a fixed user-resizable viewport, and then settles
-into the chronological transcript with its output visible.
+After submission, Pi 0.83 extensions may supply a complete result or non-PTY
+`BashOperations`; otherwise a single PTY-backed surface appears at the Composer
+boundary and accepts interactive input in a fixed user-resizable viewport. All
+three paths settle into the chronological transcript with their output visible.
 
 The three provenances must remain visually and semantically distinct:
 
@@ -37,15 +38,16 @@ incompatible implementations:
 
 - Prefix recognition is position-zero and character-exact. The ordinary-message
   counterexample is ` !ls` (leading space), not `!ls`.
-- Pi 0.82.1 excludes the entire Bash execution message for `!!`: both command
+- Pi 0.83.0 excludes the entire Bash execution message for `!!`: both command
   and output. `!` makes both eligible for the next model interaction.
 - "Full output" is bounded and must never be promised. P0 has explicit
   presentation, persistence, and model-projection limits.
 - One foreground execution means one Pi-Vis-owned Shell Turn **per session**.
   Different live sessions may each own one; P0 provides no detached-job UI.
 - Session switching is allowed and does not transfer terminal ownership.
-- The live surface always uses a terminal emulator. There is no output-size
-  threshold that swaps a running command from DOM rendering to a terminal.
+- The unhandled interactive path always uses a terminal emulator. There is no
+  output-size threshold that swaps a running PTY command from DOM rendering to
+  a terminal. Extension-supplied results and `BashOperations` remain non-PTY.
 - The settled surface uses normalized text and the shared transcript
   virtualizer; raw VT bytes are never session history or model context.
 - Admission is idle-only and never queued. A rejected draft stays editable and
@@ -56,13 +58,15 @@ incompatible implementations:
 ### 2.1 Critique of the draft
 
 The draft's strongest choices were its provenance model, text-derived and
-reversible Composer interpretation, single-PTY execution, and refusal to invent
-a hidden persistent shell mode. Those decisions survived unchanged.
+reversible Composer interpretation, one foreground execution per session, a
+single PTY for the unhandled interactive path, and refusal to invent a hidden
+persistent shell mode. Those decisions survived while Pi 0.83 added the two
+extension-handled non-PTY outcomes.
 
 The draft needed tighter contracts in five places:
 
 - Its position-zero example contained a contradictory duplicate `!ls` row.
-- It described `!!` as excluding output, while Pi 0.82.1 excludes the entire
+- It described `!!` as excluding output, while Pi 0.83.0 excludes the entire
   canonical Bash execution message.
 - "Full retained output" had no defined owner or bound. P0 now distinguishes
   bounded live emulator state, bounded reattach keyframes, Pi's canonical
@@ -79,8 +83,8 @@ The draft needed tighter contracts in five places:
 
 **Shell draft:** Composer text whose first character is `!`.
 
-**Shell Turn:** One admitted user command, its terminal execution, normalized
-output, status, and metadata.
+**Shell Turn:** One admitted user command, its execution or extension-supplied
+result, normalized output, status, and metadata.
 
 **Included turn:** A `!command` whose canonical Pi Bash execution message,
 including command and normalized result, is eligible for Pi context under Pi's
@@ -90,12 +94,14 @@ existing rules.
 message is skipped when Pi constructs model input. It remains human-visible and
 persisted.
 
-**Terminal presentation plane:** Ephemeral, owner-fenced VT data used to render
-and reattach the live terminal. It is not canonical transcript state.
+**Terminal presentation plane:** Ephemeral, owner-fenced VT data used only to
+render and reattach the unhandled live PTY. It is not canonical transcript
+state and is absent from extension-handled non-PTY turns.
 
-**Normalized output:** Plain UTF-8 text derived by a stateful terminal emulator.
-It is the only output eligible for settled transcript rendering, durable
-display retention, or Pi context.
+**Normalized output:** Plain UTF-8 text supplied by Pi's full-result or
+`BashOperations` path, or derived by a stateful terminal emulator for an
+unhandled PTY. It is the only output eligible for settled transcript rendering,
+durable display retention, or Pi context.
 
 ## 4. Composer contract
 
@@ -189,7 +195,8 @@ Shell Turn only when all of these are true:
 - No direct Shell Turn is running or cancelling in that session.
 - No agent response, compaction, retry, navigation, slash-command operation,
   submission-custody operation, or lifecycle transition owns the session.
-- The renderer is not proposing stale state and the host has PTY capability.
+- The renderer is not proposing stale state and the host has the execution
+  capability selected by Pi's public `user_bash` result.
 - The normalized command is non-empty and within the command limit.
 
 The rule is deliberately idle-only. It avoids inserting Bash history while a
@@ -204,7 +211,7 @@ deterministic writer.
 | Shell Turn active in this session | Reject with reason and preserve draft |
 | Shell Turn active only in another session | Allow if this session is otherwise eligible |
 | Stale owner, epoch, or editor revision | Reject silently at the authority boundary; never replay |
-| PTY unavailable before acceptance | Reject and preserve draft; create no Shell Turn |
+| Hook preparation cancelled, or selected execution path unavailable before acceptance | Reject and preserve draft; create no Shell Turn |
 | Spawn fails after accepted start | Settle a visible failed Shell Turn; do not restore or rerun the draft |
 
 There is no shell queue, pending replay, automatic retry, or "run when idle"
@@ -215,11 +222,13 @@ cleanup guarantees.
 
 ## 6. Running-terminal experience
 
-### 6.1 One PTY and one surface
+### 6.1 One execution and one surface
 
-Every Shell Turn starts in a PTY from its first byte. Pi-Vis never starts with
-pipes and restarts to "upgrade" interactivity. The process, PTY, and execution
-ID stay unchanged as the presentation resizes.
+Every unhandled `user_bash` Shell Turn starts in a PTY from its first byte.
+Pi-Vis never starts that path with pipes and restarts to "upgrade"
+interactivity. The process, PTY, and execution ID stay unchanged as the
+presentation resizes. An extension-supplied full result or `BashOperations`
+path is explicitly non-PTY and never advertises terminal input or resize.
 
 Starting a PTY does not immediately open the live viewport. Presentation has a
 200 ms grace period, keyed to the exact session/owner/epoch/execution. During
@@ -360,16 +369,27 @@ user actions. Agent-generated bash retains the existing Pi tool-card treatment.
 Implementing this feature therefore requires corresponding updates to
 `docs/ui-conventions.md` and `docs/architecture/state-and-sessions.md`.
 
-### 8.2 Pi 0.82.1 context contract
+### 8.2 Pi 0.83.0 context contract
 
-Execution must continue through the public
+Execution first emits Pi 0.83's public `user_bash` extension event exactly
+once. A handler may return a complete result, which is recorded without a
+spawn, or replacement `BashOperations`, which are passed to the public
 `AgentSession.executeBash(command, onChunk, { excludeFromContext, id,
-operations })` surface with a Pi-Vis PTY `BashOperations` adapter. This
-preserves Pi's canonical Bash message and context behavior:
+operations })` surface as a non-PTY Shell Turn. An unhandled event continues
+through that same surface with the Pi-Vis PTY adapter. This preserves Pi's
+canonical Bash message and context behavior:
+
+The hook promise never occupies the serialized mutation scheduler. The host
+starts it only after an initial authority check, then re-enters serialized
+ingress to revalidate owner, exact editor source, and foreground-work fences
+before it creates a start marker or execution. Escape/legacy abort can fence a
+pending hook despite the event's lack of `AbortSignal`; stable admission
+settles as `not_admitted/cancelled`, preserves the draft, and consumes any late
+handler resolution or rejection without starting or recording work.
 
 - `!command` records the original command and normalized result in a Pi Bash
   execution message. Pi may include both on the next model interaction.
-- `!!command` sets `excludeFromContext`; Pi 0.82.1 skips the entire Bash
+- `!!command` sets `excludeFromContext`; Pi 0.83.0 skips the entire Bash
   execution message, including command and output.
 - Classification is frozen at admission and persists. It cannot be toggled
   retroactively.
@@ -379,7 +399,7 @@ promise that normal context-window and compaction rules will retain it forever.
 Context exclusion is not deletion: the human transcript and session persistence
 still contain the command and normalized output.
 
-Pi 0.82.1 tail-truncates its canonical result to at most 50 KiB or 2,000
+Pi 0.83.0 tail-truncates its canonical result to at most 50 KiB or 2,000
 logical lines and may expose a full-output path. The UI must describe model
 projection as normalized and possibly truncated; it must not imply that Pi saw
 the entire human-retained value.
@@ -433,7 +453,7 @@ The PTY lives in the owning SDK-host process alongside `AgentSession`. The
 existing main-process `src/main/pty.ts` launches the SDK host itself and is not
 a reusable per-command terminal authority.
 
-Only Pi's public 0.82.1 surface may be used after the already-approved pinned
+Only Pi's public 0.83.0 surface may be used after the already-approved pinned
 private-registry lookup. The Shell Turn feature does not add another private Pi
 import. The packaged application keeps the SDK host and native PTY dependency
 unpacked, matching the existing host subprocess layout. Until the PTY dependency
@@ -442,10 +462,17 @@ component-aware helper-path patch documented in
 `docs/architecture/runtime-services.md`; the final app must pass both packaged
 host- and main-resolution PTY smokes.
 
-The custom PTY operation closes over a host-owned terminal manager. It receives
-Pi's prefix-resolved command and session cwd, spawns one process group, routes
-raw bytes to a headless emulator and presentation subscribers, emits the final
-normalized value to Pi, and returns exit status through `BashOperations`.
+For an unhandled `user_bash` event, the custom PTY operation closes over a
+host-owned terminal manager. It receives Pi's prefix-resolved command and
+session cwd, spawns one process group, routes raw bytes to a headless emulator
+and presentation subscribers, emits the final normalized value to Pi, and
+returns exit status through `BashOperations`. Extension-provided results or
+operations retain the same semantic transcript lifecycle but do not advertise
+interactive PTY input. A running operations turn retains a bounded normalized-
+output attach baseline with a dedicated update-sequence watermark; covered
+replay is ignored after renderer recovery, later updates append once, and an
+explicit omission notice remains until final canonical output replaces the
+baseline.
 
 ### 9.2 Typed semantic and terminal contracts
 
@@ -457,7 +484,8 @@ The semantic plane is canonical while a turn is live and includes:
 - `executionId`, admission `intentId`, command, classification, and
   `cwdAtStart`;
 - running/cancelling state and start time;
-- terminal mode and whether input is ready after reconstruction.
+- explicit PTY classification, plus terminal mode and input readiness only for
+  an interactive PTY path.
 
 Completion metadata—duration, exit code or signal, normalization
 kind, and Pi truncation metadata—travels on the typed transcript event and is
@@ -536,7 +564,7 @@ otherwise:
 | Retained alternate-screen final frames | 1 MiB aggregate | Drop oldest final frames, or omit one oversized frame, and insert a counted plain-text omission marker |
 | PTY parser backlog | Pause at 256 KiB; resume at 64 KiB | Apply node-pty flow control without dropping or reordering bytes |
 | Child IPC backlog | 1,024 messages or 8 MiB | Pause the PTY while queued; fail the host rather than silently lose an authority publication if the bounded queue is exceeded |
-| Canonical Pi result | Pi 0.82.1 limit: 50 KiB or 2,000 lines | Use Pi's tail truncation, preserve `truncated`, and surface its optional complete-output path |
+| Canonical Pi result | Pi 0.83.0 limit: 50 KiB or 2,000 lines | Use Pi's tail truncation, preserve `truncated`, and surface its optional complete-output path |
 
 Live rendering continues after reattach retention fills. A reconstructed
 surface exposes an icon-only warning with the accessible name "Earlier live

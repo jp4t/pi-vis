@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  createSessionRuntimeOptionsResolver,
   createSessionRuntimeOverrideResolver,
   resolvePiDependency,
+  resolveSessionRuntimeOptions,
   resolveSessionRuntimeOverrides,
 } from "./bootstrap.mjs";
 
@@ -255,5 +257,211 @@ describe("resolveSessionRuntimeOverrides", () => {
         hasConfiguredAuth: () => false,
       }),
     ).toEqual({ thinkingLevel: "low" });
+  });
+});
+
+describe("resolveSessionRuntimeOptions", () => {
+  const modelA = { provider: "provider-a", id: "model-a" };
+  const modelB = { provider: "provider-b", id: "model-b" };
+  const modelC = { provider: "provider-c", id: "model-c" };
+
+  function sessionManager({
+    messages = [],
+    model = null,
+    thinkingLevel = "off",
+    branch = [],
+  } = {}) {
+    return {
+      buildSessionContext: () => ({ messages, model, thinkingLevel }),
+      getBranch: () => branch,
+    };
+  }
+
+  function settings({ enabledModels, defaultProvider, defaultModel } = {}) {
+    return {
+      getEnabledModels: () => enabledModels,
+      getDefaultProvider: () => defaultProvider,
+      getDefaultModel: () => defaultModel,
+    };
+  }
+
+  function modelRuntime(models = [modelA, modelB, modelC]) {
+    return {
+      getModel: (provider, modelId) =>
+        models.find((model) => model.provider === provider && model.id === modelId),
+      hasConfiguredAuth: () => true,
+    };
+  }
+
+  it("resolves saved scope and chooses the saved default when it is in scope", async () => {
+    const scopedModels = [
+      { model: modelA, thinkingLevel: "high" },
+      { model: modelB, thinkingLevel: "low" },
+    ];
+    const diagnostic = {
+      type: "warning",
+      code: "no-match",
+      message: "No models match pattern missing",
+      pattern: "missing",
+    };
+    const calls = [];
+    const runtime = modelRuntime();
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager(),
+      settingsManager: settings({
+        enabledModels: ["provider-a/model-a:high", "provider-b/model-b:low"],
+        defaultProvider: "provider-b",
+        defaultModel: "model-b",
+      }),
+      modelRuntime: runtime,
+      resolveModelScopeWithDiagnostics: async (patterns, receivedRuntime) => {
+        calls.push({ patterns, receivedRuntime });
+        return { scopedModels, diagnostics: [diagnostic] };
+      },
+    });
+
+    expect(calls).toEqual([
+      {
+        patterns: ["provider-a/model-a:high", "provider-b/model-b:low"],
+        receivedRuntime: runtime,
+      },
+    ]);
+    expect(result).toEqual({
+      sessionOptions: { scopedModels, model: modelB, thinkingLevel: "low" },
+      diagnostics: [diagnostic],
+    });
+  });
+
+  it("chooses the first scoped model and keeps a configured all-model scope intact", async () => {
+    const scopedModels = [{ model: modelA, thinkingLevel: "high" }, { model: modelB }];
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager(),
+      settingsManager: settings({
+        enabledModels: ["provider-*/*"],
+        defaultProvider: "provider-c",
+        defaultModel: "model-c",
+      }),
+      modelRuntime: modelRuntime(),
+      resolveModelScopeWithDiagnostics: async () => ({ scopedModels, diagnostics: [] }),
+    });
+
+    expect(result.sessionOptions).toEqual({
+      scopedModels,
+      model: modelA,
+      thinkingLevel: "high",
+    });
+  });
+
+  it("passes an empty scope without invoking the resolver when no setting exists", async () => {
+    let called = false;
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager(),
+      settingsManager: settings(),
+      modelRuntime: modelRuntime(),
+      resolveModelScopeWithDiagnostics: async () => {
+        called = true;
+        throw new Error("an absent scope must not be resolved");
+      },
+    });
+
+    expect(called).toBe(false);
+    expect(result).toEqual({ sessionOptions: { scopedModels: [] }, diagnostics: [] });
+  });
+
+  it("reports a no-match scope without forcing an initial model", async () => {
+    const diagnostics = [
+      {
+        type: "warning",
+        code: "no-match",
+        message: 'No models match pattern "missing"',
+        pattern: "missing",
+      },
+    ];
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager(),
+      settingsManager: settings({ enabledModels: ["missing"] }),
+      modelRuntime: modelRuntime(),
+      resolveModelScopeWithDiagnostics: async () => ({ scopedModels: [], diagnostics }),
+    });
+
+    expect(result).toEqual({ sessionOptions: { scopedModels: [] }, diagnostics });
+  });
+
+  it("passes scope to continuing sessions without replacing their restored model selection", async () => {
+    const scopedModels = [{ model: modelA }];
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager({ messages: [{ role: "user" }] }),
+      settingsManager: settings({ enabledModels: ["provider-a/model-a"] }),
+      modelRuntime: modelRuntime(),
+      resolveModelScopeWithDiagnostics: async () => ({ scopedModels, diagnostics: [] }),
+    });
+
+    expect(result.sessionOptions).toEqual({ scopedModels });
+  });
+
+  it("keeps zero-message persisted model and thinking metadata ahead of scope defaults", async () => {
+    const scopedModels = [{ model: modelA, thinkingLevel: "high" }];
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager({
+        model: { provider: "provider-c", modelId: "model-c" },
+        thinkingLevel: "xhigh",
+        branch: [
+          { type: "model_change", provider: "provider-c", modelId: "model-c" },
+          { type: "thinking_level_change", thinkingLevel: "xhigh" },
+        ],
+      }),
+      settingsManager: settings({ enabledModels: ["provider-a/model-a:high"] }),
+      modelRuntime: modelRuntime(),
+      resolveModelScopeWithDiagnostics: async () => ({ scopedModels, diagnostics: [] }),
+    });
+
+    expect(result.sessionOptions).toEqual({
+      scopedModels,
+      model: modelC,
+      thinkingLevel: "xhigh",
+    });
+  });
+
+  it("lets a null resume model use saved scope while retaining resume thinking", async () => {
+    const scopedModels = [{ model: modelA, thinkingLevel: "high" }];
+    const result = await resolveSessionRuntimeOptions({
+      sessionManager: sessionManager(),
+      settingsManager: settings({ enabledModels: ["provider-a/model-a:high"] }),
+      modelRuntime: modelRuntime(),
+      resolveModelScopeWithDiagnostics: async () => ({ scopedModels, diagnostics: [] }),
+      runtimeResumeState: { model: null, thinkingLevel: "low" },
+    });
+
+    expect(result).toEqual({
+      sessionOptions: { scopedModels, model: modelA, thinkingLevel: "low" },
+      diagnostics: [],
+    });
+  });
+
+  it("consumes resume selection once while resolving saved scope for every factory run", async () => {
+    const scopedModels = [{ model: modelA, thinkingLevel: "high" }];
+    let scopeCalls = 0;
+    const resolveOptions = createSessionRuntimeOptionsResolver(
+      async () => {
+        scopeCalls += 1;
+        return { scopedModels, diagnostics: [] };
+      },
+      {
+        model: { provider: "provider-b", modelId: "model-b" },
+        thinkingLevel: "low",
+      },
+    );
+    const runtime = modelRuntime();
+    const configuredSettings = settings({ enabledModels: ["provider-a/model-a:high"] });
+
+    await expect(resolveOptions(sessionManager(), configuredSettings, runtime)).resolves.toEqual({
+      sessionOptions: { scopedModels, model: modelB, thinkingLevel: "low" },
+      diagnostics: [],
+    });
+    await expect(resolveOptions(sessionManager(), configuredSettings, runtime)).resolves.toEqual({
+      sessionOptions: { scopedModels, model: modelA, thinkingLevel: "high" },
+      diagnostics: [],
+    });
+    expect(scopeCalls).toBe(2);
   });
 });

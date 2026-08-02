@@ -940,6 +940,7 @@ export const IntentReceiptSchema = z
           "transitioning",
           "busy",
           "stale_editor",
+          "cancelled",
           "invalid",
         ]),
         /** Machine-readable detail for invalid payload or bounded-admission rejection. */
@@ -1481,6 +1482,33 @@ export const ShellTurnSnapshotSchema = z
   .strict();
 export type ShellTurnSnapshot = z.infer<typeof ShellTurnSnapshotSchema>;
 
+/**
+ * Bounded normalized output retained while extension-supplied BashOperations
+ * run without a PTY. It can reconstruct transcript correlation after a
+ * renderer detach, but deliberately carries no terminal input/resize fence.
+ */
+export const NonPtyShellTurnSnapshotSchema = z
+  .object({
+    id: NonEmptyIdSchema,
+    command: z.string(),
+    owner: RuntimeIdentitySchema,
+    startedAt: z.number(),
+    cwd: z.string().optional(),
+    excludeFromContext: z.boolean().optional(),
+    pty: z.literal(false),
+    outputText: z.string().max(1024 * 1024),
+    outputThroughSequence: NonNegativeIntegerSchema,
+    replayTruncated: z.boolean().optional(),
+  })
+  .strict();
+export type NonPtyShellTurnSnapshot = z.infer<typeof NonPtyShellTurnSnapshotSchema>;
+
+export const ActiveShellTurnSnapshotSchema = z.union([
+  ShellTurnSnapshotSchema,
+  NonPtyShellTurnSnapshotSchema,
+]);
+export type ActiveShellTurnSnapshot = z.infer<typeof ActiveShellTurnSnapshotSchema>;
+
 export const TranscriptPresentationBaselineSchema = z
   .object({
     sync: PlaneSyncSchema,
@@ -1488,7 +1516,7 @@ export const TranscriptPresentationBaselineSchema = z
     liveTailCursor: z.string().nullable(),
     overlapBoundary: z.string().nullable(),
     currentStreamingMessage: z.unknown().optional(),
-    currentShellTurn: ShellTurnSnapshotSchema.optional(),
+    currentShellTurn: ActiveShellTurnSnapshotSchema.optional(),
   })
   .strict();
 export type TranscriptPresentationBaseline = z.infer<typeof TranscriptPresentationBaselineSchema>;
@@ -1621,6 +1649,33 @@ export const AuthorityAttachBaselineSchema = z
           code: z.ZodIssueCode.custom,
           path: ["semantic", "sync", "cursor"],
           message: "following semantic baseline cursor must identify its snapshot",
+        });
+      }
+    }
+    const currentShellTurn = baseline.transcript.currentShellTurn;
+    if (
+      currentShellTurn &&
+      (currentShellTurn.owner.hostInstanceId !== baseline.owner.hostInstanceId ||
+        currentShellTurn.owner.sessionEpoch !== baseline.owner.sessionEpoch)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["transcript", "currentShellTurn", "owner"],
+        message: "active shell baseline must belong to the baseline owner",
+      });
+    }
+    if (currentShellTurn) {
+      const shellActivity = baseline.semantic.snapshot.activity.bash;
+      const expectedPty = !("pty" in currentShellTurn);
+      if (
+        !shellActivity ||
+        shellActivity.intentId !== currentShellTurn.id ||
+        shellActivity.pty !== expectedPty
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["transcript", "currentShellTurn"],
+          message: "active shell baseline must match semantic shell activity and PTY class",
         });
       }
     }

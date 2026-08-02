@@ -3,6 +3,7 @@ import { resolveModelScopeWithDiagnostics } from "@earendil-works/pi-coding-agen
 import { describe, expect, it, vi } from "vitest";
 import { PI_COMMAND_POLICY } from "../../src/shared/pi-protocol/commands.ts";
 import {
+  AuthorityAttachBaselineResponseSchema,
   AuthorityFrameSchema,
   TransitionBatchSchema,
 } from "../../src/shared/pi-protocol/runtime-state.ts";
@@ -105,6 +106,7 @@ function makeSession(overrides = {}) {
       getRegisteredCommands: vi.fn(() => []),
       hasHandlers: vi.fn(() => false),
       emitInput: vi.fn(async () => ({ action: "continue" })),
+      emitUserBash: vi.fn(async () => undefined),
     },
     resourceLoader: { getSkills: vi.fn(() => ({ skills: [] })) },
     sessionManager: {
@@ -198,9 +200,9 @@ function setup(sessionOverrides, bridgeOverrides = {}) {
     bindExtensions,
   } = bridge;
   let nextId = 0;
-  const run = async (command) => {
+  const run = async (command, uiSurface) => {
     const id = `cmd-${++nextId}`;
-    await handleCommand({ id, command });
+    await handleCommand({ id, command, ...(uiSurface ? { uiSurface } : {}) });
     // Return the last response message for this id.
     const responses = send.mock.calls
       .map((c) => c[0])
@@ -1142,6 +1144,321 @@ describe("setupCommandBridge — target intent dispatch", () => {
     );
     expect(session.prompt).toHaveBeenCalledWith("/extension arg", expect.any(Object));
     expect(runtime.newSession).not.toHaveBeenCalled();
+  });
+
+  it("lets a 0.83 user_bash handler replace a Shell Turn result exactly once without a PTY", async () => {
+    const replacement = {
+      output: "extension replacement\n",
+      exitCode: 23,
+      cancelled: false,
+      truncated: false,
+    };
+    const createShellController = vi.fn(() => makeShellController());
+    const sendPresentation = vi.fn();
+    const runWithInvocationSurface = vi.fn((_surface, operation) => operation());
+    const { session, dispatchIntent } = setup(undefined, {
+      createShellController,
+      sendPresentation,
+      runWithInvocationSurface,
+      uiState: makeUiState({
+        editorSnapshot: () => ({ revision: 0, text: "!!extension-result", attachments: [] }),
+      }),
+    });
+    session.extensionRunner.emitUserBash.mockResolvedValue({ result: replacement });
+    const request = envelope("extension-result", {
+      kind: "runBash",
+      command: "extension-result",
+      excludeFromContext: true,
+      editorRevision: 0,
+      editorText: "!!extension-result",
+    });
+
+    await expect(dispatchIntent(request)).resolves.toMatchObject({ status: "admitted" });
+    await expect(dispatchIntent(request)).resolves.toMatchObject({ status: "duplicate" });
+    await vi.waitFor(() =>
+      expect(session.recordBashResult).toHaveBeenCalledWith("extension-result", replacement, {
+        excludeFromContext: true,
+      }),
+    );
+
+    expect(session.recordBashResult).toHaveBeenCalledOnce();
+    expect(runWithInvocationSurface).toHaveBeenCalledOnce();
+    expect(runWithInvocationSurface).toHaveBeenCalledWith("composer", expect.any(Function));
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce();
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledWith({
+      type: "user_bash",
+      command: "extension-result",
+      excludeFromContext: true,
+      cwd: "/work",
+    });
+    expect(session.executeBash).not.toHaveBeenCalled();
+    expect(createShellController).not.toHaveBeenCalled();
+    expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledWith(
+      "pivis.shell_turn_start",
+      expect.objectContaining({ executionId: "extension-result", pty: false }),
+    );
+    expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledWith(
+      "pivis.shell_turn_complete",
+      expect.objectContaining({ executionId: "extension-result", exitCode: 23 }),
+    );
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_execution_start",
+              id: "extension-result",
+              pty: false,
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_execution_end",
+              id: "extension-result",
+              output: "extension replacement\n",
+              exitCode: 23,
+              pty: false,
+            }),
+          ],
+        }),
+      }),
+    );
+  });
+
+  it("streams 0.83 user_bash replacement operations exactly once without constructing a PTY", async () => {
+    const gate = deferred();
+    const operations = { exec: vi.fn() };
+    let listener;
+    const executeBash = vi.fn((_command, _onChunk, options) => {
+      listener?.({ type: "bash_execution_update", id: options.id, delta: "remote chunk\n" });
+      return gate.promise;
+    });
+    const createShellController = vi.fn(() => makeShellController());
+    const sendPresentation = vi.fn();
+    const { session, dispatchIntent, requestAuthorityAttach } = setup(
+      {
+        subscribe: vi.fn((nextListener) => {
+          listener = nextListener;
+          return vi.fn();
+        }),
+        executeBash,
+      },
+      {
+        createShellController,
+        sendPresentation,
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "!remote-command", attachments: [] }),
+        }),
+      },
+    );
+    session.extensionRunner.emitUserBash.mockResolvedValue({ operations });
+    const request = envelope("extension-operations", {
+      kind: "runBash",
+      command: "remote-command",
+      excludeFromContext: false,
+      editorRevision: 0,
+      editorText: "!remote-command",
+    });
+
+    await expect(dispatchIntent(request)).resolves.toMatchObject({ status: "admitted" });
+    await expect(dispatchIntent(request)).resolves.toMatchObject({ status: "duplicate" });
+    await vi.waitFor(() => expect(executeBash).toHaveBeenCalledOnce());
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce();
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledWith({
+      type: "user_bash",
+      command: "remote-command",
+      excludeFromContext: false,
+      cwd: "/work",
+    });
+    expect(executeBash).toHaveBeenCalledWith("remote-command", undefined, {
+      id: "extension-operations",
+      excludeFromContext: false,
+      operations,
+    });
+    expect(createShellController).not.toHaveBeenCalled();
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_execution_start",
+              id: "extension-operations",
+              pty: false,
+            }),
+          ],
+        }),
+      }),
+    );
+    expect(sendPresentation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plane: "transcript",
+        payload: expect.objectContaining({
+          entries: [
+            expect.objectContaining({
+              type: "bash_execution_update",
+              id: "extension-operations",
+              delta: "remote chunk\n",
+            }),
+          ],
+        }),
+      }),
+    );
+
+    const attach = await requestAuthorityAttach(9);
+    expect(AuthorityAttachBaselineResponseSchema.safeParse(attach)).toMatchObject({
+      success: true,
+    });
+    expect(attach).toMatchObject({
+      status: "ready",
+      baseline: {
+        semantic: {
+          snapshot: {
+            activity: {
+              bash: {
+                intentId: "extension-operations",
+                pty: false,
+              },
+            },
+          },
+        },
+        transcript: {
+          currentShellTurn: {
+            id: "extension-operations",
+            command: "remote-command",
+            pty: false,
+            outputText: "remote chunk\n",
+            outputThroughSequence: 1,
+          },
+        },
+      },
+    });
+
+    gate.resolve({ output: "remote chunk\n", exitCode: 0, cancelled: false, truncated: false });
+    await vi.waitFor(() =>
+      expect(sendPresentation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          plane: "transcript",
+          payload: expect.objectContaining({
+            entries: [
+              expect.objectContaining({
+                type: "bash_execution_end",
+                id: "extension-operations",
+                output: "remote chunk\n",
+                pty: false,
+              }),
+            ],
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("emits an unhandled 0.83 user_bash event once before using the existing PTY path", async () => {
+    const gate = deferred();
+    const controller = makeShellController();
+    const createShellController = vi.fn(() => controller);
+    const { session, dispatchIntent } = setup(
+      { executeBash: vi.fn(() => gate.promise) },
+      {
+        createShellController,
+        uiState: makeUiState({
+          editorSnapshot: () => ({ revision: 0, text: "!local-command", attachments: [] }),
+        }),
+      },
+    );
+    const request = envelope("default-pty", {
+      kind: "runBash",
+      command: "local-command",
+      excludeFromContext: false,
+      editorRevision: 0,
+      editorText: "!local-command",
+    });
+
+    await expect(dispatchIntent(request)).resolves.toMatchObject({ status: "admitted" });
+    await expect(dispatchIntent(request)).resolves.toMatchObject({ status: "duplicate" });
+    await vi.waitFor(() => expect(session.executeBash).toHaveBeenCalledOnce());
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce();
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledWith({
+      type: "user_bash",
+      command: "local-command",
+      excludeFromContext: false,
+      cwd: "/work",
+    });
+    expect(createShellController).toHaveBeenCalledOnce();
+    expect(session.executeBash).toHaveBeenCalledWith("local-command", undefined, {
+      id: "default-pty",
+      excludeFromContext: false,
+      operations: controller.operations,
+    });
+
+    gate.resolve({ output: "local\n", exitCode: 0, cancelled: false, truncated: false });
+  });
+
+  it("keeps ingress live and fences a delayed user_bash intent when Escape cancels preparation", async () => {
+    const preparation = deferred();
+    const createShellController = vi.fn(() => makeShellController());
+    const acceptShellEditorSubmission = vi.fn(() => true);
+    const { session, dispatchIntent, handleEscape } = setup(undefined, {
+      createShellController,
+      uiState: makeUiState({
+        editorSnapshot: () => ({ revision: 0, text: "!delayed-command", attachments: [] }),
+        acceptShellEditorSubmission,
+      }),
+    });
+    session.extensionRunner.emitUserBash.mockImplementation(() => preparation.promise);
+    const request = envelope("delayed-user-bash", {
+      kind: "runBash",
+      command: "delayed-command",
+      excludeFromContext: false,
+      editorRevision: 0,
+      editorText: "!delayed-command",
+    });
+
+    const first = dispatchIntent(request);
+    const duplicate = dispatchIntent(request);
+    await vi.waitFor(() => expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce());
+
+    // The hook remains unresolved, but it no longer owns the serialized
+    // ingress scheduler: an unrelated intent can execute and settle.
+    await expect(
+      dispatchIntent(envelope("refresh-during-user-bash", { kind: "refreshModels" })),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await vi.waitFor(() => expect(session.modelRuntime.refresh).toHaveBeenCalledOnce());
+
+    await expect(handleEscape("cancel-delayed-user-bash")).resolves.toMatchObject({
+      disposition: "abort_requested",
+      target: "bash",
+    });
+    await expect(first).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "delayed-user-bash",
+      reason: "cancelled",
+    });
+    await expect(duplicate).resolves.toEqual({
+      status: "not_admitted",
+      intentId: "delayed-user-bash",
+      reason: "cancelled",
+    });
+
+    // A handler has no public AbortSignal in Pi 0.83, so it may reject late.
+    // The host consumes that loser but must never start or persist its result.
+    preparation.reject(new Error("late extension rejection"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(createShellController).not.toHaveBeenCalled();
+    expect(session.executeBash).not.toHaveBeenCalled();
+    expect(session.recordBashResult).not.toHaveBeenCalled();
+    expect(session.sessionManager.appendCustomEntry).not.toHaveBeenCalled();
+    expect(acceptShellEditorSubmission).not.toHaveBeenCalled();
   });
 
   it("publishes the direct bash streaming lifecycle on the live transcript plane", async () => {
@@ -2987,15 +3304,97 @@ describe("setupCommandBridge — command mapping", () => {
 
   it("bash passes its request id for streaming updates and returns the full result", async () => {
     const controller = makeShellController();
+    const runWithInvocationSurface = vi.fn((_surface, operation) => operation());
     const { session, run } = setup(undefined, {
       createShellController: vi.fn(() => controller),
+      runWithInvocationSurface,
     });
-    const res = await run({ type: "bash", command: "ls" });
+    const res = await run({ type: "bash", command: "ls" }, "unified");
     expect(session.executeBash).toHaveBeenCalledWith("ls", undefined, {
       id: "cmd-1",
       operations: controller.operations,
     });
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce();
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledWith({
+      type: "user_bash",
+      command: "ls",
+      excludeFromContext: false,
+      cwd: "/work",
+    });
+    expect(runWithInvocationSurface).toHaveBeenCalledOnce();
+    expect(runWithInvocationSurface).toHaveBeenCalledWith("unified", expect.any(Function));
     expect(res.data).toMatchObject({ output: "ok", exitCode: 0 });
+  });
+
+  it("bash honors a 0.83 user_bash full result once without canonical duplication", async () => {
+    const replacement = {
+      output: "public replacement\n",
+      exitCode: 0,
+      cancelled: false,
+      truncated: false,
+    };
+    const createShellController = vi.fn(() => makeShellController());
+    const { session, run } = setup(undefined, { createShellController });
+    session.extensionRunner.emitUserBash.mockResolvedValue({ result: replacement });
+
+    const response = await run({
+      type: "bash",
+      command: "public-result",
+      excludeFromContext: true,
+    });
+
+    expect(response).toMatchObject({ success: true, data: replacement });
+    expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce();
+    expect(session.recordBashResult).toHaveBeenCalledOnce();
+    expect(session.recordBashResult).toHaveBeenCalledWith("public-result", replacement, {
+      excludeFromContext: true,
+    });
+    expect(session.executeBash).not.toHaveBeenCalled();
+    expect(createShellController).not.toHaveBeenCalled();
+  });
+
+  it("abort_bash fences a delayed legacy user_bash handler before execution", async () => {
+    const preparation = deferred();
+    const createShellController = vi.fn(() => makeShellController());
+    const { session, run } = setup(undefined, { createShellController });
+    session.extensionRunner.emitUserBash.mockImplementation(() => preparation.promise);
+
+    const bashResponse = run({ type: "bash", command: "legacy-delayed" });
+    await vi.waitFor(() => expect(session.extensionRunner.emitUserBash).toHaveBeenCalledOnce());
+    await expect(run({ type: "abort_bash" })).resolves.toMatchObject({ success: true });
+    await expect(bashResponse).resolves.toMatchObject({
+      success: false,
+      error: "Shell command was cancelled before it started",
+    });
+
+    preparation.resolve(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(createShellController).not.toHaveBeenCalled();
+    expect(session.executeBash).not.toHaveBeenCalled();
+    expect(session.recordBashResult).not.toHaveBeenCalled();
+    expect(session.sessionManager.appendCustomEntry).not.toHaveBeenCalled();
+  });
+
+  it("refuses a second legacy non-PTY Shell Turn while operations remain active", async () => {
+    const terminal = deferred();
+    const operations = { exec: vi.fn() };
+    const executeBash = vi.fn(() => terminal.promise);
+    const { session, run } = setup({ executeBash });
+    session.extensionRunner.emitUserBash.mockResolvedValue({ operations });
+
+    const first = run({ type: "bash", command: "first-remote" });
+    await vi.waitFor(() => expect(executeBash).toHaveBeenCalledOnce());
+    await expect(run({ type: "bash", command: "second-remote" })).resolves.toMatchObject({
+      success: false,
+      error: "A Shell Turn is already running",
+    });
+    expect(executeBash).toHaveBeenCalledOnce();
+    expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledTimes(1);
+
+    terminal.resolve({ output: "done\n", exitCode: 0, cancelled: false, truncated: false });
+    await expect(first).resolves.toMatchObject({ success: true });
+    expect(session.sessionManager.appendCustomEntry).toHaveBeenCalledTimes(2);
   });
 
   it("abort_bash calls abortBash and responds immediately", async () => {
@@ -3884,6 +4283,15 @@ describe("assertHostCapabilities", () => {
     const runtime = makeRuntime(session);
     expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
       /session\.recordBashResult/,
+    );
+  });
+
+  it("throws when Pi 0.83's public user_bash emitter is missing", () => {
+    const session = makeSession();
+    session.extensionRunner.emitUserBash = undefined;
+    const runtime = makeRuntime(session);
+    expect(() => assertHostCapabilities(session, runtime, MODEL_SCOPE_PI)).toThrow(
+      /session\.extensionRunner\.emitUserBash/,
     );
   });
 

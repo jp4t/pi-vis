@@ -290,6 +290,29 @@ describe("Composer intent execution — prompts and effects", () => {
     expect(deps.awaitIntentOutcome).not.toHaveBeenCalled();
   });
 
+  it("preserves and explains a Shell Turn cancelled during user_bash preparation", async () => {
+    const { deps } = depsFor({
+      dispatch: vi.fn(async (_sid, _intent, intentId) => ({
+        status: "not_admitted" as const,
+        intentId: intentId!,
+        reason: "cancelled" as const,
+      })) as NonNullable<ExecuteDeps["dispatch"]>,
+    });
+    await expect(
+      executeAction(
+        SID,
+        { kind: "bash", command: "pwd", excludeFromContext: false, editorText: "!pwd" },
+        deps,
+      ),
+    ).rejects.toThrow("cancelled before it started");
+    expect(deps.addToast).toHaveBeenCalledWith(
+      SID,
+      "The shell command was cancelled before it started; the current draft was preserved.",
+      "warning",
+    );
+    expect(deps.awaitIntentOutcome).not.toHaveBeenCalled();
+  });
+
   it("preflights the 64 KiB UTF-8 shell command limit without dispatching", async () => {
     const { deps } = depsFor();
     const command = "é".repeat(32_769);

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SessionEntrySchema } from "./entries.js";
 
-describe("SessionEntrySchema Pi 0.82.1 public payloads", () => {
+describe("SessionEntrySchema Pi 0.83.0 public payloads", () => {
   it.each([
     {
       role: "bashExecution",

@@ -1,6 +1,6 @@
 import type { TranscriptBlock } from "@shared/ipc-contract.js";
 import type { KnownPiEvent } from "@shared/pi-protocol/events.js";
-import type { ShellTurnSnapshot } from "@shared/pi-protocol/runtime-state.js";
+import type { ActiveShellTurnSnapshot } from "@shared/pi-protocol/runtime-state.js";
 import { extractTextAndImages, extractToolResult } from "@shared/pi-protocol/tool-result.js";
 import { detectTurnError } from "@shared/pi-protocol/turn-error.js";
 import type { PiUsage } from "@shared/pi-protocol/usage.js";
@@ -8,6 +8,7 @@ import { assertNever } from "@shared/result.js";
 
 export const LIVE_SHELL_REPLAY_LIMIT = 1024 * 1024;
 const LIVE_SHELL_CHUNK_LIMIT = 512;
+const LIVE_SHELL_REPLAY_TRUNCATION_NOTICE = "[Earlier shell output omitted during reload]\n";
 
 export interface ShellTerminalChunk {
   sequence: number;
@@ -126,6 +127,8 @@ export interface BashBlockData {
   terminalOutputChunks?: readonly ShellTerminalChunk[] | undefined;
   terminalOutputChunkChars?: number | undefined;
   liveReplayTruncated?: boolean | undefined;
+  /** Last host-assigned non-PTY bash_execution_update sequence applied. */
+  streamOutputSequence?: number | undefined;
   terminalMode?: "compact" | "fullscreen" | undefined;
   inputAcknowledgedThrough?: number | undefined;
   resizeRevision?: number | undefined;
@@ -278,7 +281,7 @@ export interface TranscriptState {
   activeAssistantId: string | null;
   activeToolCallIds: Map<string, string>; // toolCallId → blockId
   activeBashId: string | null;
-  /** Pi 0.82 direct-bash event ID owning activeBashId. */
+  /** Pi 0.83 direct-bash event ID owning activeBashId. */
   activeBashExecutionId: string | null;
   /** Error block created by the current failed assistant turn, awaiting the
    * following agent_end to tell us whether it will be retried. This scopes
@@ -901,6 +904,7 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
                       terminalOutputSequence: event.pty ? 0 : undefined,
                       terminalOutputChunks: event.pty ? [] : undefined,
                       terminalOutputChunkChars: event.pty ? 0 : undefined,
+                      streamOutputSequence: event.pty ? undefined : 0,
                     },
                   }
                 : block,
@@ -922,15 +926,20 @@ export function applyPiEvent(state: TranscriptState, event: KnownPiEvent): Trans
         ...state,
         blocks: patchBlock(activeBashId, (block) =>
           block.type === "bash"
-            ? {
-                ...block,
-                data: {
-                  ...block.data,
-                  outputText: block.data.pty
-                    ? block.data.outputText
-                    : block.data.outputText + event.delta,
-                },
-              }
+            ? (() => {
+                if (block.data.pty) return block;
+                const currentSequence = block.data.streamOutputSequence ?? 0;
+                const sequence = event.sequence ?? currentSequence + 1;
+                if (event.sequence !== undefined && sequence <= currentSequence) return block;
+                return {
+                  ...block,
+                  data: {
+                    ...block.data,
+                    outputText: block.data.outputText + event.delta,
+                    streamOutputSequence: sequence,
+                  },
+                };
+              })()
             : block,
         ),
       };
@@ -1832,14 +1841,71 @@ export function addBashBlock(state: TranscriptState, command: string): Transcrip
   };
 }
 
-/** Install the host's bounded live-PTY keyframe before attach replay deltas. */
+/** Install the host's bounded active-shell keyframe before attach replay deltas. */
 export function restoreActiveShellTurn(
   state: TranscriptState,
-  shell: ShellTurnSnapshot,
+  shell: ActiveShellTurnSnapshot,
 ): TranscriptState {
   const existing = state.blocks.find(
     (block) => block.type === "bash" && block.data.executionId === shell.id,
   );
+  if ("pty" in shell) {
+    const outputText = `${shell.replayTruncated ? LIVE_SHELL_REPLAY_TRUNCATION_NOTICE : ""}${shell.outputText}`;
+    if (existing?.type === "bash") {
+      return {
+        ...state,
+        activeBashId: existing.id,
+        activeBashExecutionId: shell.id,
+        blocks: state.blocks.map((block) =>
+          block.id === existing.id && block.type === "bash"
+            ? {
+                ...block,
+                data: {
+                  ...block.data,
+                  executionId: shell.id,
+                  command: shell.command,
+                  outputText,
+                  pty: false,
+                  isStreaming: true,
+                  excludeFromContext: shell.excludeFromContext,
+                  startedAt: shell.startedAt,
+                  timestamp: shell.startedAt,
+                  cwd: shell.cwd,
+                  streamOutputSequence: shell.outputThroughSequence,
+                  liveReplayTruncated: shell.replayTruncated,
+                },
+              }
+            : block,
+        ),
+      };
+    }
+    const started = addBashBlock(state, shell.command);
+    const id = started.activeBashId;
+    if (!id) return started;
+    return {
+      ...started,
+      activeBashExecutionId: shell.id,
+      blocks: started.blocks.map((block) =>
+        block.id === id && block.type === "bash"
+          ? {
+              ...block,
+              data: {
+                ...block.data,
+                executionId: shell.id,
+                outputText,
+                pty: false,
+                excludeFromContext: shell.excludeFromContext,
+                startedAt: shell.startedAt,
+                timestamp: shell.startedAt,
+                cwd: shell.cwd,
+                streamOutputSequence: shell.outputThroughSequence,
+                liveReplayTruncated: shell.replayTruncated,
+              },
+            }
+          : block,
+      ),
+    };
+  }
   if (existing?.type === "bash") {
     return {
       ...state,
