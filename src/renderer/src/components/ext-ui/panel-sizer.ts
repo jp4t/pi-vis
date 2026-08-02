@@ -97,6 +97,9 @@ export interface PanelSizer {
   sync: () => void;
   /** Coalesce a burst of triggers into at most one pass per animation frame. */
   scheduleSync: () => void;
+  /** Schedule after newly written host content, advancing resize-response
+   *  correlation before the next measurement. */
+  scheduleContentSync: () => void;
   /** Tear down: cancel timers and reset the styles the sizer set. */
   dispose: () => void;
 }
@@ -270,11 +273,14 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
     sourceRows: number;
     sourceContentRows: number;
     coupledPasses: number;
+    contentGeneration: number;
   } | null = null;
   let implicitViewport = false;
   let implicitViewportExtraRows = 0;
+  let implicitViewportAwaitingContentGeneration: number | null = null;
 
   let syncQueued = false;
+  let contentGeneration = 0;
   const scheduleSync = (): void => {
     if (syncQueued || disposed) return;
     syncQueued = true;
@@ -282,6 +288,10 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
       syncQueued = false;
       if (!disposed) sync();
     });
+  };
+  const scheduleContentSync = (): void => {
+    contentGeneration++;
+    scheduleSync();
   };
 
   // Single sizing pass. Content mode resizes ordinary grids toward
@@ -307,9 +317,21 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
       overflowProbe = null;
       implicitViewport = false;
       implicitViewportExtraRows = 0;
+      implicitViewportAwaitingContentGeneration = null;
       virtualizedIntrinsic = false;
       virtualTopPending = false;
       applyFixedViewport(maxDisplayRows(), cols, cell);
+      return;
+    }
+
+    // A local term.resize() immediately reflows the previous buffer. Layout
+    // observers may request another pass before the host has repainted for the
+    // reported grid; only a subsequent content write may advance that probe.
+    if (
+      overflowProbe?.targetRows === term.rows &&
+      overflowProbe.contentGeneration === contentGeneration &&
+      cols === term.cols
+    ) {
       return;
     }
 
@@ -332,12 +354,18 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
     // signal. Keep it fixed while its height continues to track the grid; release
     // it if later content becomes intrinsic overflow or shrinks.
     if (implicitViewport) {
+      if (implicitViewportAwaitingContentGeneration === contentGeneration) {
+        applyFixedViewport(maxDisplayRows(), cols, cell);
+        return;
+      }
+      implicitViewportAwaitingContentGeneration = null;
       if (measured.filled && measured.rows <= term.rows + implicitViewportExtraRows) {
         applyFixedViewport(maxDisplayRows(), cols, cell);
         return;
       }
       implicitViewport = false;
       implicitViewportExtraRows = 0;
+      implicitViewportAwaitingContentGeneration = null;
       overflowProbe = null;
     }
 
@@ -358,6 +386,7 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
         overflowProbe = null;
         implicitViewport = true;
         implicitViewportExtraRows = Math.max(0, contentRows - term.rows);
+        implicitViewportAwaitingContentGeneration = contentGeneration;
         applyFixedViewport(maxDisplayRows(), cols, cell);
         return;
       }
@@ -380,6 +409,7 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
           sourceRows: term.rows,
           sourceContentRows: contentRows,
           coupledPasses,
+          contentGeneration,
         }
       : null;
 
@@ -388,7 +418,7 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
       const now = Date.now();
       resizeTimes.push(now);
       resizeTimes = resizeTimes.filter((t) => now - t < RESIZE_WINDOW_MS);
-      if (resizeTimes.length > MAX_RESIZES_PER_WINDOW) {
+      if (resizeTimes.length >= MAX_RESIZES_PER_WINDOW) {
         pinnedRows = Math.max(term.rows, targetRows);
         resizeTimes = [];
         if (cooldownTimer) clearTimeout(cooldownTimer);
@@ -429,5 +459,5 @@ export function createPanelSizer(opts: PanelSizerOptions): PanelSizer {
     notifyComposerSlotResize();
   };
 
-  return { sync, scheduleSync, dispose };
+  return { sync, scheduleSync, scheduleContentSync, dispose };
 }

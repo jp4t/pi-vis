@@ -69,6 +69,12 @@ const previewAuthPrompts = new Map<
 >();
 let previewLoginComplete = false;
 let previewOauthLoginCount = 0;
+let initialWorkspaceOpenSessionId: SessionId | null = null;
+let initialWorkspaceActivationReady = false;
+let initialWorkspaceAuthorityAttached = false;
+let initialWorkspaceCompletionScheduled = false;
+let initialWorkspaceOpenComplete = false;
+const initialWorkspaceOpenCallbacks = new Set<() => void>();
 
 // Test/preview hooks (NOT part of the real IPC contract). Render tests use
 // these to drive deterministic streaming + observe panel input without a
@@ -88,6 +94,8 @@ const previewHooks = {
   extensionUpdateCheckCalls: 0,
   /** Extension-only update targets dispatched from Settings. */
   extensionUpdateTargets: [] as Array<"all" | { extension: string }>,
+  /** Completed Sidebar boot attachments; render tests use this instead of timing. */
+  initialWorkspaceOpenCompletions: 0,
   /** Current ESC claim count for render-test synchronization. */
   escapeClaimCount(): number {
     return useOverlayStore.getState().count;
@@ -261,6 +269,37 @@ const previewHooks = {
       .applyAuthorityAttach(activeId, authorityAttach(activeId, runtime.rendererGeneration ?? 0));
   },
 };
+
+function afterInitialWorkspaceOpen(callback: () => void): void {
+  if (initialWorkspaceOpenComplete) {
+    queueMicrotask(callback);
+    return;
+  }
+  initialWorkspaceOpenCallbacks.add(callback);
+}
+
+function completeInitialWorkspaceOpen(): void {
+  if (initialWorkspaceOpenComplete) return;
+  initialWorkspaceOpenComplete = true;
+  previewHooks.initialWorkspaceOpenCompletions++;
+  for (const callback of initialWorkspaceOpenCallbacks) queueMicrotask(callback);
+  initialWorkspaceOpenCallbacks.clear();
+}
+
+function maybeCompleteInitialWorkspaceOpen(): void {
+  if (
+    initialWorkspaceOpenComplete ||
+    initialWorkspaceCompletionScheduled ||
+    !initialWorkspaceActivationReady ||
+    !initialWorkspaceAuthorityAttached
+  )
+    return;
+  initialWorkspaceCompletionScheduled = true;
+  setTimeout(() => {
+    initialWorkspaceCompletionScheduled = false;
+    completeInitialWorkspaceOpen();
+  }, 0);
+}
 // Attach to window for render-test access (guarded for type safety).
 (window as unknown as { __pivisPreview?: typeof previewHooks }).__pivisPreview = previewHooks;
 // Expose the store for render-test introspection (NOT part of the real
@@ -1871,19 +1910,36 @@ const stub = {
           history: [],
         };
       }
-      case "session.open":
+      case "session.open": {
+        const { workspacePath, sessionFile } = req as {
+          workspacePath?: string;
+          sessionFile?: string;
+        };
+        const sessionId = `demo-${Date.now()}` as SessionId;
+        if (
+          initialWorkspaceOpenSessionId === null &&
+          workspacePath === DEMO_WORKSPACE &&
+          sessionFile === undefined
+        ) {
+          initialWorkspaceOpenSessionId = sessionId;
+        }
         return {
           outcome: "opened",
-          sessionId: `demo-${Date.now()}` as SessionId,
+          sessionId,
           name: null,
           preview: null,
           sessionStatus: "cold",
         };
+      }
       case "session.activate": {
         const { sessionId } = req as { sessionId: SessionId };
         setTimeout(() => {
           emit("session.statusChanged", { sessionId, status: "ready" });
           emitRuntimeState(sessionId, false);
+          if (sessionId === initialWorkspaceOpenSessionId) {
+            initialWorkspaceActivationReady = true;
+            maybeCompleteInitialWorkspaceOpen();
+          }
         }, 50);
         return undefined;
       }
@@ -1926,7 +1982,12 @@ const stub = {
         if (sessionId.startsWith("preview-search-open-")) {
           previewHooks.searchAuthorityAttachCalls++;
         }
-        return authorityAttach(sessionId, rendererGeneration);
+        const response = authorityAttach(sessionId, rendererGeneration);
+        if (sessionId === initialWorkspaceOpenSessionId) {
+          initialWorkspaceAuthorityAttached = true;
+          maybeCompleteInitialWorkspaceOpen();
+        }
+        return response;
       }
       case "session.query":
         return handleQuery(req as Parameters<typeof handleQuery>[0]);
@@ -2291,7 +2352,7 @@ const stub = {
 seedDemoSession();
 
 function seedToolOutputPreview(): void {
-  setTimeout(() => {
+  afterInitialWorkspaceOpen(() => {
     const output = Array.from({ length: 180 }, (_, i) => {
       const n = String(i + 1).padStart(3, "0");
       return `preview-line-${n}  ${"0123456789abcdef ".repeat((i % 7) + 1)}done`;
@@ -2323,7 +2384,7 @@ function seedToolOutputPreview(): void {
       },
       isError: false,
     });
-  }, 600);
+  });
 }
 
 if (new URLSearchParams(window.location.search).get("toolOutput") === "1") {
@@ -2331,7 +2392,7 @@ if (new URLSearchParams(window.location.search).get("toolOutput") === "1") {
 }
 
 function seedCustomEntryPreview(): void {
-  setTimeout(() => {
+  afterInitialWorkspaceOpen(() => {
     const store = useSessionsStore.getState();
     store.applyEvent(store.activeSessionId ?? DEMO_SESSION_ID, {
       type: "entry_appended",
@@ -2342,7 +2403,7 @@ function seedCustomEntryPreview(): void {
         data: { title: "Indexed files", count: 17 },
       },
     });
-  }, 600);
+  });
 }
 
 if (new URLSearchParams(window.location.search).get("customEntry") === "1") {
@@ -2353,8 +2414,9 @@ if (new URLSearchParams(window.location.search).get("customEntry") === "1") {
 // Enable with ?unified=1 on the preview URL. Emits the panel_open{unified}
 // + panel_data events an extension's factory setWidget produces, so the real
 // UnifiedTuiHost → xterm.js pipeline can be render-tested in a headless
-// browser (see tests/render/unified-panel.spec.ts). Delayed so the App's
-// session.panelEvent subscription is mounted before the first emit.
+// browser (see tests/render/unified-panel.spec.ts). Emission waits for the
+// Sidebar's initial activation and authority attachment, when the App
+// subscriptions and keyed session subtree are ready.
 function startUnifiedPanelPreview(): void {
   const PANEL_ID = 2;
   // `?unified=tall` emits a roster taller than the display cap;
@@ -2444,12 +2506,9 @@ function startUnifiedPanelPreview(): void {
     transitionRepaints++;
     return transitionRepaints === 1 ? activeExpandingFrame(rows) : roster;
   };
-  setTimeout(() => {
-    // Target whichever session is actually active at emit time. The Sidebar's
-    // one-shot boot effect opens a fresh session tab on load (displacing the
-    // seeded demo-session-1), so the active id is NOT DEMO_SESSION_ID — emitting
-    // for the seeded id would hit a non-active session and the panel would
-    // never render (hasUnifiedPanel reads the active session).
+  afterInitialWorkspaceOpen(() => {
+    // Target whichever session is active after Sidebar boot. A later manual
+    // new-session action can still make another session active.
     const activeId = useSessionsStore.getState().activeSessionId ?? DEMO_SESSION_ID;
     emitPreviewPanelEvent(activeId, {
       type: "panel_open",
@@ -2489,7 +2548,7 @@ function startUnifiedPanelPreview(): void {
       emitPreviewPanelEvent(activeId, { type: "panel_data", panelId: PANEL_ID, data: box });
       registerPanelFrame(activeId, PANEL_ID, box);
     }
-  }, 600);
+  });
 }
 
 if (
@@ -2531,7 +2590,7 @@ function startCustomPanelPreview(): void {
     "╰──── ←/→ tabs · Enter change · Esc close ─────╯",
   ];
   const data = `\x1b[2J\x1b[H${box.join("\r\n")}\r\n`;
-  setTimeout(() => {
+  afterInitialWorkspaceOpen(() => {
     const activeId = useSessionsStore.getState().activeSessionId ?? DEMO_SESSION_ID;
     emitPreviewPanelEvent(activeId, {
       type: "panel_open",
@@ -2541,7 +2600,7 @@ function startCustomPanelPreview(): void {
     });
     emitPreviewPanelEvent(activeId, { type: "panel_data", panelId: PANEL_ID, data });
     registerPanelFrame(activeId, PANEL_ID, data);
-  }, 600);
+  });
 }
 
 if (new URLSearchParams(window.location.search).get("panel") === "1") {

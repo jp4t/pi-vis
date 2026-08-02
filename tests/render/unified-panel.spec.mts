@@ -23,6 +23,7 @@ interface PreviewStoreState {
 }
 
 interface PreviewHooks {
+  initialWorkspaceOpenCompletions: number;
   panelInputLog: string[];
   panelResizeLog: Array<{
     panelId: number | undefined;
@@ -45,6 +46,14 @@ interface PreviewHooks {
  */
 function stripKittyReleases(s: string): string {
   return s.replace(/\x1b\[[\d:;]*:3[u~]/g, "");
+}
+
+async function waitForPreviewBoot(page: import("@playwright/test").Page): Promise<void> {
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { __pivisPreview?: PreviewHooks }).__pivisPreview
+        ?.initialWorkspaceOpenCompletions === 1,
+  );
 }
 
 test.describe("Unified-TUI panel (factory setWidget) — renderer", () => {
@@ -276,6 +285,7 @@ test.describe("Unified-TUI panel (factory setWidget) — renderer", () => {
     await page.waitForLoadState("domcontentloaded");
     // Sidebar boot asynchronously adopts the real preview session; wait for
     // that keyed session subtree to settle before starting its local rename.
+    await waitForPreviewBoot(page);
     await expect(page.locator(".composer__textarea")).toBeEnabled();
 
     await page.locator(".session-header__name-btn").click();
@@ -396,6 +406,20 @@ test.describe("Unified-TUI panel (factory setWidget) — renderer", () => {
     await expect(panel.locator(".xterm-rows")).toContainText("END OF OVERSIZED ROSTER", {
       timeout: 15_000,
     });
+
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const card = document.querySelector(".unified-panel") as HTMLElement;
+            return {
+              overflowY: card.style.overflowY,
+              scrollable: card.scrollHeight - card.clientHeight,
+            };
+          }),
+        { timeout: 15_000 },
+      )
+      .toMatchObject({ overflowY: "auto" });
 
     const m = await page.evaluate(() => {
       const card = document.querySelector(".unified-panel") as HTMLElement;
@@ -682,17 +706,17 @@ test.describe("Unified-TUI panel (factory setWidget) — renderer", () => {
 
       const settled = await page.evaluate(
         () =>
-          (window as unknown as { __pivisPreview?: PreviewHooks }).__pivisPreview?.panelResizeLog
-            .length ?? 0,
+          (window as unknown as { __pivisPreview?: PreviewHooks }).__pivisPreview?.panelResizeLog ??
+          [],
       );
-      expect(settled).toBeLessThanOrEqual(6);
+      expect(settled.length, JSON.stringify(settled)).toBeLessThanOrEqual(6);
       await page.waitForTimeout(1_200);
       const later = await page.evaluate(
         () =>
           (window as unknown as { __pivisPreview?: PreviewHooks }).__pivisPreview?.panelResizeLog
             .length ?? 0,
       );
-      expect(later).toBe(settled);
+      expect(later).toBe(settled.length);
     });
   }
 
@@ -707,6 +731,20 @@ test.describe("Unified-TUI panel (factory setWidget) — renderer", () => {
     await expect(panel.locator(".xterm-rows")).toContainText("END OF OVERSIZED ROSTER", {
       timeout: 15_000,
     });
+
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(() => {
+            const card = document.querySelector(".unified-panel") as HTMLElement;
+            return {
+              overflowY: card.style.overflowY,
+              scrollable: card.scrollHeight - card.clientHeight,
+            };
+          }),
+        { timeout: 15_000 },
+      )
+      .toMatchObject({ overflowY: "auto" });
 
     const m = await page.evaluate(() => {
       const card = document.querySelector(".unified-panel") as HTMLElement;

@@ -26,6 +26,19 @@ export interface LaunchedElectronApplication {
   process(): ChildProcess;
 }
 
+/**
+ * npm cannot install Electron's Linux SUID sandbox helper as root:4755. The
+ * repository E2E harness therefore disables Chromium's OS sandbox only for its
+ * spawned Linux test application. Production startup never uses this launcher.
+ */
+export function buildElectronLaunchArgs(
+  args: readonly string[] = [],
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (platform !== "linux") return [...args];
+  return ["--no-sandbox", ...args.filter((arg) => arg !== "--no-sandbox")];
+}
+
 const PROJECT_ROOT = resolve(import.meta.dirname, "../..");
 const SOURCE_HOST_DIRECTORY = join(PROJECT_ROOT, "resources/pi-session-host");
 const COPIED_HOST_DIRECTORY = join(PROJECT_ROOT, "out/resources/pi-session-host");
@@ -183,7 +196,7 @@ export async function launchElectron(options: LaunchOptions): Promise<LaunchedEl
   // require("electron") resolves to the npm package path.
   delete env.ELECTRON_RUN_AS_NODE;
 
-  const child = spawn(electronPath, options.args ?? [], {
+  const child = spawn(electronPath, buildElectronLaunchArgs(options.args), {
     cwd: options.cwd ?? process.cwd(),
     env,
     stdio: ["ignore", "pipe", "pipe"],

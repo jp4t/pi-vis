@@ -7,7 +7,12 @@ async function waitForStore(page: import("@playwright/test").Page): Promise<void
     const store = (
       window as unknown as { __pivisStore?: { getState: () => { activeSessionId: string | null } } }
     ).__pivisStore;
-    return !!store?.getState().activeSessionId;
+    const preview = (
+      window as unknown as {
+        __pivisPreview?: { initialWorkspaceOpenCompletions: number };
+      }
+    ).__pivisPreview;
+    return preview?.initialWorkspaceOpenCompletions === 1 && !!store?.getState().activeSessionId;
   });
   await expect(page.locator(".composer__textarea")).toBeEnabled({ timeout: 20_000 });
 }

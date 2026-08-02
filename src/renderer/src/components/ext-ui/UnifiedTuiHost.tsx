@@ -136,6 +136,7 @@ export function UnifiedTuiHost({
   // The current sizing pass, exposed by the lifecycle effect so the mode-change
   // effect below can re-run it without taking sync's deps.
   const syncRef = useRef<(() => void) | null>(null);
+  const contentSyncRef = useRef<(() => void) | null>(null);
   // Display mode, read live by sync() without being a rebuild dep (mode flips
   // mid-panel must NOT tear down xterm).
   const modeRef = useRef<"content" | "viewport">("content");
@@ -264,6 +265,7 @@ export function UnifiedTuiHost({
     }
     let requestReplayRepaint: string | null = null;
     let releaseReplayAfterDrain: AppliedPanelOutput | null = null;
+    let terminalContentChanged = false;
     const applied = appliedOutputRef.current;
     if (applied) {
       const reconciliation = reconcilePanelOutput(applied, unifiedPanel);
@@ -276,18 +278,22 @@ export function UnifiedTuiHost({
       switch (reconciliation.action.kind) {
         case "append":
           term.write(reconciliation.action.ansi);
+          terminalContentChanged = true;
           break;
         case "replace":
           // Queue the clear with the replay. Unlike term.reset(), this cannot
           // race already-queued writes and does not disable Kitty keyboard mode.
           term.write(`${PANEL_REPLAY_CLEAR_ANSI}${reconciliation.action.ansi}`);
+          terminalContentChanged = true;
           replayRepaintRequestRef.current = null;
           break;
         case "clear":
           term.write(PANEL_REPLAY_CLEAR_ANSI);
+          terminalContentChanged = true;
           break;
         case "request_repaint": {
           term.write(PANEL_REPLAY_CLEAR_ANSI);
+          terminalContentChanged = true;
           break;
         }
         case "none":
@@ -313,7 +319,10 @@ export function UnifiedTuiHost({
       authorityAckRef.current !== ackKey;
     if (shouldAcknowledge) authorityAckRef.current = ackKey;
     term.write("", () => {
-      if (visibleRef.current) syncRef.current?.();
+      if (visibleRef.current) {
+        if (terminalContentChanged) contentSyncRef.current?.();
+        else syncRef.current?.();
+      }
       if (releaseReplayAfterDrain) {
         const active = panelRef.current;
         const currentApplied = appliedOutputRef.current;
@@ -592,6 +601,7 @@ export function UnifiedTuiHost({
     });
     // Expose the (coalesced) sizing pass so the mode-change effect can re-run it.
     syncRef.current = sizer.scheduleSync;
+    contentSyncRef.current = sizer.scheduleContentSync;
 
     // Replay only the store's bounded CURRENT segment (trimmed after the latest
     // hard full-screen clear), never the whole historical ANSI log. This gives
@@ -606,7 +616,7 @@ export function UnifiedTuiHost({
     }
     term.write("", () => {
       if (disposed) return;
-      sizer.scheduleSync();
+      sizer.scheduleContentSync();
       const active = panelRef.current;
       if (
         currentPanel.authority === true &&
@@ -661,7 +671,7 @@ export function UnifiedTuiHost({
         event.panelId === currentPanel.id
       ) {
         term.write(event.data, () => {
-          if (!disposed) sizer.scheduleSync();
+          if (!disposed) sizer.scheduleContentSync();
         });
       }
       if (
@@ -903,6 +913,7 @@ export function UnifiedTuiHost({
     return () => {
       disposed = true;
       syncRef.current = null;
+      contentSyncRef.current = null;
       container.removeEventListener("mousedown", refocus);
       onDataDispose.dispose();
       unsubPanel?.();
