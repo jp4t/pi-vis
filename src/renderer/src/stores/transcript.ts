@@ -1841,6 +1841,58 @@ export function addBashBlock(state: TranscriptState, command: string): Transcrip
   };
 }
 
+/** Install Pi's cumulative in-flight assistant checkpoint before attach replay deltas. */
+export function restoreActiveAssistantMessage(
+  state: TranscriptState,
+  message: unknown,
+): TranscriptState {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return state;
+  const candidate = message as Record<string, unknown>;
+  if (candidate.role !== "assistant" || !Array.isArray(candidate.content)) return state;
+  const segments = candidate.content.flatMap((part, contentIndex): AssistantSegment[] => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return [];
+    const content = part as Record<string, unknown>;
+    if (content.type === "thinking" && typeof content.thinking === "string") {
+      return [{ kind: "thinking", content: content.thinking, contentIndex }];
+    }
+    if (content.type === "text" && typeof content.text === "string") {
+      return [{ kind: "text", content: content.text, contentIndex }];
+    }
+    return [];
+  });
+  const active = state.activeAssistantId
+    ? state.blocks.find(
+        (block) => block.id === state.activeAssistantId && block.type === "assistant",
+      )
+    : undefined;
+  if (active?.type === "assistant") {
+    return {
+      ...state,
+      blocks: state.blocks.map((block) =>
+        block.id === active.id && block.type === "assistant"
+          ? {
+              ...block,
+              data: { role: "assistant", segments, isStreaming: true },
+            }
+          : block,
+      ),
+    };
+  }
+  const blockId = newBlockId();
+  return {
+    ...state,
+    blocks: [
+      ...state.blocks,
+      {
+        id: blockId,
+        type: "assistant",
+        data: { role: "assistant", segments, isStreaming: true },
+      },
+    ],
+    activeAssistantId: blockId,
+  };
+}
+
 /** Install the host's bounded active-shell keyframe before attach replay deltas. */
 export function restoreActiveShellTurn(
   state: TranscriptState,

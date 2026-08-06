@@ -79,6 +79,28 @@ describe("createIpcSendQueue", () => {
     expect(fatal).toHaveBeenCalledWith(expect.objectContaining({ message: "channel failed" }));
   });
 
+  it("retains a burst of small streaming deltas beyond the old message-count limit", () => {
+    const callbacks = [];
+    const fatal = vi.fn();
+    const sendNow = vi.fn((_message, callback) => {
+      callbacks.push(callback);
+      return false;
+    });
+    const queue = createIpcSendQueue({ sendNow, onFatalError: fatal });
+
+    queue.send({ id: "blocked" });
+    for (let index = 0; index < 2_048; index++) {
+      queue.send({ type: "message_update", delta: "x", index });
+    }
+
+    expect(queue.closed).toBe(false);
+    expect(queue.queuedMessages).toBe(2_048);
+    expect(queue.queuedBytes).toBeLessThan(8 * 1024 * 1024);
+    expect(fatal).not.toHaveBeenCalled();
+    callbacks[0]();
+    expect(sendNow).toHaveBeenCalledTimes(2);
+  });
+
   it("fails a disconnected channel without invoking the sender", () => {
     const fatal = vi.fn();
     const sendNow = vi.fn();

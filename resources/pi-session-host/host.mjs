@@ -99,8 +99,11 @@ const ipcSendQueue = createIpcSendQueue({
   onPressureChange: (backpressured) => {
     setShellTransportBackpressure?.(backpressured);
   },
-  onFatalError: () => {
-    console.error("[pi-session-host] Fatal IPC transport backpressure failure");
+  onFatalError: (error) => {
+    console.error(
+      "[pi-session-host] Fatal IPC transport backpressure failure:",
+      error instanceof Error ? error.message : String(error),
+    );
     disposeShell?.();
     queueMicrotask(() => process.exit(1));
   },

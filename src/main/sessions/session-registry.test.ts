@@ -2055,6 +2055,72 @@ describe("SessionRegistry direct AgentSession authority", () => {
     h.registry.stopAll();
   });
 
+  it("recaptures restored editor custody when a replacement fails during final setup", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+    const first = h.fakes[0]!;
+    first.editor = {
+      revision: 4,
+      text: "unsent draft",
+      attachments: [{ kind: "file", name: "notes.txt", path: "/tmp/notes.txt" }],
+      conflictText: "alternate local draft",
+      conflictAttachments: [{ kind: "file", name: "alternate.txt", path: "/tmp/alternate.txt" }],
+      alternateConflictText: "third draft",
+      alternateConflictAttachments: [{ kind: "file", name: "third.txt", path: "/tmp/third.txt" }],
+      additionalConflictCandidates: [
+        {
+          text: "fourth draft",
+          attachments: [{ kind: "file", name: "fourth.txt", path: "/tmp/fourth.txt" }],
+        },
+      ],
+    };
+    first.emitControl({ type: "snapshot", snapshot: first.snapshot() });
+    await vi.waitFor(() =>
+      expect(h.registry.getSession(id)?.snapshot?.editor.text).toBe("unsent draft"),
+    );
+
+    const resync = h.registry.resyncSession.bind(h.registry);
+    let failFirstReplacement = true;
+    vi.spyOn(h.registry, "resyncSession").mockImplementation((sessionId) => {
+      if (failFirstReplacement && h.fakes.length === 2) {
+        failFirstReplacement = false;
+        return Promise.reject(new Error("replacement final resync failed"));
+      }
+      return resync(sessionId);
+    });
+
+    first.emitExit(1);
+
+    await vi.waitFor(() => expect(h.fakes).toHaveLength(3), { timeout: 4_000 });
+    await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+    const secondReplacement = h.fakes[2]!;
+    expect(secondReplacement.sent).toContainEqual(
+      expect.objectContaining({
+        type: "editor_patch",
+        patch: expect.objectContaining({
+          text: "unsent draft",
+          attachments: [expect.objectContaining({ name: "notes.txt" })],
+        }),
+      }),
+    );
+    expect(h.registry.getSession(id)?.snapshot?.editor).toMatchObject({
+      text: "unsent draft",
+      attachments: [expect.objectContaining({ name: "notes.txt" })],
+      conflictText: "alternate local draft",
+      conflictAttachments: [expect.objectContaining({ name: "alternate.txt" })],
+      alternateConflictText: "third draft",
+      alternateConflictAttachments: [expect.objectContaining({ name: "third.txt" })],
+      additionalConflictCandidates: [
+        {
+          text: "fourth draft",
+          attachments: [expect.objectContaining({ name: "fourth.txt" })],
+        },
+      ],
+    });
+    h.registry.stopAll();
+  });
+
   it("retains replacement attachments when recovery candidates have identical text", async () => {
     const h = harness({
       configureFake: (fake, spawnIndex) => {
@@ -2975,21 +3041,99 @@ describe("SessionRegistry direct AgentSession authority", () => {
     h.registry.stopAll();
   });
 
-  it("restarts once and leaves a second rapid crash failed", async () => {
+  it("automatically recovers an exit carrying the fatal IPC backpressure diagnostic", async () => {
     const h = harness();
     const id = h.registry.openSession("/tmp/project");
     await h.registry.activateSession(id, "/tmp/pi", {});
 
+    h.fakes[0]!.emitStderr(
+      "[pi-session-host] Fatal IPC transport backpressure failure: IPC queue exceeded 8388608 bytes\n",
+    );
     h.fakes[0]!.emitExit(1);
+
     await vi.waitFor(() => expect(h.fakes).toHaveLength(2));
     await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
-    expectDirectHostSpawns(h.spawnArgs, 2);
+    expect(
+      h.statuses.some(
+        (status) =>
+          Array.isArray(status) &&
+          status[1] === "failed" &&
+          String(status[2]).includes("Fatal IPC transport backpressure failure"),
+      ),
+    ).toBe(true);
+    h.registry.stopAll();
+  });
 
+  it("counts one ready replacement crash only once when final activation setup also rejects", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+
+    const resync = h.registry.resyncSession.bind(h.registry);
+    let rejectReplacementResync!: (reason: Error) => void;
+    let markReplacementResyncEntered!: () => void;
+    const replacementResyncEntered = new Promise<void>((resolve) => {
+      markReplacementResyncEntered = resolve;
+    });
+    let blockFirstReplacement = true;
+    vi.spyOn(h.registry, "resyncSession").mockImplementation((sessionId) => {
+      if (blockFirstReplacement && h.fakes.length === 2) {
+        blockFirstReplacement = false;
+        markReplacementResyncEntered();
+        return new Promise((_resolve, reject) => {
+          rejectReplacementResync = reject;
+        });
+      }
+      return resync(sessionId);
+    });
+
+    h.fakes[0]!.emitExit(1);
+    await replacementResyncEntered;
     h.fakes[1]!.emitExit(1);
-    await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("failed"));
-    await tick();
+    // The backoff can elapse before the still-pending activation settles. Its
+    // successor must remain owned rather than firing early and being dropped
+    // merely because `_activating` is still true.
+    await new Promise((resolve) => setTimeout(resolve, 600));
     expect(h.fakes).toHaveLength(2);
-    expectDirectHostSpawns(h.spawnArgs, 2);
+    rejectReplacementResync(new Error("final activation setup failed after host exit"));
+
+    await vi.waitFor(() => expect(h.fakes).toHaveLength(3), { timeout: 3_000 });
+    await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+    expect(h.registry.getSession(id)?._rapidFailureCount).toBe(2);
+    expect(h.registry.getSession(id)?._automaticRestartAttempt).toBeUndefined();
+    h.registry.stopAll();
+  });
+
+  it("keeps recovering when replacement hosts fail before ready", async () => {
+    const h = harness({ failStartupAt: [1, 2] });
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+
+    h.fakes[0]!.emitExit(1);
+
+    await vi.waitFor(() => expect(h.fakes).toHaveLength(4), { timeout: 4_000 });
+    await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+    expectDirectHostSpawns(h.spawnArgs, 4);
+    h.registry.stopAll();
+  });
+
+  it("automatically retries three rapid host failures before stopping a crash loop", async () => {
+    const h = harness();
+    const id = h.registry.openSession("/tmp/project");
+    await h.registry.activateSession(id, "/tmp/pi", {});
+
+    for (let crash = 0; crash < 3; crash++) {
+      h.fakes[crash]!.emitExit(1);
+      await vi.waitFor(() => expect(h.fakes).toHaveLength(crash + 2), { timeout: 3_000 });
+      await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("ready"));
+    }
+    expectDirectHostSpawns(h.spawnArgs, 4);
+
+    h.fakes[3]!.emitExit(1);
+    await vi.waitFor(() => expect(h.registry.getSession(id)?.status).toBe("failed"));
+    await new Promise((resolve) => setTimeout(resolve, 1_600));
+    expect(h.fakes).toHaveLength(4);
+    expectDirectHostSpawns(h.spawnArgs, 4);
     h.registry.stopAll();
   });
 

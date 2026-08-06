@@ -1516,6 +1516,8 @@ export const TranscriptPresentationBaselineSchema = z
     liveTailCursor: z.string().nullable(),
     overlapBoundary: z.string().nullable(),
     currentStreamingMessage: z.unknown().optional(),
+    /** Main may rewind transcript replay behind this cumulative checkpoint. */
+    currentStreamingMessageThroughSequence: PositiveIntegerSchema.optional(),
     currentShellTurn: ActiveShellTurnSnapshotSchema.optional(),
   })
   .strict();
@@ -1651,6 +1653,19 @@ export const AuthorityAttachBaselineSchema = z
           message: "following semantic baseline cursor must identify its snapshot",
         });
       }
+    }
+    const streamingCheckpointThrough = baseline.transcript.currentStreamingMessageThroughSequence;
+    if (
+      streamingCheckpointThrough !== undefined &&
+      (baseline.transcript.currentStreamingMessage === undefined ||
+        baseline.transcript.sync.state !== "following" ||
+        streamingCheckpointThrough < baseline.transcript.sync.cursor.transportSequence)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["transcript", "currentStreamingMessageThroughSequence"],
+        message: "streaming checkpoint high-water requires a following cumulative baseline",
+      });
     }
     const currentShellTurn = baseline.transcript.currentShellTurn;
     if (

@@ -5089,6 +5089,154 @@ describe("sessions store - authority intent projection", () => {
 
   afterEach(() => vi.unstubAllGlobals());
 
+  it("materializes an in-flight assistant checkpoint before transcript attach replay", () => {
+    const attach = authorityAttach(
+      semanticSnapshot(1, {
+        sdk: {
+          isStreaming: true,
+          isIdle: false,
+          isCompacting: false,
+          isRetrying: false,
+          retryAttempt: 0,
+          isBashRunning: false,
+        },
+      }),
+    );
+    attach.baseline.transcript.currentStreamingMessage = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "brief reason" },
+        { type: "text", text: "hel" },
+      ],
+    };
+    attach.replay = [
+      {
+        sessionId: SESSION_A,
+        rendererGeneration: 0,
+        publicationSequence: 1,
+        plane: "transcript",
+        owner: attach.baseline.owner,
+        payload: {
+          kind: "delta",
+          cursor: {
+            ...attach.baseline.owner,
+            transportSequence: 2,
+            snapshotSequence: 2,
+          },
+          liveTailCursor: "2",
+          entries: [
+            {
+              type: "message_update",
+              message: { role: "assistant" },
+              assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "lo" },
+            },
+          ],
+        },
+      },
+    ];
+
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+
+    const transcript = useSessionsStore.getState().sessions.get(SESSION_A)?.transcript;
+    const assistant = transcript?.blocks.find((block) => block.type === "assistant");
+    expect(assistant).toMatchObject({
+      type: "assistant",
+      data: {
+        segments: [
+          { kind: "thinking", content: "brief reason", contentIndex: 0 },
+          { kind: "text", content: "hello", contentIndex: 1 },
+        ],
+        isStreaming: true,
+      },
+    });
+    expect(transcript?.activeAssistantId).toBe(assistant?.id);
+  });
+
+  it("applies covered transcript lifecycles before a rewound streaming checkpoint", () => {
+    const attach = authorityAttach();
+    attach.baseline.transcript.sync = {
+      state: "following",
+      cursor: {
+        ...attach.baseline.owner,
+        transportSequence: 1,
+        snapshotSequence: 1,
+      },
+    };
+    attach.baseline.transcript.currentStreamingMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "current complete" }],
+    };
+    attach.baseline.transcript.currentStreamingMessageThroughSequence = 2;
+    attach.replay = [
+      {
+        sessionId: SESSION_A,
+        rendererGeneration: 0,
+        publicationSequence: 1,
+        plane: "transcript",
+        owner: attach.baseline.owner,
+        payload: {
+          kind: "delta",
+          cursor: {
+            ...attach.baseline.owner,
+            transportSequence: 2,
+            snapshotSequence: 2,
+          },
+          liveTailCursor: "2",
+          entries: [
+            { type: "message_start", message: { role: "assistant" } },
+            {
+              type: "message_update",
+              message: { role: "assistant" },
+              assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+            },
+            {
+              type: "message_update",
+              message: { role: "assistant" },
+              assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "previous" },
+            },
+            {
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "previous" }],
+              },
+            },
+            { type: "message_start", message: { role: "assistant" } },
+            {
+              type: "message_update",
+              message: { role: "assistant" },
+              assistantMessageEvent: { type: "text_start", contentIndex: 0 },
+            },
+            {
+              type: "message_update",
+              message: { role: "assistant" },
+              assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial" },
+            },
+          ],
+        },
+      },
+    ];
+
+    useSessionsStore.getState().applyAuthorityAttach(SESSION_A, attach);
+
+    const transcript = useSessionsStore.getState().sessions.get(SESSION_A)?.transcript;
+    const assistants = transcript?.blocks.filter((block) => block.type === "assistant") ?? [];
+    expect(assistants).toHaveLength(2);
+    expect(assistants[0]).toMatchObject({
+      data: {
+        segments: [{ kind: "text", content: "previous", contentIndex: 0 }],
+        isStreaming: false,
+      },
+    });
+    expect(assistants[1]).toMatchObject({
+      data: {
+        segments: [{ kind: "text", content: "current complete", contentIndex: 0 }],
+        isStreaming: true,
+      },
+    });
+    expect(transcript?.activeAssistantId).toBe(assistants[1]?.id);
+  });
+
   it("projects input acknowledgement high-watermarks for custom and unified panels", () => {
     const attach = authorityAttach();
     const cursor = {

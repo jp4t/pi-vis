@@ -5004,6 +5004,45 @@ describe("state authority", () => {
     ).resolves.toMatchObject({ status: "admitted" });
   });
 
+  it("keeps token deltas linear and suppresses unchanged semantic frames", async () => {
+    const sendFrame = vi.fn();
+    const sendPresentation = vi.fn();
+    const { authority } = setup(
+      { isStreaming: true, isIdle: false },
+      { sendFrame, sendPresentation },
+    );
+    authority.publishSnapshot();
+    sendFrame.mockClear();
+    sendPresentation.mockClear();
+
+    const cumulativeMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "x".repeat(64 * 1024) }],
+      provider: "test-provider",
+      model: "test-model",
+    };
+    authority.observeEvent({
+      type: "message_update",
+      message: cumulativeMessage,
+      assistantMessageEvent: { type: "text_delta", delta: "x", contentIndex: 0 },
+    });
+
+    expect(sendFrame).not.toHaveBeenCalled();
+    expect(sendPresentation).toHaveBeenCalledOnce();
+    const publication = sendPresentation.mock.calls[0][0];
+    expect(publication.payload.entries).toEqual([
+      {
+        type: "message_update",
+        message: { role: "assistant" },
+        assistantMessageEvent: { type: "text_delta", delta: "x", contentIndex: 0 },
+      },
+    ]);
+    expect(JSON.stringify(publication).length).toBeLessThan(1_000);
+
+    const attached = await readyAttach(authority, 31);
+    expect(attached.transcript.currentStreamingMessage).toEqual(cumulativeMessage);
+  });
+
   it("exposes an atomic semantic frame and failure escrow without inventing a compaction end", () => {
     const sendFrame = vi.fn();
     const { authority, sendRecord, sendControl } = setup({}, { sendFrame });

@@ -91,6 +91,7 @@ import {
   createTranscriptState,
   finalizeActiveBlocks,
   finishBashBlock,
+  restoreActiveAssistantMessage,
   restoreActiveShellTurn,
   retirePendingUserEchoesByIntent,
   seedFromHistory,
@@ -2819,18 +2820,34 @@ const buildSessionsStore = (
     // message emitted during attach vanishes while the later assistant delta is
     // rendered. Parse before the atomic commit and apply only if the transcript
     // plane accepts the attach.
-    const replayTranscriptEntries = response.replay.flatMap((publication) =>
+    const streamingCheckpointThrough =
+      response.baseline.transcript.currentStreamingMessageThroughSequence;
+    const replayTranscriptRecords = response.replay.flatMap((publication) =>
       publication.plane === "transcript" && publication.payload.kind === "delta"
-        ? publication.payload.entries
+        ? publication.payload.entries.map((entry) => ({
+            entry,
+            coveredByStreamingCheckpoint:
+              streamingCheckpointThrough !== undefined &&
+              publication.payload.cursor.transportSequence <= streamingCheckpointThrough,
+          }))
         : [],
     );
+    const replayTranscriptEntries = replayTranscriptRecords.map(({ entry }) => entry);
     const invalidReplayEntries: unknown[] = [];
-    const replayEvents = replayTranscriptEntries.flatMap((entry) => {
-      const parsed = PiEventSchema.safeParse(entry);
-      if (parsed.success) return [parsed.data];
-      invalidReplayEntries.push(entry);
-      return [];
-    });
+    const parsedReplayEvents = replayTranscriptRecords.flatMap(
+      ({ entry, coveredByStreamingCheckpoint }) => {
+        const parsed = PiEventSchema.safeParse(entry);
+        if (parsed.success) return [{ event: parsed.data, coveredByStreamingCheckpoint }];
+        invalidReplayEntries.push(entry);
+        return [];
+      },
+    );
+    const checkpointCoveredReplayEvents = parsedReplayEvents
+      .filter(({ coveredByStreamingCheckpoint }) => coveredByStreamingCheckpoint)
+      .map(({ event }) => event);
+    const replayEvents = parsedReplayEvents
+      .filter(({ coveredByStreamingCheckpoint }) => !coveredByStreamingCheckpoint)
+      .map(({ event }) => event);
     let following = false;
     let transcriptFollowing = false;
     runAtomically(() => {
@@ -2864,16 +2881,8 @@ const buildSessionsStore = (
           ? invalidReplayEntries.length
           : replayTranscriptEntries.length;
         const semanticProjection = applyAuthoritySemanticProjection(current, authorityProjection);
-        const shellSnapshot = response.baseline.transcript.currentShellTurn;
-        const projectionWithShell =
-          transcriptFollowing && shellSnapshot
-            ? {
-                ...semanticProjection,
-                transcript: restoreActiveShellTurn(semanticProjection.transcript, shellSnapshot),
-              }
-            : semanticProjection;
         sessions.set(sessionId, {
-          ...appendQueueRestorations(projectionWithShell, restorations),
+          ...appendQueueRestorations(semanticProjection, restorations),
           authorityProjection,
           panel: customPanel
             ? {
@@ -2949,6 +2958,28 @@ const buildSessionsStore = (
         });
         return { sessions };
       });
+      if (transcriptFollowing && checkpointCoveredReplayEvents.length > 0) {
+        get().applyEvents(sessionId, checkpointCoveredReplayEvents);
+      }
+      const streamingMessage = response.baseline.transcript.currentStreamingMessage;
+      const shellSnapshot = response.baseline.transcript.currentShellTurn;
+      if (transcriptFollowing && (streamingMessage !== undefined || shellSnapshot !== undefined)) {
+        set((state) => {
+          const current = state.sessions.get(sessionId);
+          if (!current) return {};
+          const withStreamingCheckpoint =
+            streamingMessage !== undefined
+              ? restoreActiveAssistantMessage(current.transcript, streamingMessage)
+              : current.transcript;
+          const withTranscriptBaselines = shellSnapshot
+            ? restoreActiveShellTurn(withStreamingCheckpoint, shellSnapshot)
+            : withStreamingCheckpoint;
+          if (withTranscriptBaselines === current.transcript) return {};
+          const sessions = new Map(state.sessions);
+          sessions.set(sessionId, { ...current, transcript: withTranscriptBaselines });
+          return { sessions };
+        });
+      }
       if (transcriptFollowing && replayEvents.length > 0) {
         get().applyEvents(sessionId, replayEvents);
       }

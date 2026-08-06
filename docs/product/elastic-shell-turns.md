@@ -563,7 +563,7 @@ otherwise:
 | Reattach keyframe/raw fallback | 1 MiB | Serialize the newest emulator state/scrollback that fits and show an omission notice when older live rows are absent |
 | Retained alternate-screen final frames | 1 MiB aggregate | Drop oldest final frames, or omit one oversized frame, and insert a counted plain-text omission marker |
 | PTY parser backlog | Pause at 256 KiB; resume at 64 KiB | Apply node-pty flow control without dropping or reordering bytes |
-| Child IPC backlog | 1,024 messages or 8 MiB | Pause the PTY while queued; fail the host rather than silently lose an authority publication if the bounded queue is exceeded |
+| Child IPC backlog | 8,192 messages or 8 MiB | Pause the PTY while queued; fail the host rather than silently lose an authority publication if the bounded queue is exceeded |
 | Canonical Pi result | Pi 0.83.0 limit: 50 KiB or 2,000 lines | Use Pi's tail truncation, preserve `truncated`, and surface its optional complete-output path |
 
 Live rendering continues after reattach retention fills. A reconstructed

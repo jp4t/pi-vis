@@ -661,6 +661,29 @@ describe("authority protocol schemas", () => {
 
   it("requires attach baselines, panel reconstruction, and replay to be internally coherent", () => {
     expect(AuthorityAttachBaselineSchema.safeParse(baseline()).success).toBe(true);
+    const streamingBaseline = baseline({
+      transcript: {
+        sync: { state: "following", cursor },
+        persistedHistoryCursor: null,
+        liveTailCursor: "7",
+        overlapBoundary: null,
+        currentStreamingMessage: {
+          role: "assistant",
+          content: [{ type: "text", text: "partial" }],
+        },
+        currentStreamingMessageThroughSequence: cursor.transportSequence + 1,
+      },
+    });
+    expect(AuthorityAttachBaselineSchema.safeParse(streamingBaseline).success).toBe(true);
+    expect(
+      AuthorityAttachBaselineSchema.safeParse({
+        ...streamingBaseline,
+        transcript: {
+          ...streamingBaseline.transcript,
+          currentStreamingMessage: undefined,
+        },
+      }).success,
+    ).toBe(false);
     const navigationPresentation = {
       intentId: "navigate-a",
       owner,

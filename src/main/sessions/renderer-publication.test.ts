@@ -290,12 +290,22 @@ describe("RendererPublicationRouter", () => {
     );
 
     router.route({ plane: "transcript", owner: owner(), payload: transcript(owner(), 2) });
-    resolveBaseline({ status: "ready", baseline: baseline(owner(), 1, 0, 2) });
+    const sourceBaseline = baseline(owner(), 1, 0, 2);
+    sourceBaseline.transcript.currentStreamingMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "checkpoint" }],
+    };
+    resolveBaseline({ status: "ready", baseline: sourceBaseline });
 
     const response = expectReady(await attaching);
     expect(response.baseline.transcript).toMatchObject({
       sync: { state: "following", cursor: { transportSequence: 1 } },
       liveTailCursor: "1",
+      currentStreamingMessage: {
+        role: "assistant",
+        content: [{ type: "text", text: "checkpoint" }],
+      },
+      currentStreamingMessageThroughSequence: 2,
     });
     expect(response.replay).toHaveLength(1);
     expect(response.replay[0]).toMatchObject({

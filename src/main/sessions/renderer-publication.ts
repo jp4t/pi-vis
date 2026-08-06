@@ -280,11 +280,13 @@ export class RendererPublicationRouter {
         let covered = classified.covered;
         let replay = classified.replay;
 
-        // The transcript baseline carries cursors and streaming metadata, not
-        // completed messages. A transcript delta received while attaching must
-        // therefore be replayed even when the child baseline cursor already
-        // covers it. Rewind only that plane to the predecessor cursor and keep
-        // all buffered transcript records in their original cross-plane order.
+        // The transcript baseline carries one cumulative in-flight assistant
+        // checkpoint, but not completed messages or other transcript records.
+        // Traffic received while attaching must therefore be replayed even when
+        // the child cursor covers it. Rewind only that plane and, when present,
+        // mark the checkpoint's original high-water so the renderer can apply
+        // the covered prefix first, install the cumulative checkpoint once, and
+        // then apply the later tail without duplicating token deltas.
         const firstCoveredTranscript = covered.find(
           ({ publication }) => publication.plane === "transcript",
         );
@@ -300,12 +302,17 @@ export class RendererPublicationRouter {
             (entry) => entry.publication.plane === "transcript" || replaySet.has(entry),
           );
           covered = covered.filter(({ publication }) => publication.plane !== "transcript");
-          const { currentStreamingMessage: _coveredStreamingMessage, ...transcriptBaseline } =
-            sourceBaseline.transcript;
+          const streamingCheckpointThrough =
+            sourceBaseline.transcript.currentStreamingMessage !== undefined
+              ? sourceBaseline.transcript.sync.cursor.transportSequence
+              : undefined;
           installBaseline = {
             ...sourceBaseline,
             transcript: {
-              ...transcriptBaseline,
+              ...sourceBaseline.transcript,
+              ...(streamingCheckpointThrough !== undefined
+                ? { currentStreamingMessageThroughSequence: streamingCheckpointThrough }
+                : {}),
               sync: {
                 state: "following",
                 cursor: {

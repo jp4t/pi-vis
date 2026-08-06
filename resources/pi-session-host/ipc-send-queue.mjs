@@ -1,4 +1,7 @@
-const DEFAULT_MAX_QUEUED_MESSAGES = 1_024;
+// The byte bound is the primary memory fence. Streaming deltas are intentionally
+// small after host-side compaction, but a temporarily busy main process can
+// still retain more than 1,024 of them without approaching eight MiB.
+const DEFAULT_MAX_QUEUED_MESSAGES = 8_192;
 const DEFAULT_MAX_QUEUED_BYTES = 8 * 1024 * 1024;
 
 function messageBytes(message) {

@@ -178,6 +178,9 @@ export interface SessionRecord {
   /** Release can beat session.activate while main is still locating Pi. */
   _releasedActivationVisits: Map<string, number>;
   _restartChain?: Promise<void> | undefined;
+  _restartTimer?: ReturnType<typeof setTimeout> | undefined;
+  /** Distinguishes a pre-ready retry failure from one already counted by host failure handling. */
+  _automaticRestartAttempt?: { failureAccounted: boolean } | undefined;
   _dead?: boolean | undefined;
   _procReady?: boolean | undefined;
   _piPath?: string | undefined;
@@ -240,6 +243,8 @@ export interface SessionRecord {
 }
 
 const RAPID_FAILURE_WINDOW_MS = 30_000;
+const MAX_AUTOMATIC_RESTART_ATTEMPTS = 3;
+const AUTOMATIC_RESTART_DELAYS_MS = [100, 500, 1_500] as const;
 function removeRuntimePinWithRetry(alias: string, attemptsRemaining = 60): void {
   try {
     unlinkSync(alias);
@@ -586,6 +591,10 @@ export class SessionRegistry {
     }
     if (record._activating) return record._activationDone;
     if (record.proc && (record.status === "starting" || record.status === "ready")) return;
+    if (record._restartTimer) {
+      clearTimeout(record._restartTimer);
+      record._restartTimer = undefined;
+    }
 
     record._activationVisitId = activationVisitId;
     record._activationVisitStartedAt = activationVisitId ? Date.now() : undefined;
@@ -690,15 +699,27 @@ export class SessionRegistry {
         proc.stop();
         return;
       }
-      // Keep the recovery budget across a successful ready handshake. A second
-      // crash inside RAPID_FAILURE_WINDOW_MS must leave the session failed
-      // rather than creating an endless crash/restart loop.
+      // Keep the recovery budget across a successful ready handshake. Rapid
+      // successor crashes continue consuming the bounded attempt budget rather
+      // than resetting into an endless crash/restart loop.
       this.onStatusChanged(sessionId, "ready", undefined, proc.piVersion);
     } catch (error) {
       if (record._dead) return;
       const message = error instanceof Error ? error.message : String(error);
-      record.proc?.stop();
-      record.proc = undefined;
+      const failedProc = record.proc;
+      // Recovery may already have installed and cleared its predecessor
+      // checkpoint before a later activation step fails. Preserve the latest
+      // validated replacement editor before retiring that process so another
+      // bounded retry cannot discard the restored draft or conflict state.
+      if (
+        failedProc?.hostInstanceId &&
+        record.snapshot?.hostInstanceId === failedProc.hostInstanceId &&
+        record.snapshot.sessionEpoch === failedProc.sessionEpoch
+      ) {
+        this.captureEditorRecovery(record);
+      }
+      failedProc?.stop();
+      if (record.proc === failedProc) record.proc = undefined;
       record._procReady = false;
       record.status = "failed";
       record.error = message;
@@ -1614,10 +1635,7 @@ export class SessionRegistry {
       }
     }
     const snapshot = await proc.requestSnapshot();
-    record._editorRecovery = undefined;
-    record._editorRecoveryReconciliation = undefined;
-    record._deferredInitialBatch = undefined;
-    this.installTransitionBatch(
+    const installed = this.installTransitionBatch(
       record,
       {
         ...initialBatch,
@@ -1626,6 +1644,12 @@ export class SessionRegistry {
       },
       { allowInitial: true },
     );
+    if (!installed) throw new Error("Recovered editor baseline could not be installed");
+    // Clear custody only after the validated replacement snapshot is installed.
+    // A later activation failure can then recapture this exact canonical state.
+    record._editorRecovery = undefined;
+    record._editorRecoveryReconciliation = undefined;
+    record._deferredInitialBatch = undefined;
   }
 
   /**
@@ -1718,6 +1742,65 @@ export class SessionRegistry {
     }
   }
 
+  private accountRapidFailure(record: SessionRecord): void {
+    const now = Date.now();
+    const rapid = now - (record._lastFailureAt ?? 0) < RAPID_FAILURE_WINDOW_MS;
+    record._lastFailureAt = now;
+    record._rapidFailureCount = rapid ? record._rapidFailureCount + 1 : 1;
+  }
+
+  private scheduleAutomaticRestart(record: SessionRecord): void {
+    if (
+      record._rapidFailureCount > MAX_AUTOMATIC_RESTART_ATTEMPTS ||
+      record._dead ||
+      !record._piPath
+    ) {
+      this.releaseLock(record);
+      return;
+    }
+    if (record._restartTimer) return;
+    const delayMs =
+      AUTOMATIC_RESTART_DELAYS_MS[
+        Math.min(record._rapidFailureCount, AUTOMATIC_RESTART_DELAYS_MS.length) - 1
+      ];
+    record._restartTimer = setTimeout(() => {
+      record._restartTimer = undefined;
+      if (record._dead || record.proc || record._activating) return;
+      const attempt = { failureAccounted: false };
+      record._automaticRestartAttempt = attempt;
+      void this.activateSession(record.sessionId, record._piPath as string, record._env).then(
+        () => {
+          if (record._automaticRestartAttempt !== attempt) return;
+          record._automaticRestartAttempt = undefined;
+          // A ready-during-activation failure is accounted synchronously by
+          // handleRuntimeFailure(), but its successor must wait until this
+          // activation promise settles so an earlier timer cannot fire while
+          // `_activating` is still true and silently lose the retry.
+          if (attempt.failureAccounted) this.scheduleAutomaticRestart(record);
+        },
+        () => {
+          if (record._automaticRestartAttempt !== attempt) return;
+          record._automaticRestartAttempt = undefined;
+          if (
+            this.sessions.get(record.sessionId) !== record ||
+            record._dead ||
+            record.proc ||
+            record._activating
+          ) {
+            return;
+          }
+          // A pre-ready failure consumes the crash-loop budget here. If this
+          // attempt reached ready far enough for handleRuntimeFailure(), that
+          // handler already counted the same physical failure, so never count
+          // it again in this rejection path.
+          if (!attempt.failureAccounted) this.accountRapidFailure(record);
+          this.scheduleAutomaticRestart(record);
+        },
+      );
+    }, delayMs);
+    record._restartTimer.unref?.();
+  }
+
   private handleRuntimeFailure(record: SessionRecord, proc: SessionHost, reason: string): void {
     if (record.proc !== proc) return;
     this.captureEditorRecovery(record);
@@ -1805,20 +1888,12 @@ export class SessionRegistry {
     this.onPanelEvent(record.sessionId, { type: "unified_panel_reset" });
     this.onStatusChanged(record.sessionId, "failed", reason);
 
-    const now = Date.now();
-    const rapid = now - (record._lastFailureAt ?? 0) < RAPID_FAILURE_WINDOW_MS;
-    record._lastFailureAt = now;
-    record._rapidFailureCount = rapid ? record._rapidFailureCount + 1 : 1;
-    if (record._rapidFailureCount > 1 || record._dead || !record._piPath) {
-      this.releaseLock(record);
-      return;
-    }
-    queueMicrotask(() => {
-      if (record._dead || record.proc || record._activating) return;
-      void this.activateSession(record.sessionId, record._piPath as string, record._env).catch(
-        () => {},
-      );
-    });
+    const automaticAttempt = record._automaticRestartAttempt;
+    if (automaticAttempt) automaticAttempt.failureAccounted = true;
+    this.accountRapidFailure(record);
+    // An automatic activation owns its successor scheduling after its promise
+    // settles. Ordinary ready-host failure has no such owner and schedules now.
+    if (!automaticAttempt) this.scheduleAutomaticRestart(record);
   }
 
   /**
@@ -1964,8 +2039,14 @@ export class SessionRegistry {
           };
         }
       }
-      if (!record.proc && (record.error !== undefined || record._dead))
+      if (
+        !record.proc &&
+        !record._restartTimer &&
+        !record._activating &&
+        (record.error !== undefined || record._dead)
+      ) {
         return { status: "terminal" };
+      }
       await new Promise<void>((resolve) => setTimeout(resolve, 20));
     }
     return { status: "timeout" };
@@ -3815,6 +3896,9 @@ export class SessionRegistry {
     const record = this.sessions.get(sessionId);
     if (!record) return;
     record._dead = true;
+    if (record._restartTimer) clearTimeout(record._restartTimer);
+    record._restartTimer = undefined;
+    record._automaticRestartAttempt = undefined;
     if (record._leaseTimer) clearTimeout(record._leaseTimer);
     for (const timer of record._unifiedClaimTimers.values()) clearTimeout(timer);
     record._unifiedClaimTimers.clear();

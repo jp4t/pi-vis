@@ -1400,6 +1400,27 @@ export function createStateAuthority({
     return frame;
   }
 
+  // Transcript events are independently sequenced presentation traffic. Pi's
+  // message_update stream can contain thousands of token deltas without
+  // changing any semantic getter or operation state, so emitting a complete
+  // semantic snapshot for every delta creates quadratic IPC traffic. Still
+  // sample the direct SDK state at each event boundary, but publish a frame
+  // only when that semantic projection actually changed.
+  function publishSemanticChangeIfNeeded() {
+    if (transition || typeof sendFrame !== "function") return commitSemanticFrame([]);
+    const directSnapshot = snapshot();
+    const terminalSnapshot = semanticSnapshot(directSnapshot);
+    if (
+      lastMutationFingerprint !== undefined &&
+      lastMutationFingerprint === mutationFingerprint(terminalSnapshot)
+    ) {
+      return terminalSnapshot;
+    }
+    const frame = createSemanticFrame([], directSnapshot);
+    sendFrame(frame);
+    return frame;
+  }
+
   function normalizedTreeBranch(value) {
     if (!Array.isArray(value)) return undefined;
     try {
@@ -3120,10 +3141,24 @@ export function createStateAuthority({
     transcriptPresentation.liveTailCursor = String(cursor.transportSequence);
     const event = entries[entries.length - 1];
     if (event?.type === "message_start" || event?.type === "message_update") {
+      // Keep Pi's complete cumulative message only once for attach recovery.
+      // Live message_update rendering consumes assistantMessageEvent deltas and
+      // the role; retransmitting the cumulative message on every token is
+      // quadratic in the generated response size.
       transcriptPresentation.currentStreamingMessage = structuredClone(event.message ?? event);
     } else if (event?.type === "message_end") {
       transcriptPresentation.currentStreamingMessage = undefined;
     }
+    const wireEntries = entries.map((entry) => {
+      if (entry?.type !== "message_update" || typeof entry.message?.role !== "string") return entry;
+      return {
+        type: "message_update",
+        message: { role: entry.message.role },
+        ...(entry.assistantMessageEvent !== undefined
+          ? { assistantMessageEvent: entry.assistantMessageEvent }
+          : {}),
+      };
+    });
     sendPresentation({
       plane: "transcript",
       owner: semanticOwner(),
@@ -3131,7 +3166,7 @@ export function createStateAuthority({
         kind: "delta",
         cursor,
         liveTailCursor: transcriptPresentation.liveTailCursor,
-        entries: structuredClone(entries),
+        entries: structuredClone(wireEntries),
       },
     });
   }
@@ -3361,7 +3396,7 @@ export function createStateAuthority({
     // sequenced transcript plane. Keep the legacy record+snapshot fallback for
     // embedders/tests that have not installed a presentation sink.
     if (typeof sendPresentation === "function") {
-      const frame = commitSemanticFrame([]);
+      const frame = publishSemanticChangeIfNeeded();
       publishTranscript([publishedEvent]);
       return frame;
     }
