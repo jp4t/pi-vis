@@ -5024,7 +5024,12 @@ describe("state authority", () => {
     authority.observeEvent({
       type: "message_update",
       message: cumulativeMessage,
-      assistantMessageEvent: { type: "text_delta", delta: "x", contentIndex: 0 },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "x",
+        contentIndex: 0,
+        partial: cumulativeMessage,
+      },
     });
 
     expect(sendFrame).not.toHaveBeenCalled();

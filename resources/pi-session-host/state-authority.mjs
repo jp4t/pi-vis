@@ -1,4 +1,9 @@
 import * as crypto from "node:crypto";
+import {
+  createStreamingMessageCheckpoint,
+  materializeStreamingMessageCheckpoint,
+  updateStreamingMessageCheckpoint,
+} from "./streaming-message-checkpoint.mjs";
 
 const MAX_SHELL_COMMAND_BYTES = 64 * 1024;
 const LIVE_NON_PTY_SHELL_REPLAY_LIMIT = 1024 * 1024;
@@ -15,6 +20,15 @@ function isSlashSubmission(request) {
 
 function inputKindForEditorText(text) {
   return typeof text === "string" && text.startsWith("/") ? "slash_command" : "ordinary";
+}
+
+function incrementalAssistantMessageEvent(event) {
+  if (!event || typeof event !== "object" || Array.isArray(event)) return event;
+  // Pi's public stream subevent repeats its complete cumulative message in
+  // partial/message/error. The checkpoint owns that state; live transcript IPC
+  // carries only lifecycle fields, deltas, and one-time terminal block data.
+  const { partial: _partial, message: _message, error: _error, ...incremental } = event;
+  return incremental;
 }
 
 function appendBoundedNonPtyShellOutput(shell, delta) {
@@ -99,7 +113,7 @@ export function createStateAuthority({
     overlapBoundary: initialTranscriptSessionFile
       ? `persisted:${initialTranscriptSessionFile}`
       : null,
-    currentStreamingMessage: undefined,
+    streamingMessageCheckpoint: undefined,
   };
   let shellTurn = null;
   let stopped = false;
@@ -3140,14 +3154,21 @@ export function createStateAuthority({
     const cursor = presentationCursor("transcript");
     transcriptPresentation.liveTailCursor = String(cursor.transportSequence);
     const event = entries[entries.length - 1];
-    if (event?.type === "message_start" || event?.type === "message_update") {
-      // Keep Pi's complete cumulative message only once for attach recovery.
-      // Live message_update rendering consumes assistantMessageEvent deltas and
-      // the role; retransmitting the cumulative message on every token is
-      // quadratic in the generated response size.
-      transcriptPresentation.currentStreamingMessage = structuredClone(event.message ?? event);
+    if (event?.type === "message_start" && event.message?.role === "assistant") {
+      transcriptPresentation.streamingMessageCheckpoint = createStreamingMessageCheckpoint(
+        event.message,
+      );
+    } else if (event?.type === "message_update" && event.message?.role === "assistant") {
+      // Live rendering consumes only assistantMessageEvent deltas. Retain the
+      // attach checkpoint as content chunks plus non-content metadata and materialize
+      // Pi's complete cumulative message only when a read-barrier attach asks for it.
+      transcriptPresentation.streamingMessageCheckpoint = updateStreamingMessageCheckpoint(
+        transcriptPresentation.streamingMessageCheckpoint,
+        event.message,
+        event.assistantMessageEvent,
+      );
     } else if (event?.type === "message_end") {
-      transcriptPresentation.currentStreamingMessage = undefined;
+      transcriptPresentation.streamingMessageCheckpoint = undefined;
     }
     const wireEntries = entries.map((entry) => {
       if (entry?.type !== "message_update" || typeof entry.message?.role !== "string") return entry;
@@ -3155,7 +3176,9 @@ export function createStateAuthority({
         type: "message_update",
         message: { role: entry.message.role },
         ...(entry.assistantMessageEvent !== undefined
-          ? { assistantMessageEvent: entry.assistantMessageEvent }
+          ? {
+              assistantMessageEvent: incrementalAssistantMessageEvent(entry.assistantMessageEvent),
+            }
           : {}),
       };
     });
@@ -4216,7 +4239,7 @@ export function createStateAuthority({
       transcriptPresentation.persistedHistoryCursor = successorFile ?? null;
       transcriptPresentation.liveTailCursor = null;
       transcriptPresentation.overlapBoundary = successorFile ? `persisted:${successorFile}` : null;
-      transcriptPresentation.currentStreamingMessage = undefined;
+      transcriptPresentation.streamingMessageCheckpoint = undefined;
     }
     // Operation-journal coverage is owner-scoped. A successor baseline must
     // never advertise retained predecessor entries or predecessor watermarks.
@@ -4496,10 +4519,10 @@ export function createStateAuthority({
             persistedHistoryCursor: transcriptPresentation.persistedHistoryCursor,
             liveTailCursor: transcriptPresentation.liveTailCursor,
             overlapBoundary: transcriptPresentation.overlapBoundary,
-            ...(transcriptPresentation.currentStreamingMessage !== undefined
+            ...(transcriptPresentation.streamingMessageCheckpoint !== undefined
               ? {
-                  currentStreamingMessage: structuredClone(
-                    transcriptPresentation.currentStreamingMessage,
+                  currentStreamingMessage: materializeStreamingMessageCheckpoint(
+                    transcriptPresentation.streamingMessageCheckpoint,
                   ),
                 }
               : {}),
