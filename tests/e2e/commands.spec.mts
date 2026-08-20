@@ -154,8 +154,39 @@ test.describe("Slash commands", () => {
     await expect(interfaceSection.getByText("Dark theme", { exact: true })).toBeVisible();
     await expect(interfaceSection.getByText("Mode", { exact: true })).toBeVisible();
     await expect(interfaceSection.getByText("Font Size", { exact: true })).toBeVisible();
-    await expect(interfaceSection.getByText("Family", { exact: true })).toHaveCount(0);
+    // Interface + title font families are user-configurable (defaults Inter /
+    // Fraunces). The control is a select when queryLocalFonts is available,
+    // else a free-text input — accept either.
+    const fontFamilyRow = interfaceSection.locator(".settings-row", {
+      hasText: "Font Family",
+    });
+    const titleFontRow = interfaceSection.locator(".settings-row", { hasText: "Title Font" });
+    await expect(fontFamilyRow).toBeVisible();
+    await expect(titleFontRow).toBeVisible();
     await expect(interfaceSection).not.toContainText("Pi-Vis owns interface font families");
+
+    // Defaults render as Inter (interface) / Fraunces (title) on :root.
+    const defaultVars = await window.locator("html").evaluate((element) => ({
+      display: (element as HTMLElement).style.getPropertyValue("--font-display"),
+      accent: (element as HTMLElement).style.getPropertyValue("--font-accent"),
+    }));
+    expect(defaultVars.display).toContain("Inter");
+    expect(defaultVars.accent).toContain("Fraunces");
+
+    // Changing the title font rewrites --font-accent live, falling back to
+    // the interface font.
+    const titleInput = titleFontRow.locator("input.settings-input");
+    if ((await titleInput.count()) > 0) {
+      await titleInput.fill("IBM Plex Serif");
+    } else {
+      await titleFontRow.locator(".settings-select__trigger").click();
+      await titleFontRow.getByRole("option", { name: "IBM Plex Serif" }).click();
+    }
+    const accentVar = await window
+      .locator("html")
+      .evaluate((element) => (element as HTMLElement).style.getPropertyValue("--font-accent"));
+    expect(accentVar).toContain("IBM Plex Serif");
+    expect(accentVar).toContain("var(--font-display)");
 
     const darkThemeRow = interfaceSection.locator(".settings-row", { hasText: "Dark theme" });
     await darkThemeRow.locator(".settings-select__trigger").click();
