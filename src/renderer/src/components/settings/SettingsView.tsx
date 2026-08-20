@@ -32,12 +32,12 @@ interface FontFamily {
  */
 const BUNDLED_CODE_FONTS = ["IBM Plex Mono"];
 
-// Curated Google-Docs-style shortlists for the interface + title pickers:
-// bundled families first (Inter = interface default; Fraunces = title
-// default), then a handful of widely available system fonts. Deliberately
-// NOT the full queryLocalFonts list — hundreds of system fonts make the
-// picker unusable. A persisted custom family is appended via `current` in
-// buildFontOptions, so a settings.json value outside the list still renders.
+// Curated Google-Docs-style shortlists for the interface + title pickers,
+// pinned to the TOP of the dropdown (bundled defaults first: Inter for Chat
+// & UI, Fraunces for Titles, then a handful of widely available system
+// fonts); the full queryLocalFonts system list follows below, same as the
+// code picker. A persisted custom family outside the list still renders via
+// the `current` slot in buildFontOptions.
 const INTERFACE_FONT_OPTIONS = [
   "Inter",
   "Arial",
@@ -800,7 +800,7 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                     })
                   }
                   options={buildFontOptions(
-                    [],
+                    localFonts,
                     settings.fonts.display.family,
                     INTERFACE_FONT_OPTIONS,
                   ).map((family) => ({ value: family, label: family }))}
@@ -865,7 +865,7 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                     })
                   }
                   options={buildFontOptions(
-                    [],
+                    localFonts,
                     settings.fonts.accent.family,
                     TITLE_FONT_OPTIONS,
                   ).map((family) => ({ value: family, label: family }))}
