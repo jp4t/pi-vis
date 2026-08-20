@@ -102,10 +102,21 @@ function resolveActiveThemeId(settings: AppSettings, systemAppearance: ThemeAppe
 
 function applyFonts(settings: AppSettings): void {
   const root = document.documentElement;
-  // Keep the interface font family app-owned. UI alignment is tuned against
-  // this stable metric set; exposing arbitrary system fonts makes controls
-  // drift vertically even when their CSS box sizes remain correct.
-  root.style.setProperty("--font-display", '"Inter", system-ui, -apple-system, sans-serif');
+  // Interface font: user-selectable, defaulting to Inter (UI alignment is
+  // tuned against Inter's metrics, so it stays the recommended default).
+  // Append a generic sans fallback stack so that while the chosen font is
+  // still loading — or if it isn't available at all (e.g. a custom family
+  // name the user typed) — interface text degrades to the right *kind* of
+  // font.
+  root.style.setProperty(
+    "--font-display",
+    `${settings.fonts.display.family}, system-ui, -apple-system, sans-serif`,
+  );
+  // Title/accent font (workspace label, active session title, modal
+  // headers): user-selectable, defaulting to Fraunces. Falls back to the
+  // interface font so an unavailable family never renders in the browser's
+  // default.
+  root.style.setProperty("--font-accent", `${settings.fonts.accent.family}, var(--font-display)`);
   // Append a generic fallback stack for code so that while the chosen font is
   // still loading — or if it isn't available at all (e.g. a custom family name
   // the user typed) — code degrades to the right *kind* of font. Without the

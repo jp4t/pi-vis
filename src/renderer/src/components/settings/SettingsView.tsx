@@ -30,17 +30,28 @@ interface FontFamily {
  * font picker still needs bundled monospace options to appear even when they
  * are not system-installed.
  */
-const BUNDLED_FONTS = ["IBM Plex Mono"];
+const BUNDLED_CODE_FONTS = ["IBM Plex Mono"];
+
+// Interface + title fonts shipped with the app (bundled via @fontsource in
+// main.tsx). Inter is the interface default; Fraunces is the title default
+// (workspace label, active session title, modal headers); IBM Plex Serif is
+// the transcript reading/thinking voice — offered as a title option too.
+const BUNDLED_INTERFACE_FONTS = ["Inter"];
+const BUNDLED_TITLE_FONTS = ["Fraunces", "IBM Plex Serif", "Inter"];
 
 /**
  * Build the family-dropdown options: bundled fonts first, then the currently
  * selected family (so a custom value the user typed always has a matching
  * option), then the system fonts — all de-duplicated.
  */
-function buildFontOptions(localFonts: FontFamily[], current: string): string[] {
+function buildFontOptions(
+  localFonts: FontFamily[],
+  current: string,
+  bundledFonts: readonly string[] = BUNDLED_CODE_FONTS,
+): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const family of [...BUNDLED_FONTS, current, ...localFonts.map((f) => f.family)]) {
+  for (const family of [...bundledFonts, current, ...localFonts.map((f) => f.family)]) {
     if (family && !seen.has(family)) {
       seen.add(family);
       out.push(family);
@@ -732,6 +743,77 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                 </button>
                 <span className="settings-hint" id="saved-session-search-restart-hint">
                   Takes effect after restarting Pi-Vis.
+                </span>
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">Font Family</span>
+                {localFonts.length > 0 ? (
+                  <SettingsSelect
+                    value={settings.fonts.display.family}
+                    onChange={(family) =>
+                      update({
+                        fonts: {
+                          ...settings.fonts,
+                          display: { ...settings.fonts.display, family },
+                        },
+                      })
+                    }
+                    options={buildFontOptions(
+                      localFonts,
+                      settings.fonts.display.family,
+                      BUNDLED_INTERFACE_FONTS,
+                    ).map((family) => ({ value: family, label: family }))}
+                  />
+                ) : (
+                  <input
+                    className="settings-input"
+                    value={settings.fonts.display.family}
+                    onChange={(e) =>
+                      update({
+                        fonts: {
+                          ...settings.fonts,
+                          display: { ...settings.fonts.display, family: e.target.value },
+                        },
+                      })
+                    }
+                  />
+                )}
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">Title Font</span>
+                {localFonts.length > 0 ? (
+                  <SettingsSelect
+                    value={settings.fonts.accent.family}
+                    onChange={(family) =>
+                      update({
+                        fonts: {
+                          ...settings.fonts,
+                          accent: { ...settings.fonts.accent, family },
+                        },
+                      })
+                    }
+                    options={buildFontOptions(
+                      localFonts,
+                      settings.fonts.accent.family,
+                      BUNDLED_TITLE_FONTS,
+                    ).map((family) => ({ value: family, label: family }))}
+                  />
+                ) : (
+                  <input
+                    className="settings-input"
+                    value={settings.fonts.accent.family}
+                    onChange={(e) =>
+                      update({
+                        fonts: {
+                          ...settings.fonts,
+                          accent: { ...settings.fonts.accent, family: e.target.value },
+                        },
+                      })
+                    }
+                  />
+                )}
+                <span className="settings-hint">
+                  Used for the workspace name, the active session title, and modal headers.
                 </span>
               </div>
               <div className="settings-row">

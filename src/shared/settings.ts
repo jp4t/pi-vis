@@ -8,10 +8,20 @@ export type TranscriptStyle = z.infer<typeof TranscriptStyleSchema>;
 export type ThemeAppearance = "light" | "dark";
 
 const DisplayFontSettingsSchema = z.object({
-  // The interface font family is intentionally app-owned (currently Inter) so
-  // layout can be tuned against stable font metrics. Users can still scale the
-  // UI for accessibility/readability.
+  // Interface font family. Defaults to Inter — the app's layout is tuned
+  // against its metrics, so it remains the recommended choice — but the
+  // family is user-selectable (a generic sans fallback is appended at apply
+  // time so an unavailable/custom family degrades to the right kind of font).
+  family: z.string().default("Inter"),
   sizePx: z.number().min(8).max(48).default(14),
+});
+
+const AccentFontSettingsSchema = z.object({
+  // Title/accent font (--font-accent): the workspace label in the sidebar,
+  // the active session title in the title bar, and app-owned modal headers.
+  // Defaults to Fraunces. Family-only: size stays app-owned so header
+  // geometry/tracking remains stable.
+  family: z.string().default("Fraunces"),
 });
 
 const CodeFontSettingsSchema = z.object({
@@ -33,6 +43,7 @@ export const AppSettingsSchema = z.object({
   fonts: z
     .object({
       display: DisplayFontSettingsSchema.default({ sizePx: 14 }),
+      accent: AccentFontSettingsSchema.default({}),
       code: CodeFontSettingsSchema.default({ family: "IBM Plex Mono", sizePx: 14 }),
     })
     .default({}),

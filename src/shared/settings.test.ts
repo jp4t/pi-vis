@@ -18,21 +18,26 @@ describe("AppSettingsSchema", () => {
     expect(parsed.transcriptStyle).toBe("verbose");
     expect(parsed.groupModelsByProvider).toBe(false);
     expect(parsed.sessionSearchEnabled).toBe(true);
-    expect(parsed.fonts.display).toEqual({ sizePx: 14 });
+    expect(parsed.fonts.display).toEqual({ family: "Inter", sizePx: 14 });
+    expect(parsed.fonts.accent).toEqual({ family: "Fraunces" });
     expect(parsed.fonts.code).toEqual({ family: "IBM Plex Mono", sizePx: 14 });
   });
 
-  it("strips the legacy display font family on parse", () => {
+  it("preserves user-selected interface and title font families on parse", () => {
+    // fonts.display.family was once stripped as legacy (the interface font was
+    // app-owned); it is a supported preference again, so a settings.json that
+    // still carries it must round-trip rather than being dropped.
     const result = AppSettingsSchema.safeParse({
       fonts: {
         display: { family: "Nimbus Sans", sizePx: 16 },
+        accent: { family: "Helvetica" },
         code: { family: "JetBrains Mono", sizePx: 13 },
       },
     });
     expect(result.success).toBe(true);
     if (!result.success) return;
-    expect("family" in result.data.fonts.display).toBe(false);
-    expect(result.data.fonts.display.sizePx).toBe(16);
+    expect(result.data.fonts.display).toEqual({ family: "Nimbus Sans", sizePx: 16 });
+    expect(result.data.fonts.accent).toEqual({ family: "Helvetica" });
     expect(result.data.fonts.code).toEqual({ family: "JetBrains Mono", sizePx: 13 });
   });
 
