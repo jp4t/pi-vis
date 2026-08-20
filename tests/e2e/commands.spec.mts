@@ -153,17 +153,22 @@ test.describe("Slash commands", () => {
     await expect(interfaceSection.getByText("Light theme", { exact: true })).toBeVisible();
     await expect(interfaceSection.getByText("Dark theme", { exact: true })).toBeVisible();
     await expect(interfaceSection.getByText("Mode", { exact: true })).toBeVisible();
-    await expect(interfaceSection.getByText("Font Size", { exact: true })).toBeVisible();
-    // Interface + title font families are user-configurable (defaults Inter /
-    // Fraunces). The control is a select when queryLocalFonts is available,
-    // else a free-text input — accept either. Labels distinguish the chat/UI
-    // text font from the title font.
-    const fontFamilyRow = interfaceSection.locator(".settings-row", {
-      hasText: "Chat & UI Font",
+    // Font controls are grouped into their own sections (Chat & UI, Titles)
+    // following the Code section pattern: header carries context, rows are
+    // plain "Font Family" / "Font Size". Defaults Inter / Fraunces; the
+    // family control is a select when queryLocalFonts is available, else a
+    // free-text input — accept either.
+    const chatUiSection = window.locator(".settings-section", {
+      has: window.getByRole("heading", { name: "Chat & UI" }),
     });
-    const titleFontRow = interfaceSection.locator(".settings-row", { hasText: "Title Font" });
+    const titlesSection = window.locator(".settings-section", {
+      has: window.getByRole("heading", { name: "Titles" }),
+    });
+    const fontFamilyRow = chatUiSection.locator(".settings-row", { hasText: "Font Family" });
+    const titleFontRow = titlesSection.locator(".settings-row", { hasText: "Font Family" });
     await expect(fontFamilyRow).toBeVisible();
     await expect(titleFontRow).toBeVisible();
+    await expect(chatUiSection.locator(".settings-row", { hasText: "Font Size" })).toBeVisible();
     await expect(interfaceSection).not.toContainText("Pi-Vis owns interface font families");
 
     // Defaults render as Inter (interface) / Fraunces (title) on :root.

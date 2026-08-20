@@ -745,8 +745,19 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                   Takes effect after restarting Pi-Vis.
                 </span>
               </div>
+              {userThemesDir && (
+                <span className="settings-hint">
+                  Drop custom theme <code>.json</code> files in <code>{userThemesDir}</code>, then
+                  restart Pi-Vis.
+                </span>
+              )}
+            </section>
+
+            {/* Chat & UI */}
+            <section className="settings-section">
+              <h3 className="settings-section__title">Chat & UI</h3>
               <div className="settings-row">
-                <span className="settings-label">Chat & UI Font</span>
+                <span className="settings-label">Font Family</span>
                 {localFonts.length > 0 ? (
                   <SettingsSelect
                     value={settings.fonts.display.family}
@@ -773,40 +784,6 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                         fonts: {
                           ...settings.fonts,
                           display: { ...settings.fonts.display, family: e.target.value },
-                        },
-                      })
-                    }
-                  />
-                )}
-              </div>
-              <div className="settings-row">
-                <span className="settings-label">Title Font</span>
-                {localFonts.length > 0 ? (
-                  <SettingsSelect
-                    value={settings.fonts.accent.family}
-                    onChange={(family) =>
-                      update({
-                        fonts: {
-                          ...settings.fonts,
-                          accent: { ...settings.fonts.accent, family },
-                        },
-                      })
-                    }
-                    options={buildFontOptions(
-                      localFonts,
-                      settings.fonts.accent.family,
-                      BUNDLED_TITLE_FONTS,
-                    ).map((family) => ({ value: family, label: family }))}
-                  />
-                ) : (
-                  <input
-                    className="settings-input"
-                    value={settings.fonts.accent.family}
-                    onChange={(e) =>
-                      update({
-                        fonts: {
-                          ...settings.fonts,
-                          accent: { ...settings.fonts.accent, family: e.target.value },
                         },
                       })
                     }
@@ -853,12 +830,45 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                   </button>
                 </div>
               </div>
-              {userThemesDir && (
-                <span className="settings-hint">
-                  Drop custom theme <code>.json</code> files in <code>{userThemesDir}</code>, then
-                  restart Pi-Vis.
-                </span>
-              )}
+            </section>
+
+            {/* Titles */}
+            <section className="settings-section">
+              <h3 className="settings-section__title">Titles</h3>
+              <div className="settings-row">
+                <span className="settings-label">Font Family</span>
+                {localFonts.length > 0 ? (
+                  <SettingsSelect
+                    value={settings.fonts.accent.family}
+                    onChange={(family) =>
+                      update({
+                        fonts: {
+                          ...settings.fonts,
+                          accent: { ...settings.fonts.accent, family },
+                        },
+                      })
+                    }
+                    options={buildFontOptions(
+                      localFonts,
+                      settings.fonts.accent.family,
+                      BUNDLED_TITLE_FONTS,
+                    ).map((family) => ({ value: family, label: family }))}
+                  />
+                ) : (
+                  <input
+                    className="settings-input"
+                    value={settings.fonts.accent.family}
+                    onChange={(e) =>
+                      update({
+                        fonts: {
+                          ...settings.fonts,
+                          accent: { ...settings.fonts.accent, family: e.target.value },
+                        },
+                      })
+                    }
+                  />
+                )}
+              </div>
             </section>
 
             {/* Code */}
