@@ -812,9 +812,6 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                     }
                   />
                 )}
-                <span className="settings-hint">
-                  Used for the workspace name, the active session title, and modal headers.
-                </span>
               </div>
               <div className="settings-row">
                 <span className="settings-label">Font Size</span>
