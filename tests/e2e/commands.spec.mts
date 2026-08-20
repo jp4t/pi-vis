@@ -156,9 +156,10 @@ test.describe("Slash commands", () => {
     await expect(interfaceSection.getByText("Font Size", { exact: true })).toBeVisible();
     // Interface + title font families are user-configurable (defaults Inter /
     // Fraunces). The control is a select when queryLocalFonts is available,
-    // else a free-text input — accept either.
+    // else a free-text input — accept either. Labels distinguish the chat/UI
+    // text font from the title font.
     const fontFamilyRow = interfaceSection.locator(".settings-row", {
-      hasText: "Font Family",
+      hasText: "Chat & UI Font",
     });
     const titleFontRow = interfaceSection.locator(".settings-row", { hasText: "Title Font" });
     await expect(fontFamilyRow).toBeVisible();

@@ -746,7 +746,7 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                 </span>
               </div>
               <div className="settings-row">
-                <span className="settings-label">Font Family</span>
+                <span className="settings-label">Chat & UI Font</span>
                 {localFonts.length > 0 ? (
                   <SettingsSelect
                     value={settings.fonts.display.family}
