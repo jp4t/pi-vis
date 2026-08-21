@@ -8,12 +8,18 @@ export type TranscriptStyle = z.infer<typeof TranscriptStyleSchema>;
 export type ThemeAppearance = "light" | "dark";
 
 const DisplayFontSettingsSchema = z.object({
-  // Interface font family. Defaults to Inter — the app's layout is tuned
-  // against its metrics, so it remains the recommended choice — but the
-  // family is user-selectable (a generic sans fallback is appended at apply
-  // time so an unavailable/custom family degrades to the right kind of font).
-  family: z.string().default("Inter"),
+  // The interface font family is intentionally app-owned (currently Inter) so
+  // layout can be tuned against stable font metrics. Users can still scale the
+  // UI for accessibility/readability.
   sizePx: z.number().min(8).max(48).default(14),
+});
+
+const ChatFontSettingsSchema = z.object({
+  // Transcript body font (--font-chat): the reading text in the chat —
+  // assistant prose and user messages. Family-only; defaults to Inter (the
+  // interface font). Chrome stays app-owned: UI alignment is tuned against
+  // stable font metrics, so only reading text is user-selectable.
+  family: z.string().default("Inter"),
 });
 
 const AccentFontSettingsSchema = z.object({
@@ -43,6 +49,7 @@ export const AppSettingsSchema = z.object({
   fonts: z
     .object({
       display: DisplayFontSettingsSchema.default({ sizePx: 14 }),
+      chat: ChatFontSettingsSchema.default({}),
       accent: AccentFontSettingsSchema.default({}),
       code: CodeFontSettingsSchema.default({ family: "IBM Plex Mono", sizePx: 14 }),
     })

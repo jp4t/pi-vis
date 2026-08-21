@@ -38,7 +38,7 @@ const BUNDLED_CODE_FONTS = ["IBM Plex Mono"];
 // fonts); the full queryLocalFonts system list follows below, same as the
 // code picker. A persisted custom family outside the list still renders via
 // the `current` slot in buildFontOptions.
-const INTERFACE_FONT_OPTIONS = [
+const CHAT_FONT_OPTIONS = [
   "Inter",
   "Arial",
   "Helvetica",
@@ -775,37 +775,6 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                   Takes effect after restarting Pi-Vis.
                 </span>
               </div>
-              {userThemesDir && (
-                <span className="settings-hint">
-                  Drop custom theme <code>.json</code> files in <code>{userThemesDir}</code>, then
-                  restart Pi-Vis.
-                </span>
-              )}
-            </section>
-
-            {/* Chat & UI */}
-            <section className="settings-section">
-              <h3 className="settings-section__title">Chat & UI</h3>
-              <div className="settings-row">
-                <span className="settings-label">Font Family</span>
-                <SettingsSelect
-                  fontPreview
-                  value={settings.fonts.display.family}
-                  onChange={(family) =>
-                    update({
-                      fonts: {
-                        ...settings.fonts,
-                        display: { ...settings.fonts.display, family },
-                      },
-                    })
-                  }
-                  options={buildFontOptions(
-                    localFonts,
-                    settings.fonts.display.family,
-                    INTERFACE_FONT_OPTIONS,
-                  ).map((family) => ({ value: family, label: family }))}
-                />
-              </div>
               <div className="settings-row">
                 <span className="settings-label">Font Size</span>
                 <div className="settings-stepper">
@@ -845,6 +814,37 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                     +
                   </button>
                 </div>
+              </div>
+              {userThemesDir && (
+                <span className="settings-hint">
+                  Drop custom theme <code>.json</code> files in <code>{userThemesDir}</code>, then
+                  restart Pi-Vis.
+                </span>
+              )}
+            </section>
+
+            {/* Chat */}
+            <section className="settings-section">
+              <h3 className="settings-section__title">Chat</h3>
+              <div className="settings-row">
+                <span className="settings-label">Font Family</span>
+                <SettingsSelect
+                  fontPreview
+                  value={settings.fonts.chat.family}
+                  onChange={(family) =>
+                    update({
+                      fonts: {
+                        ...settings.fonts,
+                        chat: { ...settings.fonts.chat, family },
+                      },
+                    })
+                  }
+                  options={buildFontOptions(
+                    localFonts,
+                    settings.fonts.chat.family,
+                    CHAT_FONT_OPTIONS,
+                  ).map((family) => ({ value: family, label: family }))}
+                />
               </div>
             </section>
 
