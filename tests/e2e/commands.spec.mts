@@ -158,7 +158,7 @@ test.describe("Slash commands", () => {
     // plain "Font Family" / "Font Size". Chrome/interface font stays
     // app-owned (no family control in Interface); chat body + titles are
     // user-configurable (defaults Inter / Fraunces).
-    await expect(interfaceSection.getByText("Font Size", { exact: true })).toBeVisible();
+    await expect(interfaceSection.getByText("Font Size", { exact: true })).toHaveCount(0);
     const chatSection = window.locator(".settings-section", {
       has: window.getByRole("heading", { name: "Chat" }),
     });
@@ -169,6 +169,9 @@ test.describe("Slash commands", () => {
     const titleFontRow = titlesSection.locator(".settings-row", { hasText: "Font Family" });
     await expect(chatFontRow).toBeVisible();
     await expect(titleFontRow).toBeVisible();
+    await expect(
+      chatSection.locator(".settings-row", { hasText: "Font Size" }),
+    ).toBeVisible();
     await expect(interfaceSection).not.toContainText("Pi-Vis owns interface font families");
 
     // Defaults render as Inter (interface + chat) / Fraunces (title) on :root.

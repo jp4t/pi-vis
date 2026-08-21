@@ -30,31 +30,34 @@ interface FontFamily {
  * font picker still needs bundled monospace options to appear even when they
  * are not system-installed.
  */
+// Kept as the default pinned list for buildFontOptions callers that don't
+// pass one explicitly.
 const BUNDLED_CODE_FONTS = ["IBM Plex Mono"];
 
-// Curated Google-Docs-style shortlists for the interface + title pickers,
-// pinned to the TOP of the dropdown (bundled defaults first: Inter for Chat
-// & UI, Fraunces for Titles, then a handful of widely available system
-// fonts); the full queryLocalFonts system list follows below, same as the
-// code picker. A persisted custom family outside the list still renders via
-// the `current` slot in buildFontOptions.
-const CHAT_FONT_OPTIONS = [
+// One shared Google-Docs-style shortlist for all three font pickers (Chat,
+// Titles, Code): bundled families first, then widely available system fonts.
+// Each picker pins its own default family to the very top; the full
+// queryLocalFonts system list follows below, de-duplicated. A persisted
+// custom family outside the list still renders via the `current` slot in
+// buildFontOptions.
+const CURATED_FONT_OPTIONS = [
   "Inter",
+  "Fraunces",
+  "IBM Plex Serif",
+  "IBM Plex Mono",
   "Arial",
   "Helvetica",
   "Georgia",
   "Roboto",
   "Verdana",
+  "Times New Roman",
   "system-ui",
 ];
-const TITLE_FONT_OPTIONS = [
-  "Fraunces",
-  "IBM Plex Serif",
-  "Inter",
-  "Georgia",
-  "Times New Roman",
-  "Arial",
-];
+
+/** Curated list with the picker's own default pinned first. */
+function curatedFontOptions(defaultFamily: string): string[] {
+  return [defaultFamily, ...CURATED_FONT_OPTIONS.filter((f) => f !== defaultFamily)];
+}
 
 /**
  * Build the family-dropdown options: bundled fonts first, then the currently
@@ -775,6 +778,37 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                   Takes effect after restarting Pi-Vis.
                 </span>
               </div>
+              {userThemesDir && (
+                <span className="settings-hint">
+                  Drop custom theme <code>.json</code> files in <code>{userThemesDir}</code>, then
+                  restart Pi-Vis.
+                </span>
+              )}
+            </section>
+
+            {/* Chat */}
+            <section className="settings-section">
+              <h3 className="settings-section__title">Chat</h3>
+              <div className="settings-row">
+                <span className="settings-label">Font Family</span>
+                <SettingsSelect
+                  fontPreview
+                  value={settings.fonts.chat.family}
+                  onChange={(family) =>
+                    update({
+                      fonts: {
+                        ...settings.fonts,
+                        chat: { ...settings.fonts.chat, family },
+                      },
+                    })
+                  }
+                  options={buildFontOptions(
+                    localFonts,
+                    settings.fonts.chat.family,
+                    curatedFontOptions("Inter"),
+                  ).map((family) => ({ value: family, label: family }))}
+                />
+              </div>
               <div className="settings-row">
                 <span className="settings-label">Font Size</span>
                 <div className="settings-stepper">
@@ -815,37 +849,6 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                   </button>
                 </div>
               </div>
-              {userThemesDir && (
-                <span className="settings-hint">
-                  Drop custom theme <code>.json</code> files in <code>{userThemesDir}</code>, then
-                  restart Pi-Vis.
-                </span>
-              )}
-            </section>
-
-            {/* Chat */}
-            <section className="settings-section">
-              <h3 className="settings-section__title">Chat</h3>
-              <div className="settings-row">
-                <span className="settings-label">Font Family</span>
-                <SettingsSelect
-                  fontPreview
-                  value={settings.fonts.chat.family}
-                  onChange={(family) =>
-                    update({
-                      fonts: {
-                        ...settings.fonts,
-                        chat: { ...settings.fonts.chat, family },
-                      },
-                    })
-                  }
-                  options={buildFontOptions(
-                    localFonts,
-                    settings.fonts.chat.family,
-                    CHAT_FONT_OPTIONS,
-                  ).map((family) => ({ value: family, label: family }))}
-                />
-              </div>
             </section>
 
             {/* Titles */}
@@ -867,7 +870,7 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                   options={buildFontOptions(
                     localFonts,
                     settings.fonts.accent.family,
-                    TITLE_FONT_OPTIONS,
+                    curatedFontOptions("Fraunces"),
                   ).map((family) => ({ value: family, label: family }))}
                 />
               </div>
@@ -890,9 +893,11 @@ export function SettingsView({ onClose, initialSection }: SettingsViewProps): Re
                         },
                       })
                     }
-                    options={buildFontOptions(localFonts, settings.fonts.code.family).map(
-                      (family) => ({ value: family, label: family }),
-                    )}
+                    options={buildFontOptions(
+                      localFonts,
+                      settings.fonts.code.family,
+                      curatedFontOptions("IBM Plex Mono"),
+                    ).map((family) => ({ value: family, label: family }))}
                   />
                 ) : (
                   <input
